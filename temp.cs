@@ -4,6 +4,7 @@ using System.Linq;
 using System.Collections.Generic;
 using System.Numerics;
 using System.Windows.Forms;
+using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
 using SharpGLTF.Schema2;
 
@@ -18,17 +19,21 @@ namespace GlbJointCorrector
 
         private ModelRoot? currentModel;
         private string? loadedFilePath;
-        private readonly string tempPreviewPath;
+        private readonly string tempPreviewFolder;
+        private readonly string tempPreviewFile = "preview_model.glb";
+        private bool _viewerReady;
+        private string? _pendingPreviewFile;
 
-        // Cache: bone name -> (animation track name, original time/quaternion keys, target node)
+        private const string VirtualHost = "appassets.local";
+
         private readonly Dictionary<string, (string TrackName, Node Node, (float Time, Quaternion Value)[] OriginalKeys)> _rotationCache = new();
 
         public Form1()
         {
             InitializeComponent();
             SetupUI();
+            tempPreviewFolder = Path.GetTempPath();
             Initialize3DViewer();
-            tempPreviewPath = Path.Combine(Path.GetTempPath(), "preview_model.glb");
         }
 
         private void SetupUI()
@@ -72,12 +77,30 @@ namespace GlbJointCorrector
         {
             await webView.EnsureCoreWebView2Async();
 
+            // Dev tools so console errors are visible (F12 in the WebView2 window).
+            webView.CoreWebView2.Settings.AreDevToolsEnabled = true;
+            webView.CoreWebView2.Settings.IsWebMessageEnabled = true;
+
+            // Map temp folder to a virtual https host so file:// CORS restrictions don't block loading.
+            webView.CoreWebView2.SetVirtualHostNameToFolderMapping(
+                VirtualHost, tempPreviewFolder, CoreWebView2HostResourceAccessKind.Allow);
+
+            webView.CoreWebView2.NavigationCompleted += (s, e) =>
+            {
+                _viewerReady = e.IsSuccess;
+                if (_viewerReady && _pendingPreviewFile != null)
+                {
+                    LoadModelInViewer(_pendingPreviewFile);
+                    _pendingPreviewFile = null;
+                }
+            };
+
             string htmlContent = @"
             <!DOCTYPE html>
             <html>
             <head>
-                <script src='https://cloudflare.com'></script>
-                <script src='https://jsdelivr.net'></script>
+                <script src='https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js'></script>
+                <script src='https://cdn.jsdelivr.net/npm/three@0.160.0/examples/js/loaders/GLTFLoader.js'></script>
                 <style>body { margin: 0; overflow: hidden; background-color: #222; }</style>
             </head>
             <body>
@@ -96,17 +119,19 @@ namespace GlbJointCorrector
                     let mixer, clock = new THREE.Clock(), currentModel;
                     let loader = new THREE.GLTFLoader();
 
-                    function loadModel(url) {
-                        if(currentModel) scene.remove(currentModel);
+                    window.loadModel = function(url) {
+                        if (currentModel) scene.remove(currentModel);
                         loader.load(url, function(gltf) {
                             currentModel = gltf.scene;
                             scene.add(currentModel);
-                            if(gltf.animations.length > 0) {
+                            if (gltf.animations.length > 0) {
                                 mixer = new THREE.AnimationMixer(currentModel);
-                                mixer.clipAction(gltf.animations).play();
+                                mixer.clipAction(gltf.animations[0]).play();
                             }
-                        }, undefined, function(e) { console.error(e); });
-                    }
+                        }, undefined, function(err) {
+                            console.error('GLTFLoader error:', err);
+                        });
+                    };
 
                     function animate() {
                         requestAnimationFrame(animate);
@@ -121,12 +146,23 @@ namespace GlbJointCorrector
             webView.CoreWebView2.NavigateToString(htmlContent);
         }
 
+        private void LoadModelInViewer(string fileName)
+        {
+            string url = $"https://{VirtualHost}/{fileName}";
+            webView.CoreWebView2.ExecuteScriptAsync($"loadModel('{url}')");
+        }
+
         private void Update3DPreview(string filePath)
         {
-            if (webView.CoreWebView2 != null)
+            string fileName = Path.GetFileName(filePath);
+
+            if (_viewerReady)
             {
-                string uri = new Uri(filePath).AbsoluteUri;
-                webView.CoreWebView2.ExecuteScriptAsync($"loadModel('{uri}')");
+                LoadModelInViewer(fileName);
+            }
+            else
+            {
+                _pendingPreviewFile = fileName; // fire once nav completes
             }
         }
 
@@ -149,10 +185,13 @@ namespace GlbJointCorrector
             if (boneDropdown.Items.Count > 0) boneDropdown.SelectedIndex = 0;
 
             btnSave.Enabled = true;
-            Update3DPreview(loadedFilePath);
+
+            // Copy into the mapped temp folder under a stable name the virtual host can serve.
+            string previewPath = Path.Combine(tempPreviewFolder, tempPreviewFile);
+            File.Copy(loadedFilePath, previewPath, true);
+            Update3DPreview(previewPath);
         }
 
-        // Lazily caches original (unmodified) rotation keys + track name for a bone.
         private bool TryGetOriginalKeys(string boneName, out string trackName, out Node? node, out (float Time, Quaternion Value)[] keys)
         {
             if (_rotationCache.TryGetValue(boneName, out var cached))
@@ -203,17 +242,17 @@ namespace GlbJointCorrector
             Quaternion rotX = Quaternion.CreateFromAxisAngle(Vector3.UnitX, sliderX.Value * degToRad);
             Quaternion rotY = Quaternion.CreateFromAxisAngle(Vector3.UnitY, sliderY.Value * degToRad);
             Quaternion rotZ = Quaternion.CreateFromAxisAngle(Vector3.UnitZ, sliderZ.Value * degToRad);
-            Quaternion offsetRotation = rotZ * rotY * rotX; // explicit XYZ intrinsic order
+            Quaternion offsetRotation = rotZ * rotY * rotX;
 
             var correctedKeys = originalKeys
                 .Select(k => (k.Time, Quaternion.Normalize(k.Value * offsetRotation)))
                 .ToArray();
 
-            // Overwrites the existing rotation channel for this node/track with corrected keys.
             node.WithRotationAnimation(trackName, correctedKeys);
 
-            currentModel.SaveGLB(tempPreviewPath);
-            Update3DPreview(tempPreviewPath);
+            string previewPath = Path.Combine(tempPreviewFolder, tempPreviewFile);
+            currentModel.SaveGLB(previewPath);
+            Update3DPreview(previewPath);
         }
 
         private void JointSelectionChanged(object sender, EventArgs e)
@@ -228,9 +267,10 @@ namespace GlbJointCorrector
             using SaveFileDialog saveFileDialog = new() { Filter = "GLB Files|*.glb", FileName = "fixed_model.glb" };
             if (saveFileDialog.ShowDialog() != DialogResult.OK) return;
 
-            if (File.Exists(tempPreviewPath))
+            string previewPath = Path.Combine(tempPreviewFolder, tempPreviewFile);
+            if (File.Exists(previewPath))
             {
-                File.Copy(tempPreviewPath, saveFileDialog.FileName, true);
+                File.Copy(previewPath, saveFileDialog.FileName, true);
                 MessageBox.Show("Animation corrections baked and saved successfully!", "Success");
             }
         }
