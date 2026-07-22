@@ -99,8 +99,8 @@ namespace GlbJointCorrector
             <!DOCTYPE html>
             <html>
             <head>
-                <script src='https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js'></script>
-                <script src='https://cdn.jsdelivr.net/npm/three@0.160.0/examples/js/loaders/GLTFLoader.js'></script>
+                <script src='https://unpkg.com/three@0.128.0/build/three.min.js'></script>
+                <script src='https://unpkg.com/three@0.128.0/examples/js/loaders/GLTFLoader.js'></script>
                 <style>body { margin: 0; overflow: hidden; background-color: #222; }</style>
             </head>
             <body>
@@ -124,6 +124,19 @@ namespace GlbJointCorrector
                         loader.load(url, function(gltf) {
                             currentModel = gltf.scene;
                             scene.add(currentModel);
+
+                            let box = new THREE.Box3().setFromObject(currentModel);
+
+                            let size = box.getSize(new THREE.Vector3());
+                            let center = box.getCenter(new THREE.Vector3());
+                            let maxDim = Math.max(size.x, size.y, size.z);
+
+                            let distance = Math.max(maxDim, 2);
+                            camera.position.set(center.x, center.y, center.z + distance*2);
+                            
+                            camera.updateProjectionMatrix();
+                            camera.lookAt(center);
+                            
                             if (gltf.animations.length > 0) {
                                 mixer = new THREE.AnimationMixer(currentModel);
                                 mixer.clipAction(gltf.animations[0]).play();
