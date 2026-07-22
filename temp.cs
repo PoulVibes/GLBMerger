@@ -6,7 +6,6 @@ using System.Numerics;
 using System.Windows.Forms;
 using Microsoft.Web.WebView2.WinForms;
 using SharpGLTF.Schema2;
-using SharpGLTF.Animations;
 
 namespace GlbJointCorrector
 {
@@ -21,9 +20,8 @@ namespace GlbJointCorrector
         private string? loadedFilePath;
         private readonly string tempPreviewPath;
 
-        // Cache of original rotation keys per (bone name), so we never re-read from disk.
-        // Each entry: list of (time, original quaternion) pairs for that bone's rotation channel.
-        private readonly Dictionary<string, (AnimationChannel Channel, (float Time, Quaternion Value)[] OriginalKeys)> _rotationCache = new();
+        // Cache: bone name -> (animation track name, original time/quaternion keys, target node)
+        private readonly Dictionary<string, (string TrackName, Node Node, (float Time, Quaternion Value)[] OriginalKeys)> _rotationCache = new();
 
         public Form1()
         {
@@ -154,17 +152,19 @@ namespace GlbJointCorrector
             Update3DPreview(loadedFilePath);
         }
 
-        // Lazily caches original (unmodified) rotation keys for a bone, once per bone, from the in-memory model.
-        private bool TryGetOriginalKeys(string boneName, out AnimationChannel? channel, out (float Time, Quaternion Value)[] keys)
+        // Lazily caches original (unmodified) rotation keys + track name for a bone.
+        private bool TryGetOriginalKeys(string boneName, out string trackName, out Node? node, out (float Time, Quaternion Value)[] keys)
         {
             if (_rotationCache.TryGetValue(boneName, out var cached))
             {
-                channel = cached.Channel;
+                trackName = cached.TrackName;
+                node = cached.Node;
                 keys = cached.OriginalKeys;
                 return true;
             }
 
-            channel = null;
+            trackName = string.Empty;
+            node = null;
             keys = Array.Empty<(float, Quaternion)>();
 
             if (currentModel == null) return false;
@@ -179,8 +179,10 @@ namespace GlbJointCorrector
                         if (sampler == null) continue;
 
                         var originalKeys = sampler.GetLinearKeys().ToArray();
-                        _rotationCache[boneName] = (ch, originalKeys);
-                        channel = ch;
+                        _rotationCache[boneName] = (animation.Name, ch.TargetNode, originalKeys);
+
+                        trackName = animation.Name;
+                        node = ch.TargetNode;
                         keys = originalKeys;
                         return true;
                     }
@@ -195,7 +197,7 @@ namespace GlbJointCorrector
             if (currentModel == null || loadedFilePath == null || boneDropdown.SelectedItem == null) return;
 
             string targetBoneName = boneDropdown.SelectedItem.ToString()!;
-            if (!TryGetOriginalKeys(targetBoneName, out var channel, out var originalKeys) || channel == null) return;
+            if (!TryGetOriginalKeys(targetBoneName, out var trackName, out var node, out var originalKeys) || node == null) return;
 
             const float degToRad = (float)Math.PI / 180f;
             Quaternion rotX = Quaternion.CreateFromAxisAngle(Vector3.UnitX, sliderX.Value * degToRad);
@@ -203,13 +205,12 @@ namespace GlbJointCorrector
             Quaternion rotZ = Quaternion.CreateFromAxisAngle(Vector3.UnitZ, sliderZ.Value * degToRad);
             Quaternion offsetRotation = rotZ * rotY * rotX; // explicit XYZ intrinsic order
 
-            var correctedKeys = new Dictionary<float, Quaternion>(originalKeys.Length);
-            foreach (var (time, value) in originalKeys)
-            {
-                correctedKeys[time] = Quaternion.Normalize(value * offsetRotation);
-            }
+            var correctedKeys = originalKeys
+                .Select(k => (k.Time, Quaternion.Normalize(k.Value * offsetRotation)))
+                .ToArray();
 
-            channel.SetRotationTrack(ANIMATIONCURVE_SAMPLER_INTERPOLATION, correctedKeys);
+            // Overwrites the existing rotation channel for this node/track with corrected keys.
+            node.WithRotationAnimation(trackName, correctedKeys);
 
             currentModel.SaveGLB(tempPreviewPath);
             Update3DPreview(tempPreviewPath);
