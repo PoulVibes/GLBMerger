@@ -6,21 +6,24 @@ using System.Numerics;
 using System.Windows.Forms;
 using Microsoft.Web.WebView2.WinForms;
 using SharpGLTF.Schema2;
-using SharpGLTF.Transforms;
+using SharpGLTF.Animations;
 
 namespace GlbJointCorrector
 {
     public partial class Form1 : Form
     {
-        // 1. CLASS UI AND STORAGE VARIABLES
         private WebView2 webView = null!;
         private TrackBar sliderX = null!, sliderY = null!, sliderZ = null!;
         private ComboBox boneDropdown = null!;
         private Button btnLoad = null!, btnSave = null!;
-        
+
         private ModelRoot? currentModel;
         private string? loadedFilePath;
-        private string tempPreviewPath;
+        private readonly string tempPreviewPath;
+
+        // Cache of original rotation keys per (bone name), so we never re-read from disk.
+        // Each entry: list of (time, original quaternion) pairs for that bone's rotation channel.
+        private readonly Dictionary<string, (AnimationChannel Channel, (float Time, Quaternion Value)[] OriginalKeys)> _rotationCache = new();
 
         public Form1()
         {
@@ -35,16 +38,14 @@ namespace GlbJointCorrector
             this.Text = "GLB Joint Corrector";
             this.Size = new System.Drawing.Size(1200, 800);
 
-            // Left Control Panel Container
             Panel ctrlPanel = new Panel { Dock = DockStyle.Left, Width = 300 };
-            
+
             btnLoad = new Button { Text = "Load GLB", Top = 20, Left = 20, Width = 260 };
             btnLoad.Click += BtnLoad_Click!;
 
             boneDropdown = new ComboBox { Top = 60, Left = 20, Width = 260, DropDownStyle = ComboBoxStyle.DropDownList };
             boneDropdown.SelectedIndexChanged += JointSelectionChanged!;
 
-            // Angle Trackbars (-180 to 180 degrees)
             sliderX = CreateSlider("X Rotation", 100, ctrlPanel);
             sliderY = CreateSlider("Y Rotation", 180, ctrlPanel);
             sliderZ = CreateSlider("Z Rotation", 260, ctrlPanel);
@@ -55,7 +56,6 @@ namespace GlbJointCorrector
             ctrlPanel.Controls.AddRange(new Control[] { btnLoad, boneDropdown, btnSave });
             this.Controls.Add(ctrlPanel);
 
-            // Right 3D Preview Engine Container
             webView = new WebView2 { Dock = DockStyle.Fill };
             this.Controls.Add(webView);
         }
@@ -70,11 +70,10 @@ namespace GlbJointCorrector
             return slider;
         }
 
-        // 2. THREE.JS 3D VIEWPORT ENGINE INTEGRATION
         private async void Initialize3DViewer()
         {
             await webView.EnsureCoreWebView2Async();
-            
+
             string htmlContent = @"
             <!DOCTYPE html>
             <html>
@@ -133,78 +132,86 @@ namespace GlbJointCorrector
             }
         }
 
-        // 3. I/O BUTTON LOGIC
         private void BtnLoad_Click(object sender, EventArgs e)
         {
-            using (OpenFileDialog openFileDialog = new OpenFileDialog { Filter = "GLB Files|*.glb" })
-            {
-                if (openFileDialog.ShowDialog() == DialogResult.OK)
-                {
-                    loadedFilePath = openFileDialog.FileName;
-                    currentModel = ModelRoot.Load(loadedFilePath);
+            using OpenFileDialog openFileDialog = new() { Filter = "GLB Files|*.glb" };
+            if (openFileDialog.ShowDialog() != DialogResult.OK) return;
 
-                    boneDropdown.Items.Clear();
-                    var boneNames = currentModel.LogicalNodes
-                        .Where(n => !string.IsNullOrEmpty(n.Name))
-                        .Select(n => n.Name!)
-                        .ToArray();
-                    
-                    boneDropdown.Items.AddRange(boneNames);
-                    if (boneDropdown.Items.Count > 0) boneDropdown.SelectedIndex = 0;
+            loadedFilePath = openFileDialog.FileName;
+            currentModel = ModelRoot.Load(loadedFilePath);
+            _rotationCache.Clear();
 
-                    btnSave.Enabled = true;
-                    Update3DPreview(loadedFilePath);
-                }
-            }
+            boneDropdown.Items.Clear();
+            var boneNames = currentModel.LogicalNodes
+                .Where(n => !string.IsNullOrEmpty(n.Name))
+                .Select(n => n.Name!)
+                .ToArray();
+
+            boneDropdown.Items.AddRange(boneNames);
+            if (boneDropdown.Items.Count > 0) boneDropdown.SelectedIndex = 0;
+
+            btnSave.Enabled = true;
+            Update3DPreview(loadedFilePath);
         }
 
-        // 4. VALIDATED ANIMATION SLIDER LOGIC
+        // Lazily caches original (unmodified) rotation keys for a bone, once per bone, from the in-memory model.
+        private bool TryGetOriginalKeys(string boneName, out AnimationChannel? channel, out (float Time, Quaternion Value)[] keys)
+        {
+            if (_rotationCache.TryGetValue(boneName, out var cached))
+            {
+                channel = cached.Channel;
+                keys = cached.OriginalKeys;
+                return true;
+            }
+
+            channel = null;
+            keys = Array.Empty<(float, Quaternion)>();
+
+            if (currentModel == null) return false;
+
+            foreach (var animation in currentModel.LogicalAnimations)
+            {
+                foreach (var ch in animation.Channels)
+                {
+                    if (ch.TargetNode?.Name == boneName && ch.TargetNodePath == PropertyPath.rotation)
+                    {
+                        var sampler = ch.GetRotationSampler();
+                        if (sampler == null) continue;
+
+                        var originalKeys = sampler.GetLinearKeys().ToArray();
+                        _rotationCache[boneName] = (ch, originalKeys);
+                        channel = ch;
+                        keys = originalKeys;
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
         private void Slider_Scroll(object sender, EventArgs e)
         {
             if (currentModel == null || loadedFilePath == null || boneDropdown.SelectedItem == null) return;
 
             string targetBoneName = boneDropdown.SelectedItem.ToString()!;
-            Vector3 sliderRotations = new Vector3(sliderX.Value, sliderY.Value, sliderZ.Value);
+            if (!TryGetOriginalKeys(targetBoneName, out var channel, out var originalKeys) || channel == null) return;
 
-            // Open a clean copy to prevent altering data streams in place
-            var processedModel = ModelRoot.Load(loadedFilePath);
-            
-            float degreesToRadians = (float)Math.PI / 180f;
-            Quaternion offsetRotation = Quaternion.CreateFromYawPitchRoll(
-                sliderRotations.Y * degreesToRadians,
-                sliderRotations.X * degreesToRadians,
-                sliderRotations.Z * degreesToRadians
-            );
+            const float degToRad = (float)Math.PI / 180f;
+            Quaternion rotX = Quaternion.CreateFromAxisAngle(Vector3.UnitX, sliderX.Value * degToRad);
+            Quaternion rotY = Quaternion.CreateFromAxisAngle(Vector3.UnitY, sliderY.Value * degToRad);
+            Quaternion rotZ = Quaternion.CreateFromAxisAngle(Vector3.UnitZ, sliderZ.Value * degToRad);
+            Quaternion offsetRotation = rotZ * rotY * rotX; // explicit XYZ intrinsic order
 
-            // Read the data streams explicitly using valid core accessors
-            foreach (var animation in processedModel.LogicalAnimations)
+            var correctedKeys = new Dictionary<float, Quaternion>(originalKeys.Length);
+            foreach (var (time, value) in originalKeys)
             {
-                foreach (var channel in animation.Channels)
-                {
-                    if (channel.TargetNode.Name == targetBoneName && channel.TargetNodePath == PropertyPath.rotation)
-                    {
-                        // Get linear curves using the safe built-in structure framework iterator
-                        var sampler = channel.GetRotationSampler();
-                        var originalKeys = sampler.GetLinearKeys().ToArray();
-
-                        // Write changes directly into the underlying structural memory buffer arrays
-                        var outputBufferAccessor = sampler.Output;
-                        var quaternionArray = outputBufferAccessor.AsQuaternionArray();
-
-                        for (int i = 0; i < quaternionArray.Count; i++)
-                        {
-                            Quaternion originalRotation = quaternionArray[i];
-                            
-                            // Combine original frame orientation with our real-time slider offset matrix
-                            Quaternion correctedRotation = originalRotation * offsetRotation;
-                            quaternionArray[i] = Quaternion.Normalize(correctedRotation);
-                        }
-                    }
-                }
+                correctedKeys[time] = Quaternion.Normalize(value * offsetRotation);
             }
 
-            // Instantly commit changes back into preview storage
-            processedModel.SaveGLB(tempPreviewPath);
+            channel.SetRotationTrack(ANIMATIONCURVE_SAMPLER_INTERPOLATION, correctedKeys);
+
+            currentModel.SaveGLB(tempPreviewPath);
             Update3DPreview(tempPreviewPath);
         }
 
@@ -217,16 +224,13 @@ namespace GlbJointCorrector
 
         private void BtnSave_Click(object sender, EventArgs e)
         {
-            using (SaveFileDialog saveFileDialog = new SaveFileDialog { Filter = "GLB Files|*.glb", FileName = "fixed_model.glb" })
+            using SaveFileDialog saveFileDialog = new() { Filter = "GLB Files|*.glb", FileName = "fixed_model.glb" };
+            if (saveFileDialog.ShowDialog() != DialogResult.OK) return;
+
+            if (File.Exists(tempPreviewPath))
             {
-                if (saveFileDialog.ShowDialog() == DialogResult.OK)
-                {
-                    if (File.Exists(tempPreviewPath))
-                    {
-                        File.Copy(tempPreviewPath, saveFileDialog.FileName, true);
-                        MessageBox.Show("Animation corrections baked and saved successfully!", "Success");
-                    }
-                }
+                File.Copy(tempPreviewPath, saveFileDialog.FileName, true);
+                MessageBox.Show("Animation corrections baked and saved successfully!", "Success");
             }
         }
     }
