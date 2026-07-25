@@ -14,9 +14,6 @@ namespace GlbMerger
 {
     public static class GlbMergeService
     {
-        private const string Tag1 = "GLB1";
-        private const string Tag2 = "GLB2";
-
         // Builds and returns the merged model without saving it anywhere - callers decide when
         // and where to persist it (letting "process" and "save" be separate UI actions).
         public static ModelRoot MergeTargeted(
@@ -28,7 +25,15 @@ namespace GlbMerger
             Dictionary<string, float>? yOffsetAnims1 = null, Dictionary<string, float>? yOffsetAnims2 = null,
             Dictionary<string, string>? matRenameMap1 = null, Dictionary<string, string>? matRenameMap2 = null,
             string? firstMatName1 = null, string? firstMatName2 = null,
-            string? firstAnimName1 = null, string? firstAnimName2 = null)
+            string? firstAnimName1 = null, string? firstAnimName2 = null,
+            // Model 2 never contributes its own geometry (model 1's is always used), so only
+            // model 1's mesh/node names need a user-controlled rename - keyed by the node's
+            // original baseName (Mesh.Name, falling back to Node.Name), same as GlbInfoPanel's
+            // geometry grid rows. Output naming used to auto-suffix "_GLB1"/"_GLB2", but that
+            // compounded every time an already-merged file was reloaded and merged again (each
+            // pass stamped another suffix on top) - the user now names the output explicitly
+            // instead.
+            Dictionary<string, string>? geomRenameMap1 = null)
         {
             if (path1 == null)
                 throw new ArgumentException("Model 1 must be loaded - its geometry is always used as the merged output's structure.");
@@ -53,8 +58,6 @@ namespace GlbMerger
 
             var structuralMats = materialsByName1;
             var otherMats = materialsByName2;
-            var structuralTag = Tag1;
-            var otherTag = Tag2;
 
             bool anyMaterialSelected = structuralMats.Count > 0 || otherMats.Count > 0;
 
@@ -93,9 +96,9 @@ namespace GlbMerger
             foreach (var pair in orderedNodePairs)
                 EmitNodeGeometry(
                     pair.Key, pair.Value,
-                    structuralMats, otherMats, structuralTag, otherTag,
+                    structuralMats, otherMats,
                     otherNodesByName, anyMaterialSelected, fallbackMaterial,
-                    outScene, nodeMap, firstMaterialOriginalName);
+                    outScene, nodeMap, firstMaterialOriginalName, geomRenameMap1);
 
             var nodeBuildersByName = nodeMap.Values
                 .GroupBy(n => n.Name)
@@ -212,13 +215,13 @@ namespace GlbMerger
             Node srcNode, NodeBuilder nodeBuilder,
             IReadOnlyDictionary<string, MaterialBuilder> structuralMats,
             IReadOnlyDictionary<string, MaterialBuilder> otherMats,
-            string structuralTag, string otherTag,
             IReadOnlyDictionary<string, Node> otherNodesByName,
             bool anyMaterialSelected,
             MaterialBuilder fallbackMaterial,
             SceneBuilder outScene,
             Dictionary<Node, NodeBuilder> nodeMap,
-            string? firstMaterialOriginalName)
+            string? firstMaterialOriginalName,
+            IReadOnlyDictionary<string, string>? geomRenameMap)
         {
             if (srcNode.Mesh == null) return;
 
@@ -228,7 +231,10 @@ namespace GlbMerger
 
             var joints = srcNode.Skin != null ? ResolveJoints(srcNode.Skin, nodeMap) : null;
 
-            var baseName = srcNode.Mesh.Name ?? srcNode.Name ?? "mesh";
+            var originalBaseName = srcNode.Mesh.Name ?? srcNode.Name ?? "mesh";
+            var baseName = geomRenameMap != null && geomRenameMap.TryGetValue(originalBaseName, out var renamedBase) && !string.IsNullOrWhiteSpace(renamedBase)
+                ? renamedBase
+                : originalBaseName;
             bool multiPrim = srcNode.Mesh.Primitives.Count > 1;
 
             for (int primIdx = 0; primIdx < srcNode.Mesh.Primitives.Count; primIdx++)
@@ -240,20 +246,20 @@ namespace GlbMerger
                 // Pair each primitive with the correctly-corresponding material from each
                 // selected source, instead of stamping every selected material (from either
                 // model) onto every primitive.
-                var variants = new List<(MaterialBuilder material, string tag, string? originalName)>();
+                var variants = new List<(MaterialBuilder material, string? originalName)>();
 
                 var structuralMatName = prim.Material?.Name;
                 if (structuralMatName != null && structuralMats.TryGetValue(structuralMatName, out var structuralMb))
-                    variants.Add((structuralMb, structuralTag, structuralMatName));
+                    variants.Add((structuralMb, structuralMatName));
 
                 var otherMatName = otherPrim?.Material?.Name;
                 if (otherMatName != null && otherMats.TryGetValue(otherMatName, out var otherMb))
-                    variants.Add((otherMb, otherTag, otherMatName));
+                    variants.Add((otherMb, otherMatName));
 
                 if (variants.Count == 0)
                 {
                     if (!anyMaterialSelected)
-                        variants.Add((fallbackMaterial, "", null));
+                        variants.Add((fallbackMaterial, null));
                     else
                         continue; // neither source's texture for this part was selected
                 }
@@ -266,20 +272,24 @@ namespace GlbMerger
                 if (firstMaterialOriginalName != null)
                     variants = variants.OrderBy(v => v.originalName == firstMaterialOriginalName ? 0 : 1).ToList();
 
-                foreach (var (material, tag, _) in variants)
+                foreach (var (material, _) in variants)
                 {
-                    var variantName = baseName
-                        + (multiPrim ? $"_p{primIdx}" : "")
-                        + (tag.Length > 0 ? $"_{tag}" : "");
-
-                    var childNode = new NodeBuilder(variantName);
-                    nodeBuilder.AddNode(childNode);
+                    var variantName = baseName + (multiPrim ? $"_p{primIdx}" : "");
 
                     if (joints != null)
                     {
                         var skinnedMesh = BuildSkinnedPrimitive(prim, material, variantName);
                         if (skinnedMesh != null)
                         {
+                            // AddSkinnedMesh positions vertices entirely from the joints array -
+                            // it takes no target-node argument, so a skinned variant needs no
+                            // extra NodeBuilder of its own. Earlier code created one anyway (as a
+                            // dead, meshless placeholder purely named after the mesh) which did
+                            // nothing but clutter the node list - it showed up alongside real
+                            // bones in the "Fix Joint Orientation" dropdown, and since
+                            // BuildNodeTree copies the *whole* hierarchy verbatim, re-merging an
+                            // already-merged file copied those placeholders forward and let them
+                            // pile up deeper on every pass.
                             outScene.AddSkinnedMesh(skinnedMesh, joints);
                             continue;
                         }
@@ -287,6 +297,10 @@ namespace GlbMerger
                         // through and merge it as a rigid (unskinned) piece instead.
                     }
 
+                    // Only the rigid path needs its own NodeBuilder - AddRigidMesh anchors the
+                    // mesh to whatever node it's given.
+                    var childNode = new NodeBuilder(variantName);
+                    nodeBuilder.AddNode(childNode);
                     var rigidMesh = BuildRigidPrimitive(prim, material, variantName);
                     if (rigidMesh != null)
                         outScene.AddRigidMesh(rigidMesh, childNode);

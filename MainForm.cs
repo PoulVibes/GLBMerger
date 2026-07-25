@@ -12,6 +12,9 @@ namespace GlbMerger
         private Button btnFile1, btnMerge, btnSave, btnViewResult, btnFixJoints;
         private Label lblStatus;
         private GlbInfoPanel panel1, panel2;
+        private CheckBox chkDarkMode;
+        private SplitContainer splitter;
+        private readonly AppSettings _settings;
         private string? path1, path2; // GLB path for a slot; null if that slot has no GLB loaded
         private FbxAnimationSource? fbxAnims1; // slot 1's single FBX source, if it holds one
         private List<FbxAnimationSource> fbxAnimsList2 = new(); // slot 2 accumulates any number of dropped FBX sources
@@ -20,6 +23,8 @@ namespace GlbMerger
 
         public MainForm()
         {
+            _settings = AppSettings.Load();
+
             Text = "GLB Texture & Animation Merger";
             Width = 850;
             Height = 650;
@@ -36,21 +41,34 @@ namespace GlbMerger
 
             toolbar.Controls.AddRange(new Control[] { btnFile1, btnMerge, btnSave, btnViewResult, btnFixJoints, lblStatus });
 
-            var splitter = new SplitContainer
+            // Bottom-right dark mode toggle, in its own strip so it stays clear of the resizable
+            // boxes above it. Positioned manually (not just Anchor) so it tracks the right edge
+            // immediately even before the form has laid out once.
+            var bottomBar = new Panel { Dock = DockStyle.Bottom, Height = 30 };
+            chkDarkMode = new CheckBox { Text = "Dark Mode", AutoSize = true, Checked = _settings.DarkMode };
+            void PositionDarkModeCheckbox(object? s, EventArgs e)
             {
-                Dock = DockStyle.Fill,
-                Orientation = Orientation.Vertical,
-                IsSplitterFixed = true
+                chkDarkMode.Left = bottomBar.Width - chkDarkMode.Width - 12;
+                chkDarkMode.Top = (bottomBar.Height - chkDarkMode.Height) / 2;
+            }
+            bottomBar.Resize += PositionDarkModeCheckbox;
+            bottomBar.Controls.Add(chkDarkMode);
+            chkDarkMode.CheckedChanged += (s, e) =>
+            {
+                _settings.DarkMode = chkDarkMode.Checked;
+                ThemeManager.Apply(this, chkDarkMode.Checked);
             };
 
-            // Keep the two info panels locked to an even 50/50 split of the visible width,
-            // regardless of how the window is resized.
-            void KeepSplitterCentered(object? s, EventArgs e)
+            splitter = new SplitContainer
             {
-                if (splitter.Width > 0)
-                    splitter.SplitterDistance = splitter.Width / 2;
-            }
-            splitter.SizeChanged += KeepSplitterCentered;
+                Dock = DockStyle.Fill,
+                Orientation = Orientation.Vertical
+            };
+            // Panel1MinSize/Panel2MinSize default to 25, which is all that's needed to stop a
+            // drag from collapsing a side entirely - deliberately not raised further here, since
+            // setting a larger min before the control has been sized/parented (its unparented
+            // default width is ~150) throws "SplitterDistance must be between Panel1MinSize and
+            // Width - Panel2MinSize".
 
             panel1 = new GlbInfoPanel { Dock = DockStyle.Fill, ShowAnimationCheckboxes = true };
             panel1.UpdateTitle("Model 1 (geometry, materials, animations)");
@@ -64,13 +82,28 @@ namespace GlbMerger
             splitter.Panel1.Controls.Add(panel1);
             splitter.Panel2.Controls.Add(panel2);
 
+            // Deferred to Shown rather than applied here: nested Dock=Fill layout can still shift
+            // sizes several times between construction and the window's first real paint (each
+            // ancestor being parented/docked nudges things again), and a SplitContainer's
+            // SizeChanged can fire against one of those in-between sizes rather than the final
+            // one. By Shown, the whole tree has gone through its real layout pass at least once,
+            // so restoring here (rather than piecemeal during construction) is what actually lands
+            // on the intended proportions instead of drifting toward a default ~50/50.
+            Shown += (s, e) =>
+            {
+                panel1.PrimarySplitFraction = _settings.Panel1PrimarySplitFraction;
+                panel1.SecondarySplitFraction = _settings.Panel1SecondarySplitFraction;
+                panel2.PrimarySplitFraction = _settings.Panel2PrimarySplitFraction;
+                SplitterFractionPersistence.ApplyFraction(splitter, _settings.MainSplitFraction);
+            };
+
             btnFile1.Click += async (s, e) => await PickModel1();
             btnMerge.Click += OnProcessMerge;
             btnSave.Click += OnSave;
 
             btnViewResult.Click += (s, e) => {
                 if (!string.IsNullOrEmpty(latestPreviewPath) && File.Exists(latestPreviewPath)) {
-                    using var viewer = new ViewerForm(latestPreviewPath);
+                    using var viewer = new ViewerForm(latestPreviewPath, _settings.DarkMode);
                     viewer.ShowDialog(this);
                 }
             };
@@ -81,7 +114,7 @@ namespace GlbMerger
             // corrected result as well, not just Save.
             btnFixJoints.Click += (s, e) => {
                 if (latestMergedModel == null || latestPreviewPath == null) return;
-                using var jointForm = new JointOrientationForm(latestMergedModel);
+                using var jointForm = new JointOrientationForm(latestMergedModel, _settings.DarkMode);
                 jointForm.ShowDialog(this);
                 latestMergedModel.SaveGLB(latestPreviewPath);
                 lblStatus.Text = "Joint corrections applied.";
@@ -89,6 +122,25 @@ namespace GlbMerger
 
             Controls.Add(splitter);
             Controls.Add(toolbar);
+            Controls.Add(bottomBar);
+            PositionDarkModeCheckbox(this, EventArgs.Empty);
+
+            ThemeManager.Apply(this, _settings.DarkMode);
+
+            FormClosing += (s, e) => SavePreferences();
+        }
+
+        // Fractions are only meaningful once each SplitContainer has real size, so this reads
+        // back whatever the user (or the startup restore) last settled on rather than anything
+        // computed ahead of time.
+        private void SavePreferences()
+        {
+            _settings.DarkMode = chkDarkMode.Checked;
+            _settings.MainSplitFraction = SplitterFractionPersistence.GetFraction(splitter);
+            _settings.Panel1PrimarySplitFraction = panel1.PrimarySplitFraction;
+            if (panel1.SecondarySplitFraction is double p1s) _settings.Panel1SecondarySplitFraction = p1s;
+            _settings.Panel2PrimarySplitFraction = panel2.PrimarySplitFraction;
+            _settings.Save();
         }
 
         // Slot 1 is always a single GLB or FBX picked via dialog, and always supplies the merged
@@ -277,6 +329,7 @@ namespace GlbMerger
                 var yOffsetAnims1 = panel1.GetYOffsetByAnimation();
                 var renameMap1 = panel1.GetAnimationRenameMap();
                 var matRenameMap1 = panel1.GetMaterialRenameMap();
+                var geomRenameMap1 = panel1.GetGeometryRenameMap();
                 var firstMat1 = panel1.GetFirstMaterialName();
                 var firstAnim1 = panel1.GetFirstAnimationName();
 
@@ -298,7 +351,8 @@ namespace GlbMerger
                     groundFixAnims1, groundFixAnims2,
                     yRotationAnims1, yRotationAnims2, yOffsetAnims1, yOffsetAnims2,
                     matRenameMap1, matRenameMap2,
-                    firstMat1, firstMat2, firstAnim1, firstAnim2);
+                    firstMat1, firstMat2, firstAnim1, firstAnim2,
+                    geomRenameMap1: geomRenameMap1);
 
                 latestPreviewPath = Path.Combine(Path.GetTempPath(), "glbmerger_preview.glb");
                 latestMergedModel.SaveGLB(latestPreviewPath);

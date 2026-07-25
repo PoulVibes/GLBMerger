@@ -11,7 +11,7 @@ namespace GlbMerger
         private WebView2 webView;
         private string glbFilePath;
 
-        public ViewerForm(string glbPath)
+        public ViewerForm(string glbPath, bool darkMode = false)
         {
             this.glbFilePath = glbPath;
             this.Text = "3D GLB Model Asset Inspector";
@@ -21,6 +21,11 @@ namespace GlbMerger
 
             webView = new WebView2 { Dock = DockStyle.Fill };
             this.Controls.Add(webView);
+
+            // The WebView2 fills the whole client area with its own already-dark HTML, so this
+            // only really shows during the brief moment before it's ready - kept for consistency
+            // with the rest of the app rather than for any real visual impact here.
+            ThemeManager.Apply(this, darkMode);
 
             this.Load += async (s, e) => await InitializeViewerAsync();
         }

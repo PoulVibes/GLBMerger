@@ -14,10 +14,12 @@ namespace GlbMerger
         public bool ShowAnimationCheckboxes { get; set; }
 
         private GroupBox mainGroup;
-        private ListBox lstPrimitives;
+        private DataGridView grdGeometry;
         private DataGridView grdMaterials;
         private DataGridView grdAnimations;
         private Label lblPrim, lblMat, lblAnim;
+        private SplitContainer _primarySplit;
+        private SplitContainer? _secondarySplit;
 
         // Slot 2 can independently carry a GLB's own baked-in animations and a supplemental FBX's
         // animations at the same time (e.g. a GLB dropped for materials that also happens to have
@@ -39,8 +41,29 @@ namespace GlbMerger
 
             mainGroup = new GroupBox { Text = "No Model Loaded", Dock = DockStyle.Fill };
 
-            lblPrim = MakeLabel("Available Geometry (Reference Layout)");
-            lstPrimitives = new ListBox { Dock = DockStyle.Fill, IntegralHeight = false };
+            lblPrim = MakeLabel("Geometry (Merged As renames the output mesh)");
+            grdGeometry = new DataGridView
+            {
+                Dock = DockStyle.Fill,
+                AllowUserToAddRows = false,
+                AllowUserToDeleteRows = false,
+                AllowUserToResizeRows = false,
+                RowHeadersVisible = false,
+                SelectionMode = DataGridViewSelectionMode.CellSelect,
+                AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
+                BackgroundColor = SystemColors.Window,
+            };
+            grdGeometry.Columns.Add(new DataGridViewTextBoxColumn { Name = "Name", HeaderText = "Geometry", ReadOnly = true, FillWeight = 35 });
+            grdGeometry.Columns.Add(new DataGridViewTextBoxColumn { Name = "Info", HeaderText = "Materials", ReadOnly = true, FillWeight = 35 });
+            // Editable output name: lets the user rename how this mesh/node appears in the merged
+            // file, without touching the source model - matched against the merge's own baseName
+            // (Mesh.Name, falling back to Node.Name) so it lands on exactly the right part.
+            grdGeometry.Columns.Add(new DataGridViewTextBoxColumn { Name = "MergedAs", HeaderText = "Merged As", FillWeight = 30 });
+            grdGeometry.CurrentCellDirtyStateChanged += (s, e) =>
+            {
+                if (grdGeometry.IsCurrentCellDirty)
+                    grdGeometry.CommitEdit(DataGridViewDataErrorContexts.Commit);
+            };
 
             lblMat = MakeLabel("Textures / Materials (Check to Inject)");
             grdMaterials = new DataGridView
@@ -127,47 +150,89 @@ namespace GlbMerger
             };
             grdAnimations.CellValueChanged += (s, e) => EnforceSingleFirst(grdAnimations, e);
 
-            // Setup rigid UI distribution matrix
-            var layout = new TableLayoutPanel
-            {
-                Dock = DockStyle.Fill,
-                ColumnCount = 1,
-                RowCount = showGeometryBox ? 6 : 4,
-                Padding = new Padding(4)
-            };
-
-            // Setup explicit percentage distributions to prevent "0-height" flattening bugs
+            // Each box (label + list/grid) sits in its own SplitContainer panel with a draggable
+            // divider between it and its neighbor, instead of the old TableLayoutPanel's fixed
+            // percentage rows - so the user can drag to give one box more room at another's
+            // expense. Default distances still roughly mirror the old 25/35/40 (or 45/55) split,
+            // but only as a starting point; ApplySplitFraction/GetSplitFraction let the caller
+            // persist and restore whatever the user actually dragged them to.
             if (showGeometryBox)
             {
-                layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));          // Text label
-                layout.RowStyles.Add(new RowStyle(SizeType.Percent, 25F));     // Prim List
-                layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));          // Text label
-                layout.RowStyles.Add(new RowStyle(SizeType.Percent, 35F));     // Material List
-                layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));          // Text label
-                layout.RowStyles.Add(new RowStyle(SizeType.Percent, 40F));     // Anim List
+                _secondarySplit = new SplitContainer
+                {
+                    Dock = DockStyle.Fill,
+                    Orientation = Orientation.Horizontal,
+                    SplitterWidth = 6,
+                    Panel1MinSize = 40,
+                    Panel2MinSize = 40
+                };
+                _secondarySplit.Panel1.Controls.Add(MakeBox(lblMat, grdMaterials));
+                _secondarySplit.Panel2.Controls.Add(MakeBox(lblAnim, grdAnimations));
 
-                layout.Controls.Add(lblPrim, 0, 0);
-                layout.Controls.Add(lstPrimitives, 0, 1);
-                layout.Controls.Add(lblMat, 0, 2);
-                layout.Controls.Add(grdMaterials, 0, 3);
-                layout.Controls.Add(lblAnim, 0, 4);
-                layout.Controls.Add(grdAnimations, 0, 5);
+                _primarySplit = new SplitContainer
+                {
+                    Dock = DockStyle.Fill,
+                    Orientation = Orientation.Horizontal,
+                    SplitterWidth = 6,
+                    Panel1MinSize = 40,
+                    Panel2MinSize = 80
+                };
+                _primarySplit.Panel1.Controls.Add(MakeBox(lblPrim, grdGeometry));
+                _primarySplit.Panel2.Controls.Add(_secondarySplit);
+
+                SplitterFractionPersistence.ApplyFraction(_primarySplit, 0.25);
+                SplitterFractionPersistence.ApplyFraction(_secondarySplit, 0.4667);
             }
             else
             {
-                layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));          // Text label
-                layout.RowStyles.Add(new RowStyle(SizeType.Percent, 45F));     // Material List
-                layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));          // Text label
-                layout.RowStyles.Add(new RowStyle(SizeType.Percent, 55F));     // Anim List
+                _secondarySplit = null;
+                _primarySplit = new SplitContainer
+                {
+                    Dock = DockStyle.Fill,
+                    Orientation = Orientation.Horizontal,
+                    SplitterWidth = 6,
+                    Panel1MinSize = 40,
+                    Panel2MinSize = 40
+                };
+                _primarySplit.Panel1.Controls.Add(MakeBox(lblMat, grdMaterials));
+                _primarySplit.Panel2.Controls.Add(MakeBox(lblAnim, grdAnimations));
 
-                layout.Controls.Add(lblMat, 0, 0);
-                layout.Controls.Add(grdMaterials, 0, 1);
-                layout.Controls.Add(lblAnim, 0, 2);
-                layout.Controls.Add(grdAnimations, 0, 3);
+                SplitterFractionPersistence.ApplyFraction(_primarySplit, 0.45);
             }
 
-            mainGroup.Controls.Add(layout);
+            mainGroup.Controls.Add(_primarySplit);
             Controls.Add(mainGroup);
+        }
+
+        // Wraps a label + its list/grid into one Dock=Fill unit suitable for a SplitContainer
+        // panel - the content docks Fill first so the label (docked Top, added after) claims its
+        // own row above it rather than being squeezed out.
+        private static Panel MakeBox(Label label, Control content)
+        {
+            var box = new Panel { Dock = DockStyle.Fill };
+            content.Dock = DockStyle.Fill;
+            label.Dock = DockStyle.Top;
+            box.Controls.Add(content);
+            box.Controls.Add(label);
+            return box;
+        }
+
+        // Fraction (0..1) of this panel's primary divider - geometry-vs-rest when the geometry
+        // box is shown, otherwise materials-vs-animations directly. Used by the host form to
+        // persist/restore the user's chosen box sizes across runs.
+        public double PrimarySplitFraction
+        {
+            get => SplitterFractionPersistence.GetFraction(_primarySplit);
+            set => SplitterFractionPersistence.ApplyFraction(_primarySplit, value);
+        }
+
+        // Fraction (0..1) of the materials-vs-animations divider nested under the geometry box.
+        // Null when this panel has no geometry box (there's only one divider in that case,
+        // already covered by PrimarySplitFraction).
+        public double? SecondarySplitFraction
+        {
+            get => _secondarySplit != null ? SplitterFractionPersistence.GetFraction(_secondarySplit) : (double?)null;
+            set { if (_secondarySplit != null && value.HasValue) SplitterFractionPersistence.ApplyFraction(_secondarySplit, value.Value); }
         }
 
         // Lets this panel accept a GLB dropped onto the materials list and/or one or more FBX
@@ -249,8 +314,8 @@ namespace GlbMerger
         {
             this.SuspendLayout();
 
-            lstPrimitives.Items.Clear();
-            lstPrimitives.Items.Add("(FBX source - animation only, no geometry)");
+            grdGeometry.Rows.Clear();
+            grdGeometry.Rows.Add("(FBX source - animation only, no geometry)", "", "");
 
             grdMaterials.Rows.Clear();
 
@@ -267,20 +332,37 @@ namespace GlbMerger
         {
             this.SuspendLayout();
 
-            lstPrimitives.Items.Clear();
+            grdGeometry.Rows.Clear();
             grdMaterials.Rows.Clear();
 
             var model = ModelRoot.Load(path);
 
-            foreach (var mesh in model.LogicalMeshes)
-                foreach (var prim in mesh.Primitives)
+            // One row per node/mesh, keyed by the same baseName GlbMergeService uses (Mesh.Name,
+            // falling back to Node.Name) - so what the user types in "Merged As" here lands on
+            // exactly the part they're looking at, however many primitives/materials it has.
+            var seenBaseNames = new HashSet<string>();
+            void WalkNode(Node node)
+            {
+                if (node.Mesh != null)
                 {
-                    var matName = prim.Material?.Name ?? "No Material";
-                    lstPrimitives.Items.Add($"{mesh.Name ?? "mesh"} [Mat: {matName}]");
+                    var baseName = node.Mesh.Name ?? node.Name ?? "mesh";
+                    if (seenBaseNames.Add(baseName))
+                    {
+                        var matNames = node.Mesh.Primitives.Select(p => p.Material?.Name ?? "No Material").Distinct();
+                        grdGeometry.Rows.Add(baseName, string.Join(", ", matNames), baseName);
+                    }
                 }
 
-            if (lstPrimitives.Items.Count == 0)
-                lstPrimitives.Items.Add("(no geometry found)");
+                foreach (var child in node.VisualChildren)
+                    WalkNode(child);
+            }
+
+            if (model.DefaultScene != null)
+                foreach (var node in model.DefaultScene.VisualChildren)
+                    WalkNode(node);
+
+            if (grdGeometry.Rows.Count == 0)
+                grdGeometry.Rows.Add("(no geometry found)", "", "");
 
             foreach (var mat in model.LogicalMaterials)
             {
@@ -397,6 +479,24 @@ namespace GlbMerger
                 if (row.Cells["Include"].Value is not bool included || !included) continue;
 
                 var originalName = (string)row.Cells["Name"].Value!;
+                var mergedAs = row.Cells["MergedAs"].Value as string;
+                result[originalName] = string.IsNullOrWhiteSpace(mergedAs) ? originalName : mergedAs;
+            }
+            return result;
+        }
+
+        // Maps each geometry row's original baseName to whatever the user typed in "Merged As",
+        // so the merge can rename the output mesh/node without ever touching the source model.
+        // Unlike materials/animations there's no "Include" checkbox here - model 1's geometry is
+        // always used in full - so every row contributes an entry.
+        public Dictionary<string, string> GetGeometryRenameMap()
+        {
+            var result = new Dictionary<string, string>();
+            foreach (DataGridViewRow row in grdGeometry.Rows)
+            {
+                var originalName = row.Cells["Name"].Value as string;
+                if (string.IsNullOrEmpty(originalName)) continue;
+
                 var mergedAs = row.Cells["MergedAs"].Value as string;
                 result[originalName] = string.IsNullOrWhiteSpace(mergedAs) ? originalName : mergedAs;
             }

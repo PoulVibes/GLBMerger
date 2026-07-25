@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Numerics;
@@ -25,6 +26,8 @@ namespace GlbMerger
         private ComboBox _animDropdown = null!;
         private TrackBar _sliderX = null!, _sliderY = null!, _sliderZ = null!;
         private Label _lblX = null!, _lblY = null!, _lblZ = null!;
+        private NumericUpDown _numPosX = null!, _numPosY = null!, _numPosZ = null!;
+        private Label _lblPosX = null!, _lblPosY = null!, _lblPosZ = null!;
         private Label _lblStatus = null!;
         private Button _btnPause = null!;
         private WebView2 _webView = null!;
@@ -36,34 +39,51 @@ namespace GlbMerger
         // rather than trying to decompose a quaternion back into Euler angles.
         private readonly Dictionary<string, (int X, int Y, int Z)> _pendingOffsets = new();
 
+        // Bone name -> not-yet-saved position offset in meters, one entry per axis - the
+        // translation counterpart to _pendingOffsets above. Kept separate (rather than folded
+        // into one struct) so a bone can have a pending rotation change, a pending position
+        // change, or both, independently. Interpreted as a WORLD-space offset (see
+        // ToParentLocalOffset) rather than raw local, so it holds a steady position even when
+        // the bone's parent chain is itself animated.
+        private readonly Dictionary<string, (float X, float Y, float Z)> _pendingTranslationOffsets = new();
+
         // Bone name -> its rotation keys (or bind rotation) exactly as they were before any
         // adjustment this "session" (i.e. since the bone was first touched after the last
         // animation swap). Saving re-derives the correction from this baseline every time rather
         // than from whatever is currently in the model, so hitting Save repeatedly while still
         // moving the slider doesn't compound the rotation onto itself.
         private readonly Dictionary<string, (float Time, Quaternion Value)[]> _originalKeysCache = new();
+
+        // Translation counterpart to _originalKeysCache, same anti-compounding purpose.
+        private readonly Dictionary<string, (float Time, Vector3 Value)[]> _originalTranslationKeysCache = new();
         private bool _suppressSliderEvents;
 
-        public JointOrientationForm(ModelRoot model)
+        public JointOrientationForm(ModelRoot model, bool darkMode = false)
         {
             _model = model;
 
             Text = "Fix Joint Orientation";
             Width = 1000;
-            Height = 700;
-            MinimumSize = new System.Drawing.Size(700, 450);
+            Height = 850;
+            MinimumSize = new System.Drawing.Size(700, 600);
             StartPosition = FormStartPosition.CenterParent;
 
             BuildUi();
             PopulateBoneList();
             PopulateAnimationList();
 
+            // The 3D preview itself is a WebView2 rendering its own already-dark scene, so only
+            // the surrounding WinForms control panel (sliders, dropdowns, buttons) needs theming.
+            ThemeManager.Apply(this, darkMode);
+
             _ = InitializeViewerAsync();
         }
 
         private void BuildUi()
         {
-            var controlPanel = new Panel { Dock = DockStyle.Left, Width = 320, Padding = new Padding(12) };
+            // AutoScroll so shrinking the window toward MinimumSize scrolls the panel instead of
+            // clipping the bottom controls, now that there's a full extra row of position controls.
+            var controlPanel = new Panel { Dock = DockStyle.Left, Width = 320, Padding = new Padding(12), AutoScroll = true };
 
             var lblBone = new Label { Text = "Joint / Bone:", Left = 12, Top = 12, AutoSize = true };
             _boneDropdown = new ComboBox { Left = 12, Top = 32, Width = 280, DropDownStyle = ComboBoxStyle.DropDownList };
@@ -80,20 +100,25 @@ namespace GlbMerger
             (_lblY, _sliderY) = MakeSlider("Y Rotation", 198);
             (_lblZ, _sliderZ) = MakeSlider("Z Rotation", 268);
 
-            var btnSave = new Button { Text = "Save Adjustments to Animation", Left = 12, Top = 340, Width = 280 };
+            (_lblPosX, _numPosX) = MakeNumericPosition("X Position", 344);
+            (_lblPosY, _numPosY) = MakeNumericPosition("Y Position", 384);
+            (_lblPosZ, _numPosZ) = MakeNumericPosition("Z Position", 424);
+
+            var btnSave = new Button { Text = "Save Adjustments to Animation", Left = 12, Top = 478, Width = 280 };
             btnSave.Click += (s, e) => SaveAdjustments();
 
-            var btnReset = new Button { Text = "Reset This Joint", Left = 12, Top = 380, Width = 280 };
+            var btnReset = new Button { Text = "Reset This Joint", Left = 12, Top = 518, Width = 280 };
             btnReset.Click += (s, e) => ResetCurrentBone();
 
-            _lblStatus = new Label { Left = 12, Top = 418, Width = 280, Height = 32, AutoSize = false, ForeColor = System.Drawing.Color.LightGreen };
+            _lblStatus = new Label { Left = 12, Top = 556, Width = 280, Height = 32, AutoSize = false, ForeColor = System.Drawing.Color.LightGreen };
 
-            var btnClose = new Button { Text = "Done", Left = 12, Top = 458, Width = 280, DialogResult = DialogResult.OK };
+            var btnClose = new Button { Text = "Done", Left = 12, Top = 596, Width = 280, DialogResult = DialogResult.OK };
 
             controlPanel.Controls.AddRange(new Control[]
             {
                 lblBone, _boneDropdown, lblAnim, _animDropdown, _btnPause,
                 _lblX, _sliderX, _lblY, _sliderY, _lblZ, _sliderZ,
+                _lblPosX, _numPosX, _lblPosY, _numPosY, _lblPosZ, _numPosZ,
                 btnSave, btnReset, _lblStatus, btnClose
             });
             AcceptButton = btnClose;
@@ -183,31 +208,86 @@ namespace GlbMerger
                         var clock = new THREE.Clock();
                         var paused = false;
                         var bonesByName = {};
+                        // The currently-playing clip and its action, kept as direct references (not
+                        // looked up via mixer's private/internal action list) so the correction
+                        // loops below can sample track data straight from the clip regardless of
+                        // what mixer.update() has or hasn't written into the live bone objects -
+                        // see sampleTrackValue for why that live-property route isn't safe to trust.
+                        var currentClip = null;
+                        var currentAction = null;
+
                         // boneName -> THREE.Quaternion offset, re-applied on top of whatever the
                         // bone's rotation is *this frame* (bind pose, or animation-driven) - so it
                         // works identically whether an animation is playing or not, and moving a
                         // slider just changes what gets re-applied next frame, live.
                         var liveCorrections = {};
-                        // boneName -> the bone's un-corrected rotation, snapshotted right after
-                        // mixer.update() sets it fresh each frame. Corrections are always applied
-                        // on top of this snapshot rather than mutated in place, so pausing (which
-                        // stops mixer.update from refreshing the bone) doesn't cause the same
-                        // correction to be re-applied onto an already-corrected value every frame,
-                        // which is what was making paused joints spin.
+                        // boneName -> the bone's un-corrected rotation for this frame. Corrections
+                        // are always applied on top of this rather than mutated in place, so
+                        // pausing doesn't cause the same correction to be re-applied onto an
+                        // already-corrected value every frame (which is what was making paused
+                        // joints spin), and so a track whose value happens to be constant across
+                        // the whole clip doesn't get its own already-corrected output fed back in
+                        // as next frame's 'clean' base (which is what was making corrected joints
+                        // drift/bounce instead of holding position - see sampleTrackValue).
                         var baseQuaternions = {};
+
+                        // Position counterparts to liveCorrections/baseQuaternions above.
+                        var liveTranslationCorrections = {};
+                        var basePositions = {};
+
+                        // Reads a bone's own animation-curve value directly from its KeyframeTrack
+                        // via the track's interpolant, entirely bypassing bone.position/quaternion.
+                        // Those live properties are NOT a safe source for 'the clean, uncorrected
+                        // value this frame': mixer.update() only reliably refreshes a bone's
+                        // property when the track's interpolated value actually *changes* between
+                        // frames. For a track whose value is constant across every keyframe (the
+                        // common case for a non-root bone's position, or any bone that simply
+                        // doesn't move on some axis) mixer.update() leaves the property holding
+                        // whatever this code last wrote there - so re-reading it back as 'this
+                        // frame's clean base' was actually re-reading *last frame's own corrected
+                        // output*, turning a constant offset into `position += delta` every frame
+                        // forever (a runaway integrator) instead of a fixed correction. Sampling the
+                        // interpolant directly sidesteps that entirely, since it depends only on the
+                        // track's own keyframe data and the query time, never on what's currently
+                        // sitting in the live property.
+                        function sampleTrackValue(clip, boneName, suffix, time) {
+                            if (!clip) return null;
+                            for (var i = 0; i < clip.tracks.length; i++) {
+                                var track = clip.tracks[i];
+                                var lastDot = track.name.lastIndexOf('.');
+                                if (lastDot === -1) continue;
+                                if (track.name.substring(0, lastDot) !== boneName) continue;
+                                if (track.name.substring(lastDot + 1) !== suffix) continue;
+                                if (!track.__interpolant) track.__interpolant = track.createInterpolant();
+                                return track.__interpolant.evaluate(time);
+                            }
+                            return null;
+                        }
 
                         window.setLiveCorrection = function (boneName, x, y, z, w) {
                             if (!liveCorrections[boneName]) liveCorrections[boneName] = new THREE.Quaternion();
                             liveCorrections[boneName].set(x, y, z, w);
                         };
 
+                        window.setLiveTranslationCorrection = function (boneName, x, y, z) {
+                            if (!liveTranslationCorrections[boneName]) liveTranslationCorrections[boneName] = new THREE.Vector3();
+                            liveTranslationCorrections[boneName].set(x, y, z);
+                        };
+
                         window.setAnimationByName = function (name) {
                             baseQuaternions = {};
+                            basePositions = {};
+                            currentClip = null;
+                            currentAction = null;
                             if (!mixer) return;
                             mixer.stopAllAction();
                             if (!name) return;
                             var clip = window._clips.filter(function (c) { return c.name === name; })[0];
-                            if (clip) mixer.clipAction(clip).play();
+                            if (clip) {
+                                currentClip = clip;
+                                currentAction = mixer.clipAction(clip);
+                                currentAction.play();
+                            }
                         };
 
                         window.setPaused = function (value) {
@@ -269,7 +349,9 @@ namespace GlbMerger
                                     // .NET side's own default selection (its first real
                                     // animation) without needing a round-trip back from C#, which
                                     // could race with the model still loading.
-                                    mixer.clipAction(window._clips[0]).play();
+                                    currentClip = window._clips[0];
+                                    currentAction = mixer.clipAction(currentClip);
+                                    currentAction.play();
                                 }
                             } catch (innerErr) {
                                 showError('Error setting up loaded model: ' + innerErr.message);
@@ -288,25 +370,62 @@ namespace GlbMerger
                             requestAnimationFrame(animate);
                             var delta = clock.getDelta();
                             if (mixer && !paused) mixer.update(delta);
+                            var clipTime = currentAction ? currentAction.time : 0;
 
                             for (var name in liveCorrections) {
                                 var bone = bonesByName[name];
                                 if (!bone) continue;
 
                                 if (!paused) {
-                                    // mixer.update() (or the static bind pose, if there's no
-                                    // mixer) just gave this bone a clean, uncorrected rotation -
-                                    // safe to snapshot as this frame's base.
-                                    if (!baseQuaternions[name]) baseQuaternions[name] = bone.quaternion.clone();
-                                    else baseQuaternions[name].copy(bone.quaternion);
+                                    var sampledRot = sampleTrackValue(currentClip, name, 'quaternion', clipTime);
+                                    if (sampledRot) {
+                                        if (!baseQuaternions[name]) baseQuaternions[name] = new THREE.Quaternion();
+                                        baseQuaternions[name].fromArray(sampledRot);
+                                    } else if (!baseQuaternions[name]) {
+                                        // No track for this bone in the current clip (e.g. an
+                                        // un-keyframed hand/finger joint) or paused - fall back to
+                                        // whatever the bone's rotation already is, once.
+                                        baseQuaternions[name] = bone.quaternion.clone();
+                                    }
                                 } else if (!baseQuaternions[name]) {
-                                    // Paused with no base yet (bone first touched while already
-                                    // paused) - its current rotation hasn't been corrected, so
-                                    // it's still clean.
                                     baseQuaternions[name] = bone.quaternion.clone();
                                 }
 
                                 bone.quaternion.copy(baseQuaternions[name]).premultiply(liveCorrections[name]);
+                            }
+
+                            for (var posName in liveTranslationCorrections) {
+                                var posBone = bonesByName[posName];
+                                if (!posBone) continue;
+
+                                if (!paused) {
+                                    var sampledPos = sampleTrackValue(currentClip, posName, 'position', clipTime);
+                                    if (sampledPos) {
+                                        if (!basePositions[posName]) basePositions[posName] = new THREE.Vector3();
+                                        basePositions[posName].fromArray(sampledPos);
+                                    } else if (!basePositions[posName]) {
+                                        basePositions[posName] = posBone.position.clone();
+                                    }
+                                } else if (!basePositions[posName]) {
+                                    basePositions[posName] = posBone.position.clone();
+                                }
+
+                                // The correction is a WORLD-space delta (e.g. 'always 10cm
+                                // lower'), not a raw local one - added as-is, it would get
+                                // dragged through whatever rotation the parent chain is doing
+                                // that frame (a spine swaying with a breathing idle, say), making
+                                // the offset visibly wobble instead of holding a steady position.
+                                // Counter-rotating by the parent's current world orientation is
+                                // what keeps it anchored in world space for the whole clip.
+                                var localDelta = liveTranslationCorrections[posName].clone();
+                                if (posBone.parent) {
+                                    posBone.parent.updateWorldMatrix(true, false);
+                                    var parentWorldQuat = new THREE.Quaternion();
+                                    posBone.parent.getWorldQuaternion(parentWorldQuat);
+                                    localDelta.applyQuaternion(parentWorldQuat.invert());
+                                }
+
+                                posBone.position.copy(basePositions[posName]).add(localDelta);
                             }
 
                             controls.update();
@@ -377,14 +496,43 @@ namespace GlbMerger
             return (lbl, slider);
         }
 
+        // Position uses a NumericUpDown rather than a TrackBar like rotation does - joint nudges
+        // need typed precision more than a slider does. Deliberately NOT scaled/labeled as meters:
+        // a glTF's translation units are only "meters" by convention, and plenty of real files
+        // (this app has already hit this with the "YOffset" per-animation column, which uses the
+        // same unscaled +/-9999 range for the same reason) are authored at a completely different
+        // scale - one test rig has its whole skeleton on the order of 100+ units tall, where a
+        // +/-5 range would be too small to ever produce a visible correction. Left unitless and
+        // wide so it works regardless of the model's own scale; the user can always type a precise
+        // value even though the increment steps coarsely.
+        private (Label, NumericUpDown) MakeNumericPosition(string text, int top)
+        {
+            var lbl = new Label { Text = $"{text}: 0", Left = 12, Top = top, Width = 280, AutoSize = false };
+            var numeric = new NumericUpDown
+            {
+                Left = 12, Top = top + 18, Width = 120,
+                Minimum = -9999m, Maximum = 9999m, DecimalPlaces = 3, Increment = 0.1m, Value = 0m
+            };
+            numeric.ValueChanged += (s, e) => { lbl.Text = $"{text}: {numeric.Value}"; ApplyCorrection(); };
+            return (lbl, numeric);
+        }
+
+        // Only nodes that actually act as a skin's joints are real bones - every other named
+        // node in the file is geometry (a mesh-bearing part, or an empty grouping node) and has
+        // no orientation to "fix". Listing every LogicalNode used to mix real bones in with those
+        // geometry names, which is what showed up as clutter in this dropdown.
         private void PopulateBoneList()
         {
-            var names = _model.LogicalNodes
-                .Where(n => !string.IsNullOrEmpty(n.Name))
-                .Select(n => n.Name!)
-                .Distinct()
-                .OrderBy(n => n)
-                .ToArray();
+            var jointNames = new HashSet<string>();
+            foreach (var skin in _model.LogicalSkins)
+                for (int i = 0; i < skin.JointsCount; i++)
+                {
+                    var (jointNode, _) = skin.GetJoint(i);
+                    if (!string.IsNullOrEmpty(jointNode.Name))
+                        jointNames.Add(jointNode.Name);
+                }
+
+            var names = jointNames.OrderBy(n => n).ToArray();
 
             _boneDropdown.Items.AddRange(names);
             if (names.Length > 0) _boneDropdown.SelectedIndex = 0;
@@ -404,11 +552,73 @@ namespace GlbMerger
             return Quaternion.Normalize(Quaternion.Multiply(Quaternion.Multiply(rotZ, rotY), rotX));
         }
 
+        // Converts a desired WORLD-space offset into the local-space vector that, once composed
+        // through this bone's animated parent chain, reproduces that same world-space
+        // displacement at the given animation time. A bone's local translation only ever means
+        // "however far along my parent's current axes" - if any ancestor rotates over the course
+        // of the clip (a spine swaying with a breathing idle, say), a plain constant local offset
+        // gets dragged along for that rotation and visibly wobbles instead of holding a steady
+        // position. This undoes exactly that rotation so the offset stays fixed in world space
+        // for the whole animation, not just at the frame it happened to be dialed in against.
+        private static Vector3 ToParentLocalOffset(Node node, Animation? anim, float time, Vector3 worldOffset)
+        {
+            if (node.VisualParent == null) return worldOffset;
+
+            var parentWorldRotation = GetWorldRotationAt(node.VisualParent, anim, time);
+            return Vector3.Transform(worldOffset, Quaternion.Inverse(parentWorldRotation));
+        }
+
+        // Cumulative world rotation of `node` at `time` in `anim` (or the bind pose if anim is
+        // null) - composes every ancestor's own local rotation at that same time, root-first,
+        // the same way the glTF node hierarchy itself composes world transforms.
+        private static Quaternion GetWorldRotationAt(Node node, Animation? anim, float time)
+        {
+            var local = GetLocalRotationAt(node, anim, time);
+            return node.VisualParent == null
+                ? local
+                : Quaternion.Normalize(Quaternion.Multiply(GetWorldRotationAt(node.VisualParent, anim, time), local));
+        }
+
+        private static Quaternion GetLocalRotationAt(Node node, Animation? anim, float time)
+        {
+            var channel = anim?.Channels.FirstOrDefault(c => c.TargetNode == node && c.TargetNodePath == PropertyPath.rotation);
+            if (channel == null)
+            {
+                Matrix4x4.Decompose(node.LocalMatrix, out _, out var bind, out _);
+                return Quaternion.Normalize(bind);
+            }
+
+            var keys = channel.GetRotationSampler().GetLinearKeys().OrderBy(k => k.Key).ToArray();
+            return Quaternion.Normalize(SampleQuaternionAt(keys, time));
+        }
+
+        // Simple linear-time lookup + Slerp between the bracketing keys - the rotation channels
+        // read here are typically a few hundred keys at most (one per animation frame), so this
+        // doesn't need anything fancier than a scan for a Save that runs once per click.
+        private static Quaternion SampleQuaternionAt((float Time, Quaternion Value)[] sortedKeys, float time)
+        {
+            if (sortedKeys.Length == 0) return Quaternion.Identity;
+            if (time <= sortedKeys[0].Time) return sortedKeys[0].Value;
+            if (time >= sortedKeys[^1].Time) return sortedKeys[^1].Value;
+
+            for (int i = 0; i < sortedKeys.Length - 1; i++)
+            {
+                if (time < sortedKeys[i + 1].Time)
+                {
+                    float span = sortedKeys[i + 1].Time - sortedKeys[i].Time;
+                    float t = span > 0f ? (time - sortedKeys[i].Time) / span : 0f;
+                    return Quaternion.Slerp(sortedKeys[i].Value, sortedKeys[i + 1].Value, t);
+                }
+            }
+            return sortedKeys[^1].Value;
+        }
+
         private void OnBoneSelected()
         {
             if (_boneDropdown.SelectedItem is not string boneName) return;
 
             var (x, y, z) = _pendingOffsets.TryGetValue(boneName, out var pending) ? pending : (0, 0, 0);
+            var (px, py, pz) = _pendingTranslationOffsets.TryGetValue(boneName, out var pendingPos) ? pendingPos : (0f, 0f, 0f);
 
             _suppressSliderEvents = true;
             _sliderX.Value = x;
@@ -417,6 +627,15 @@ namespace GlbMerger
             _lblX.Text = $"X Rotation: {x}°";
             _lblY.Text = $"Y Rotation: {y}°";
             _lblZ.Text = $"Z Rotation: {z}°";
+            // Clamped defensively - pending values only ever come from these same controls, but a
+            // value sitting exactly on the NumericUpDown's Min/Max boundary can round the wrong way
+            // through the float/decimal conversion and throw when assigned back.
+            _numPosX.Value = Math.Clamp((decimal)px, _numPosX.Minimum, _numPosX.Maximum);
+            _numPosY.Value = Math.Clamp((decimal)py, _numPosY.Minimum, _numPosY.Maximum);
+            _numPosZ.Value = Math.Clamp((decimal)pz, _numPosZ.Minimum, _numPosZ.Maximum);
+            _lblPosX.Text = $"X Position: {px}";
+            _lblPosY.Text = $"Y Position: {py}";
+            _lblPosZ.Text = $"Z Position: {pz}";
             _suppressSliderEvents = false;
             // Restores whatever not-yet-saved offset was already dialed in for this bone, so
             // switching away and back doesn't lose it - the live 3D view is left untouched too,
@@ -451,13 +670,38 @@ namespace GlbMerger
             return keys;
         }
 
+        // Translation counterpart to GetOrCacheOriginalKeys - same once-per-session baseline
+        // capture, same bind-pose fallback when the bone has no translation channel in this clip
+        // (the common case for anything that isn't the animation's root motion bone).
+        private (float Time, Vector3 Value)[] GetOrCacheOriginalTranslationKeys(string boneName, bool isStaticPose, Animation? anim, Node node)
+        {
+            if (_originalTranslationKeysCache.TryGetValue(boneName, out var cached)) return cached;
+
+            (float Time, Vector3 Value)[] keys;
+            var channel = isStaticPose ? null : anim!.Channels.FirstOrDefault(c => c.TargetNode == node && c.TargetNodePath == PropertyPath.translation);
+            if (channel != null)
+            {
+                var sampler = channel.GetTranslationSampler();
+                keys = sampler.GetLinearKeys().OrderBy(k => k.Key).Select(k => (k.Key, k.Value)).ToArray();
+            }
+            else
+            {
+                Matrix4x4.Decompose(node.LocalMatrix, out _, out _, out var bindTranslation);
+                keys = new[] { (0f, bindTranslation) };
+            }
+
+            _originalTranslationKeysCache[boneName] = keys;
+            return keys;
+        }
+
         private void ResetCurrentBone()
         {
             if (_boneDropdown.SelectedItem is not string boneName) return;
 
+            var node = _model.LogicalNodes.First(n => n.Name == boneName);
+
             if (_originalKeysCache.TryGetValue(boneName, out var originalKeys))
             {
-                var node = _model.LogicalNodes.First(n => n.Name == boneName);
                 if (_animDropdown.SelectedIndex <= 0)
                     node.WithLocalRotation(originalKeys[0].Value);
                 else
@@ -465,11 +709,24 @@ namespace GlbMerger
                 _originalKeysCache.Remove(boneName);
             }
 
+            if (_originalTranslationKeysCache.TryGetValue(boneName, out var originalTranslationKeys))
+            {
+                if (_animDropdown.SelectedIndex <= 0)
+                    node.WithLocalTranslation(originalTranslationKeys[0].Value);
+                else
+                    node.WithTranslationAnimation((string)_animDropdown.SelectedItem!, originalTranslationKeys);
+                _originalTranslationKeysCache.Remove(boneName);
+            }
+
             _pendingOffsets.Remove(boneName);
+            _pendingTranslationOffsets.Remove(boneName);
             OnBoneSelected();
 
             if (_viewerReady)
+            {
                 _webView.CoreWebView2.ExecuteScriptAsync($"setLiveCorrection('{EscapeJs(boneName)}', 0, 0, 0, 1);");
+                _webView.CoreWebView2.ExecuteScriptAsync($"setLiveTranslationCorrection('{EscapeJs(boneName)}', 0, 0, 0);");
+            }
             _lblStatus.Text = "";
         }
 
@@ -479,13 +736,22 @@ namespace GlbMerger
             {
                 foreach (var boneName in _pendingOffsets.Keys)
                     _webView.CoreWebView2.ExecuteScriptAsync($"setLiveCorrection('{EscapeJs(boneName)}', 0, 0, 0, 1);");
+                foreach (var boneName in _pendingTranslationOffsets.Keys)
+                    _webView.CoreWebView2.ExecuteScriptAsync($"setLiveTranslationCorrection('{EscapeJs(boneName)}', 0, 0, 0);");
             }
             _pendingOffsets.Clear();
             _originalKeysCache.Clear();
+            _pendingTranslationOffsets.Clear();
+            _originalTranslationKeysCache.Clear();
 
             if (_boneDropdown.SelectedItem is string) OnBoneSelected();
             _lblStatus.Text = "";
         }
+
+        // ExecuteScriptAsync builds a literal JS number from this - $"{value}" would use the
+        // current culture (e.g. "0,125" with a comma on many non-US locales), which is not valid
+        // JS syntax and would silently corrupt the script. Always format invariant.
+        private static string Inv(float v) => v.ToString(CultureInfo.InvariantCulture);
 
         private void ApplyCorrection()
         {
@@ -498,8 +764,10 @@ namespace GlbMerger
             // Capture the baseline now, before Save could ever overwrite the model, so it reflects
             // this bone's truly-original data for the current animation.
             GetOrCacheOriginalKeys(boneName, isStaticPose, anim, node);
+            GetOrCacheOriginalTranslationKeys(boneName, isStaticPose, anim, node);
 
             _pendingOffsets[boneName] = (_sliderX.Value, _sliderY.Value, _sliderZ.Value);
+            _pendingTranslationOffsets[boneName] = ((float)_numPosX.Value, (float)_numPosY.Value, (float)_numPosZ.Value);
             _lblStatus.Text = "";
 
             var offset = ComputeOffsetQuaternion(_sliderX.Value, _sliderY.Value, _sliderZ.Value);
@@ -508,13 +776,17 @@ namespace GlbMerger
             // reload involved, so this is instant and doesn't flicker. Nothing is written to the
             // underlying model yet; that only happens on "Save Adjustments to Animation".
             if (_viewerReady)
+            {
                 _webView.CoreWebView2.ExecuteScriptAsync(
-                    $"setLiveCorrection('{EscapeJs(boneName)}', {offset.X}, {offset.Y}, {offset.Z}, {offset.W});");
+                    $"setLiveCorrection('{EscapeJs(boneName)}', {Inv(offset.X)}, {Inv(offset.Y)}, {Inv(offset.Z)}, {Inv(offset.W)});");
+                _webView.CoreWebView2.ExecuteScriptAsync(
+                    $"setLiveTranslationCorrection('{EscapeJs(boneName)}', {Inv((float)_numPosX.Value)}, {Inv((float)_numPosY.Value)}, {Inv((float)_numPosZ.Value)});");
+            }
         }
 
         private void SaveAdjustments()
         {
-            if (_pendingOffsets.Count == 0)
+            if (_pendingOffsets.Count == 0 && _pendingTranslationOffsets.Count == 0)
             {
                 MessageBox.Show(this, "No joint adjustments to save.", "Fix Joint Orientation",
                     MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -525,20 +797,53 @@ namespace GlbMerger
             string? animName = isStaticPose ? null : (string)_animDropdown.SelectedItem!;
             Animation? anim = isStaticPose ? null : _model.LogicalAnimations.First(a => a.Name == animName);
 
-            foreach (var (boneName, degrees) in _pendingOffsets)
-            {
-                var offset = ComputeOffsetQuaternion(degrees.X, degrees.Y, degrees.Z);
-                var node = _model.LogicalNodes.First(n => n.Name == boneName);
-                var originalKeys = GetOrCacheOriginalKeys(boneName, isStaticPose, anim, node);
+            // A bone can have a pending rotation offset, a pending position offset, or both -
+            // ApplyCorrection always sets both dictionaries together, so in practice this union is
+            // just whichever bones have been touched at all, but keeping them independent here
+            // means neither kind of adjustment is silently skipped if that ever changes.
+            var affectedBones = new HashSet<string>(_pendingOffsets.Keys);
+            affectedBones.UnionWith(_pendingTranslationOffsets.Keys);
 
-                if (isStaticPose)
+            foreach (var boneName in affectedBones)
+            {
+                var node = _model.LogicalNodes.First(n => n.Name == boneName);
+
+                if (_pendingOffsets.TryGetValue(boneName, out var degrees))
                 {
-                    node.WithLocalRotation(Quaternion.Normalize(Quaternion.Multiply(offset, originalKeys[0].Value)));
-                    continue;
+                    var offset = ComputeOffsetQuaternion(degrees.X, degrees.Y, degrees.Z);
+                    var originalKeys = GetOrCacheOriginalKeys(boneName, isStaticPose, anim, node);
+
+                    if (isStaticPose)
+                        node.WithLocalRotation(Quaternion.Normalize(Quaternion.Multiply(offset, originalKeys[0].Value)));
+                    else
+                    {
+                        var corrected = originalKeys.Select(k => (k.Time, Quaternion.Normalize(Quaternion.Multiply(offset, k.Value)))).ToArray();
+                        node.WithRotationAnimation(animName!, corrected);
+                    }
                 }
 
-                var corrected = originalKeys.Select(k => (k.Time, Quaternion.Normalize(Quaternion.Multiply(offset, k.Value)))).ToArray();
-                node.WithRotationAnimation(animName!, corrected);
+                if (_pendingTranslationOffsets.TryGetValue(boneName, out var posOffset))
+                {
+                    // Treated as a WORLD-space delta (e.g. "always 10cm lower"), not a raw local
+                    // one - see ToParentLocalOffset for why a plain local add wobbles when the
+                    // bone's parent chain is itself animated (a spine swaying with a breathing
+                    // idle, say).
+                    var worldOffset = new Vector3(posOffset.X, posOffset.Y, posOffset.Z);
+                    var originalTranslationKeys = GetOrCacheOriginalTranslationKeys(boneName, isStaticPose, anim, node);
+
+                    if (isStaticPose)
+                    {
+                        var localDelta = ToParentLocalOffset(node, null, 0f, worldOffset);
+                        node.WithLocalTranslation(originalTranslationKeys[0].Value + localDelta);
+                    }
+                    else
+                    {
+                        var corrected = originalTranslationKeys
+                            .Select(k => (k.Time, k.Value + ToParentLocalOffset(node, anim, k.Time, worldOffset)))
+                            .ToArray();
+                        node.WithTranslationAnimation(animName!, corrected);
+                    }
+                }
             }
 
             // Deliberately does NOT reset sliders, the live preview, or pending offsets - the user
