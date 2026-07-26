@@ -4,6 +4,7 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Numerics;
+using System.Text.RegularExpressions;
 using System.Windows.Forms;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
@@ -28,6 +29,21 @@ namespace GlbMerger
         private Label _lblX = null!, _lblY = null!, _lblZ = null!;
         private NumericUpDown _numPosX = null!, _numPosY = null!, _numPosZ = null!;
         private Label _lblPosX = null!, _lblPosY = null!, _lblPosZ = null!;
+        // "Mirror" checkboxes next to each rotation slider / position field: when checked, moving
+        // that axis also pushes a corresponding correction onto the opposite-side bone (e.g.
+        // LeftArm -> RightArm), found by swapping Left/Right in the bone name. See
+        // ApplyMirrorIfNeeded for the sign convention per axis.
+        private CheckBox _chkMirrorX = null!, _chkMirrorY = null!, _chkMirrorZ = null!;
+        private CheckBox _chkMirrorPosX = null!, _chkMirrorPosY = null!, _chkMirrorPosZ = null!;
+        // "Inv" checkboxes, one per Mirror checkbox: flips that axis's default mirror sign
+        // convention. Only has any effect while the paired Mirror checkbox is also checked.
+        private CheckBox _chkInverseX = null!, _chkInverseY = null!, _chkInverseZ = null!;
+        private CheckBox _chkInversePosX = null!, _chkInversePosY = null!, _chkInversePosZ = null!;
+        // Only enabled when the selected bone is one of a multi-joint "Spine*" chain. When
+        // checked, the dialed-in rotation on the selected spine joint is treated as the desired
+        // TOTAL bend and is split evenly across every spine joint instead of applied to just the
+        // one joint.
+        private CheckBox _chkDistributeSpine = null!;
         private Label _lblStatus = null!;
         private Button _btnPause = null!;
         private WebView2 _webView = null!;
@@ -56,6 +72,20 @@ namespace GlbMerger
 
         // Translation counterpart to _originalKeysCache, same anti-compounding purpose.
         private readonly Dictionary<string, (float Time, Vector3 Value)[]> _originalTranslationKeysCache = new();
+
+        // Bone name -> which rotation/position axes have "Mirror" checked for that bone, kept per
+        // bone (like _pendingOffsets) so switching away and back restores the checkboxes exactly.
+        private readonly Dictionary<string, (bool X, bool Y, bool Z)> _mirrorRotFlags = new();
+        private readonly Dictionary<string, (bool X, bool Y, bool Z)> _mirrorPosFlags = new();
+
+        // Bone name -> which axes have "Inv" checked, flipping that axis's default mirror sign.
+        private readonly Dictionary<string, (bool X, bool Y, bool Z)> _mirrorRotInverseFlags = new();
+        private readonly Dictionary<string, (bool X, bool Y, bool Z)> _mirrorPosInverseFlags = new();
+
+        // Spine bone name -> whether "Distribute across spine" was checked while that bone was
+        // selected.
+        private readonly Dictionary<string, bool> _distributeSpineFlags = new();
+
         private bool _suppressSliderEvents;
 
         public JointOrientationForm(ModelRoot model, bool darkMode = false)
@@ -83,42 +113,89 @@ namespace GlbMerger
         {
             // AutoScroll so shrinking the window toward MinimumSize scrolls the panel instead of
             // clipping the bottom controls, now that there's a full extra row of position controls.
-            var controlPanel = new Panel { Dock = DockStyle.Left, Width = 320, Padding = new Padding(12), AutoScroll = true };
+            var controlPanel = new Panel { Dock = DockStyle.Left, Width = 380, Padding = new Padding(12), AutoScroll = true };
 
-            var lblBone = new Label { Text = "Joint / Bone:", Left = 12, Top = 12, AutoSize = true };
-            _boneDropdown = new ComboBox { Left = 12, Top = 32, Width = 280, DropDownStyle = ComboBoxStyle.DropDownList };
+            // Every control's Top is derived from the actual height of whatever was placed above
+            // it, instead of a hardcoded constant - fixed gaps (478, 518, 556...) assumed each
+            // control's height would always match whatever font/DPI they were tuned against.
+            // Once buttons became AutoSize (to stop their own text clipping), they could grow
+            // taller than those fixed gaps allowed for and start overlapping the control below.
+            int y = 12;
+            const int gap = 6;
+
+            var lblBone = new Label { Text = "Joint / Bone:", Left = 12, Top = y, AutoSize = true };
+            y += lblBone.Height + 2;
+            _boneDropdown = new ComboBox { Left = 12, Top = y, Width = 280, DropDownStyle = ComboBoxStyle.DropDownList };
             _boneDropdown.SelectedIndexChanged += (s, e) => OnBoneSelected();
+            y += _boneDropdown.Height + gap * 2;
 
-            var lblAnim = new Label { Text = "Preview Animation:", Left = 12, Top = 66, AutoSize = true };
-            _animDropdown = new ComboBox { Left = 12, Top = 86, Width = 190, DropDownStyle = ComboBoxStyle.DropDownList };
+            var lblAnim = new Label { Text = "Preview Animation:", Left = 12, Top = y, AutoSize = true };
+            y += lblAnim.Height + 2;
+            _animDropdown = new ComboBox { Left = 12, Top = y, Width = 190, DropDownStyle = ComboBoxStyle.DropDownList };
             _animDropdown.SelectedIndexChanged += (s, e) => OnAnimationSelected();
 
-            _btnPause = new Button { Text = "Pause", Left = 210, Top = 85, Width = 82 };
+            // AutoSize + GrowOnly (rather than a fixed Width) so the button still fits its text
+            // if the font/DPI differs from whatever this pixel width was tuned against, or when
+            // it swaps to the longer "Resume" label - GrowOnly keeps the original width as a
+            // floor instead of letting "Pause" shrink the button down from it.
+            _btnPause = new Button { Text = "Pause", Left = 210, Top = y, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowOnly, MinimumSize = new System.Drawing.Size(82, 0) };
             _btnPause.Click += (s, e) => TogglePause();
+            y += Math.Max(_animDropdown.Height, _btnPause.Height) + gap * 2;
 
-            (_lblX, _sliderX) = MakeSlider("X Rotation", 128);
-            (_lblY, _sliderY) = MakeSlider("Y Rotation", 198);
-            (_lblZ, _sliderZ) = MakeSlider("Z Rotation", 268);
+            (_lblX, _sliderX, _chkMirrorX, _chkInverseX) = MakeSlider("X Rotation", ref y);
+            (_lblY, _sliderY, _chkMirrorY, _chkInverseY) = MakeSlider("Y Rotation", ref y);
+            (_lblZ, _sliderZ, _chkMirrorZ, _chkInverseZ) = MakeSlider("Z Rotation", ref y);
+            _chkMirrorX.CheckedChanged += (s, e) => OnMirrorFlagChanged();
+            _chkMirrorY.CheckedChanged += (s, e) => OnMirrorFlagChanged();
+            _chkMirrorZ.CheckedChanged += (s, e) => OnMirrorFlagChanged();
+            _chkInverseX.CheckedChanged += (s, e) => OnMirrorFlagChanged();
+            _chkInverseY.CheckedChanged += (s, e) => OnMirrorFlagChanged();
+            _chkInverseZ.CheckedChanged += (s, e) => OnMirrorFlagChanged();
 
-            (_lblPosX, _numPosX) = MakeNumericPosition("X Position", 344);
-            (_lblPosY, _numPosY) = MakeNumericPosition("Y Position", 384);
-            (_lblPosZ, _numPosZ) = MakeNumericPosition("Z Position", 424);
+            // Only ever meaningful for a bone that's part of a multi-joint "Spine*" chain -
+            // disabled/unchecked otherwise (see OnBoneSelected).
+            _chkDistributeSpine = new CheckBox { Text = "Distribute turn across all spine joints", Left = 12, Top = y, AutoSize = true };
+            _chkDistributeSpine.CheckedChanged += (s, e) => OnDistributeSpineFlagChanged();
+            y += _chkDistributeSpine.Height + gap * 2;
 
-            var btnSave = new Button { Text = "Save Adjustments to Animation", Left = 12, Top = 478, Width = 280 };
+            (_lblPosX, _numPosX, _chkMirrorPosX, _chkInversePosX) = MakeNumericPosition("X Position", ref y);
+            (_lblPosY, _numPosY, _chkMirrorPosY, _chkInversePosY) = MakeNumericPosition("Y Position", ref y);
+            (_lblPosZ, _numPosZ, _chkMirrorPosZ, _chkInversePosZ) = MakeNumericPosition("Z Position", ref y);
+            _chkMirrorPosX.CheckedChanged += (s, e) => OnMirrorFlagChanged();
+            _chkMirrorPosY.CheckedChanged += (s, e) => OnMirrorFlagChanged();
+            _chkMirrorPosZ.CheckedChanged += (s, e) => OnMirrorFlagChanged();
+            _chkInversePosX.CheckedChanged += (s, e) => OnMirrorFlagChanged();
+            _chkInversePosY.CheckedChanged += (s, e) => OnMirrorFlagChanged();
+            _chkInversePosZ.CheckedChanged += (s, e) => OnMirrorFlagChanged();
+
+            y += gap;
+
+            // AutoSize + GrowOnly for the same reason as _btnPause above: 280 stays the floor
+            // width (matching the rest of this column) but grows instead of clipping if the
+            // text needs more room than that under the runtime font/DPI.
+            var btnSave = new Button { Text = "Save Adjustments to Animation", Left = 12, Top = y, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowOnly, MinimumSize = new System.Drawing.Size(280, 0) };
             btnSave.Click += (s, e) => SaveAdjustments();
+            y += btnSave.Height + gap;
 
-            var btnReset = new Button { Text = "Reset This Joint", Left = 12, Top = 518, Width = 280 };
+            var btnReset = new Button { Text = "Reset This Joint", Left = 12, Top = y, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowOnly, MinimumSize = new System.Drawing.Size(280, 0) };
             btnReset.Click += (s, e) => ResetCurrentBone();
+            y += btnReset.Height + gap;
 
-            _lblStatus = new Label { Left = 12, Top = 556, Width = 280, Height = 32, AutoSize = false, ForeColor = System.Drawing.Color.LightGreen };
+            _lblStatus = new Label { Left = 12, Top = y, Width = 280, Height = 32, AutoSize = false, ForeColor = System.Drawing.Color.LightGreen };
+            y += _lblStatus.Height + gap;
 
-            var btnClose = new Button { Text = "Done", Left = 12, Top = 596, Width = 280, DialogResult = DialogResult.OK };
+            var btnClose = new Button { Text = "Done", Left = 12, Top = y, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowOnly, MinimumSize = new System.Drawing.Size(280, 0), DialogResult = DialogResult.OK };
 
             controlPanel.Controls.AddRange(new Control[]
             {
                 lblBone, _boneDropdown, lblAnim, _animDropdown, _btnPause,
-                _lblX, _sliderX, _lblY, _sliderY, _lblZ, _sliderZ,
-                _lblPosX, _numPosX, _lblPosY, _numPosY, _lblPosZ, _numPosZ,
+                _lblX, _sliderX, _chkMirrorX, _chkInverseX,
+                _lblY, _sliderY, _chkMirrorY, _chkInverseY,
+                _lblZ, _sliderZ, _chkMirrorZ, _chkInverseZ,
+                _chkDistributeSpine,
+                _lblPosX, _numPosX, _chkMirrorPosX, _chkInversePosX,
+                _lblPosY, _numPosY, _chkMirrorPosY, _chkInversePosY,
+                _lblPosZ, _numPosZ, _chkMirrorPosZ, _chkInversePosZ,
                 btnSave, btnReset, _lblStatus, btnClose
             });
             AcceptButton = btnClose;
@@ -483,17 +560,23 @@ namespace GlbMerger
 
         private static string EscapeJs(string s) => s.Replace("\\", "\\\\").Replace("'", "\\'");
 
-        private (Label, TrackBar) MakeSlider(string text, int top)
+        private (Label, TrackBar, CheckBox, CheckBox) MakeSlider(string text, ref int y)
         {
-            var lbl = new Label { Text = $"{text}: 0°", Left = 12, Top = top, Width = 280, AutoSize = false };
+            var lbl = new Label { Text = $"{text}: 0°", Left = 12, Top = y, AutoSize = true };
+            // "Mirror" and "Inv" sit to the right of the label on the same row - the slider
+            // itself is nearly the full panel width, so there's no room beside it.
+            var chkMirror = new CheckBox { Text = "Mirror", Left = 200, Top = y, AutoSize = true };
+            var chkInverse = new CheckBox { Text = "Inv", Left = 270, Top = y, AutoSize = true };
+            y += lbl.Height + 2;
             var slider = new TrackBar
             {
-                Left = 12, Top = top + 18, Width = 280, Height = 45,
+                Left = 12, Top = y, Width = 280, Height = 45,
                 Minimum = -180, Maximum = 180, Value = 0,
                 TickFrequency = 30
             };
+            y += slider.Height + 6;
             slider.ValueChanged += (s, e) => { lbl.Text = $"{text}: {slider.Value}°"; ApplyCorrection(); };
-            return (lbl, slider);
+            return (lbl, slider, chkMirror, chkInverse);
         }
 
         // Position uses a NumericUpDown rather than a TrackBar like rotation does - joint nudges
@@ -505,16 +588,22 @@ namespace GlbMerger
         // +/-5 range would be too small to ever produce a visible correction. Left unitless and
         // wide so it works regardless of the model's own scale; the user can always type a precise
         // value even though the increment steps coarsely.
-        private (Label, NumericUpDown) MakeNumericPosition(string text, int top)
+        private (Label, NumericUpDown, CheckBox, CheckBox) MakeNumericPosition(string text, ref int y)
         {
-            var lbl = new Label { Text = $"{text}: 0", Left = 12, Top = top, Width = 280, AutoSize = false };
+            var lbl = new Label { Text = $"{text}: 0", Left = 12, Top = y, AutoSize = true };
+            y += lbl.Height + 2;
             var numeric = new NumericUpDown
             {
-                Left = 12, Top = top + 18, Width = 120,
+                Left = 12, Top = y, Width = 120,
                 Minimum = -9999m, Maximum = 9999m, DecimalPlaces = 3, Increment = 0.1m, Value = 0m
             };
+            // The numeric field is only 120px wide (unlike the near-full-width rotation slider),
+            // so "Mirror"/"Inv" fit beside it instead of needing the label's row.
+            var chkMirror = new CheckBox { Text = "Mirror", Left = 142, Top = y + 2, AutoSize = true };
+            var chkInverse = new CheckBox { Text = "Inv", Left = 212, Top = y + 2, AutoSize = true };
+            y += numeric.Height + 6;
             numeric.ValueChanged += (s, e) => { lbl.Text = $"{text}: {numeric.Value}"; ApplyCorrection(); };
-            return (lbl, numeric);
+            return (lbl, numeric, chkMirror, chkInverse);
         }
 
         // Only nodes that actually act as a skin's joints are real bones - every other named
@@ -613,12 +702,40 @@ namespace GlbMerger
             return sortedKeys[^1].Value;
         }
 
+        // Finds the opposite-side counterpart of a bone by swapping "Left"/"Right" in its name
+        // (the Mixamo-style convention this app's rig handling already assumes elsewhere - see
+        // the LegChains table in GlbMergeService). Returns null for bones with no such pair (e.g.
+        // Spine, Hips, Head).
+        private static string? GetMirrorBoneName(string boneName)
+        {
+            if (boneName.Contains("Left", StringComparison.Ordinal)) return boneName.Replace("Left", "Right");
+            if (boneName.Contains("Right", StringComparison.Ordinal)) return boneName.Replace("Right", "Left");
+            return null;
+        }
+
+        private static readonly Regex SpineBoneNamePattern = new(@"^Spine\d*$");
+
+        private static bool IsSpineBone(string boneName) => SpineBoneNamePattern.IsMatch(boneName);
+
+        // All "Spine", "Spine1", "Spine2", ... joints present in this model's skin, in chain
+        // order (base of the spine first).
+        private List<string> GetSpineBoneNames() =>
+            _boneDropdown.Items.Cast<string>()
+                .Where(IsSpineBone)
+                .OrderBy(n => n.Length > 5 ? int.Parse(n.Substring(5)) : 0)
+                .ToList();
+
         private void OnBoneSelected()
         {
             if (_boneDropdown.SelectedItem is not string boneName) return;
 
             var (x, y, z) = _pendingOffsets.TryGetValue(boneName, out var pending) ? pending : (0, 0, 0);
             var (px, py, pz) = _pendingTranslationOffsets.TryGetValue(boneName, out var pendingPos) ? pendingPos : (0f, 0f, 0f);
+            var (mrx, mry, mrz) = _mirrorRotFlags.TryGetValue(boneName, out var mirrorRot) ? mirrorRot : (false, false, false);
+            var (mpx, mpy, mpz) = _mirrorPosFlags.TryGetValue(boneName, out var mirrorPos) ? mirrorPos : (false, false, false);
+            var (irx, iry, irz) = _mirrorRotInverseFlags.TryGetValue(boneName, out var invRot) ? invRot : (false, false, false);
+            var (ipx, ipy, ipz) = _mirrorPosInverseFlags.TryGetValue(boneName, out var invPos) ? invPos : (false, false, false);
+            bool isDistributableSpineBone = IsSpineBone(boneName) && GetSpineBoneNames().Count > 1;
 
             _suppressSliderEvents = true;
             _sliderX.Value = x;
@@ -627,6 +744,21 @@ namespace GlbMerger
             _lblX.Text = $"X Rotation: {x}°";
             _lblY.Text = $"Y Rotation: {y}°";
             _lblZ.Text = $"Z Rotation: {z}°";
+            _chkMirrorX.Checked = mrx;
+            _chkMirrorY.Checked = mry;
+            _chkMirrorZ.Checked = mrz;
+            _chkMirrorPosX.Checked = mpx;
+            _chkMirrorPosY.Checked = mpy;
+            _chkMirrorPosZ.Checked = mpz;
+            _chkInverseX.Checked = irx;
+            _chkInverseY.Checked = iry;
+            _chkInverseZ.Checked = irz;
+            _chkInversePosX.Checked = ipx;
+            _chkInversePosY.Checked = ipy;
+            _chkInversePosZ.Checked = ipz;
+            _chkDistributeSpine.Enabled = isDistributableSpineBone;
+            _chkDistributeSpine.Checked = isDistributableSpineBone
+                && _distributeSpineFlags.TryGetValue(boneName, out var distribute) && distribute;
             // Clamped defensively - pending values only ever come from these same controls, but a
             // value sitting exactly on the NumericUpDown's Min/Max boundary can round the wrong way
             // through the float/decimal conversion and throw when assigned back.
@@ -720,6 +852,11 @@ namespace GlbMerger
 
             _pendingOffsets.Remove(boneName);
             _pendingTranslationOffsets.Remove(boneName);
+            _mirrorRotFlags.Remove(boneName);
+            _mirrorPosFlags.Remove(boneName);
+            _mirrorRotInverseFlags.Remove(boneName);
+            _mirrorPosInverseFlags.Remove(boneName);
+            _distributeSpineFlags.Remove(boneName);
             OnBoneSelected();
 
             if (_viewerReady)
@@ -743,6 +880,11 @@ namespace GlbMerger
             _originalKeysCache.Clear();
             _pendingTranslationOffsets.Clear();
             _originalTranslationKeysCache.Clear();
+            _mirrorRotFlags.Clear();
+            _mirrorPosFlags.Clear();
+            _mirrorRotInverseFlags.Clear();
+            _mirrorPosInverseFlags.Clear();
+            _distributeSpineFlags.Clear();
 
             if (_boneDropdown.SelectedItem is string) OnBoneSelected();
             _lblStatus.Text = "";
@@ -766,11 +908,13 @@ namespace GlbMerger
             GetOrCacheOriginalKeys(boneName, isStaticPose, anim, node);
             GetOrCacheOriginalTranslationKeys(boneName, isStaticPose, anim, node);
 
-            _pendingOffsets[boneName] = (_sliderX.Value, _sliderY.Value, _sliderZ.Value);
             _pendingTranslationOffsets[boneName] = ((float)_numPosX.Value, (float)_numPosY.Value, (float)_numPosZ.Value);
             _lblStatus.Text = "";
 
-            var offset = ComputeOffsetQuaternion(_sliderX.Value, _sliderY.Value, _sliderZ.Value);
+            if (_chkDistributeSpine.Enabled && _chkDistributeSpine.Checked)
+                ApplyDistributedSpineRotation(isStaticPose, anim);
+            else
+                ApplySingleBoneRotation(boneName, _sliderX.Value, _sliderY.Value, _sliderZ.Value);
 
             // Mirrors the offset live onto the actual Three.js bone object - no file save or
             // reload involved, so this is instant and doesn't flicker. Nothing is written to the
@@ -778,10 +922,110 @@ namespace GlbMerger
             if (_viewerReady)
             {
                 _webView.CoreWebView2.ExecuteScriptAsync(
-                    $"setLiveCorrection('{EscapeJs(boneName)}', {Inv(offset.X)}, {Inv(offset.Y)}, {Inv(offset.Z)}, {Inv(offset.W)});");
-                _webView.CoreWebView2.ExecuteScriptAsync(
                     $"setLiveTranslationCorrection('{EscapeJs(boneName)}', {Inv((float)_numPosX.Value)}, {Inv((float)_numPosY.Value)}, {Inv((float)_numPosZ.Value)});");
             }
+
+            ApplyMirrorIfNeeded(boneName, isStaticPose, anim);
+        }
+
+        // Sets one bone's pending rotation offset and pushes it to the live preview. Shared by the
+        // normal single-joint path, the spine-distribute path, and the mirror path below - all
+        // three ultimately just want "this bone gets this X/Y/Z degrees applied".
+        private void ApplySingleBoneRotation(string boneName, int xDeg, int yDeg, int zDeg)
+        {
+            _pendingOffsets[boneName] = (xDeg, yDeg, zDeg);
+            if (!_viewerReady) return;
+
+            var offset = ComputeOffsetQuaternion(xDeg, yDeg, zDeg);
+            _webView.CoreWebView2.ExecuteScriptAsync(
+                $"setLiveCorrection('{EscapeJs(boneName)}', {Inv(offset.X)}, {Inv(offset.Y)}, {Inv(offset.Z)}, {Inv(offset.W)});");
+        }
+
+        // Treats the selected spine joint's dialed-in X/Y/Z as the TOTAL desired bend and splits
+        // it evenly across every Spine* joint in the model, so turning one joint's slider bends
+        // the whole spine chain by roughly that amount rather than just the one joint.
+        private void ApplyDistributedSpineRotation(bool isStaticPose, Animation? anim)
+        {
+            var spineNames = GetSpineBoneNames();
+            int n = spineNames.Count;
+            int dx = (int)Math.Round(_sliderX.Value / (double)n, MidpointRounding.AwayFromZero);
+            int dy = (int)Math.Round(_sliderY.Value / (double)n, MidpointRounding.AwayFromZero);
+            int dz = (int)Math.Round(_sliderZ.Value / (double)n, MidpointRounding.AwayFromZero);
+
+            foreach (var spineName in spineNames)
+            {
+                var spineNode = _model.LogicalNodes.First(nd => nd.Name == spineName);
+                GetOrCacheOriginalKeys(spineName, isStaticPose, anim, spineNode);
+                ApplySingleBoneRotation(spineName, dx, dy, dz);
+            }
+        }
+
+        // Propagates the current axis values onto the opposite-side bone for whichever axes have
+        // "Mirror" checked, leaving that bone's other (unchecked) axes untouched. Rotation mirrors
+        // using the standard biped "Behavior" convention (same as Maya's Mirror Joint): the X
+        // (bend) axis is copied as-is, while Y/Z (twist/splay) are sign-flipped, since Left/Right
+        // joint pairs are typically authored as mirror images of each other. Position is mirrored
+        // by negating only the lateral (X) world-space component and keeping Y/Z as-is, since this
+        // app's rigs are Y-up/Z-forward with X running left-right (see ToParentLocalOffset for why
+        // position offsets are world-space to begin with).
+        private void ApplyMirrorIfNeeded(string boneName, bool isStaticPose, Animation? anim)
+        {
+            var mirrorName = GetMirrorBoneName(boneName);
+            if (mirrorName == null || !_boneDropdown.Items.Contains(mirrorName)) return;
+
+            (bool X, bool Y, bool Z) rotFlags = _mirrorRotFlags.TryGetValue(boneName, out var mr) ? mr : (false, false, false);
+            (bool X, bool Y, bool Z) posFlags = _mirrorPosFlags.TryGetValue(boneName, out var mp) ? mp : (false, false, false);
+            if (!rotFlags.X && !rotFlags.Y && !rotFlags.Z && !posFlags.X && !posFlags.Y && !posFlags.Z) return;
+
+            (bool X, bool Y, bool Z) rotInverse = _mirrorRotInverseFlags.TryGetValue(boneName, out var ir) ? ir : (false, false, false);
+            (bool X, bool Y, bool Z) posInverse = _mirrorPosInverseFlags.TryGetValue(boneName, out var ip) ? ip : (false, false, false);
+
+            var mirrorNode = _model.LogicalNodes.First(n => n.Name == mirrorName);
+
+            if (rotFlags.X || rotFlags.Y || rotFlags.Z)
+            {
+                GetOrCacheOriginalKeys(mirrorName, isStaticPose, anim, mirrorNode);
+                var (mx, my, mz) = _pendingOffsets.TryGetValue(mirrorName, out var existingRot) ? existingRot : (0, 0, 0);
+                // Default "Behavior" mirror sign per axis - X (bend) copied as-is, Y/Z
+                // (twist/splay) sign-flipped. "Inv" flips that default for just its own axis.
+                if (rotFlags.X) mx = rotInverse.X ? -_sliderX.Value : _sliderX.Value;
+                if (rotFlags.Y) my = rotInverse.Y ? _sliderY.Value : -_sliderY.Value;
+                if (rotFlags.Z) mz = rotInverse.Z ? _sliderZ.Value : -_sliderZ.Value;
+                ApplySingleBoneRotation(mirrorName, mx, my, mz);
+            }
+
+            if (posFlags.X || posFlags.Y || posFlags.Z)
+            {
+                GetOrCacheOriginalTranslationKeys(mirrorName, isStaticPose, anim, mirrorNode);
+                var (mpx, mpy, mpz) = _pendingTranslationOffsets.TryGetValue(mirrorName, out var existingPos) ? existingPos : (0f, 0f, 0f);
+                // Default mirror sign per axis - lateral X negated, Y/Z copied as-is. "Inv"
+                // flips that default for just its own axis.
+                if (posFlags.X) mpx = posInverse.X ? (float)_numPosX.Value : -(float)_numPosX.Value;
+                if (posFlags.Y) mpy = posInverse.Y ? -(float)_numPosY.Value : (float)_numPosY.Value;
+                if (posFlags.Z) mpz = posInverse.Z ? -(float)_numPosZ.Value : (float)_numPosZ.Value;
+                _pendingTranslationOffsets[mirrorName] = (mpx, mpy, mpz);
+
+                if (_viewerReady)
+                    _webView.CoreWebView2.ExecuteScriptAsync(
+                        $"setLiveTranslationCorrection('{EscapeJs(mirrorName)}', {Inv(mpx)}, {Inv(mpy)}, {Inv(mpz)});");
+            }
+        }
+
+        private void OnMirrorFlagChanged()
+        {
+            if (_boneDropdown.SelectedItem is not string boneName) return;
+            _mirrorRotFlags[boneName] = (_chkMirrorX.Checked, _chkMirrorY.Checked, _chkMirrorZ.Checked);
+            _mirrorPosFlags[boneName] = (_chkMirrorPosX.Checked, _chkMirrorPosY.Checked, _chkMirrorPosZ.Checked);
+            _mirrorRotInverseFlags[boneName] = (_chkInverseX.Checked, _chkInverseY.Checked, _chkInverseZ.Checked);
+            _mirrorPosInverseFlags[boneName] = (_chkInversePosX.Checked, _chkInversePosY.Checked, _chkInversePosZ.Checked);
+            ApplyCorrection();
+        }
+
+        private void OnDistributeSpineFlagChanged()
+        {
+            if (_boneDropdown.SelectedItem is not string boneName) return;
+            _distributeSpineFlags[boneName] = _chkDistributeSpine.Checked;
+            ApplyCorrection();
         }
 
         private void SaveAdjustments()

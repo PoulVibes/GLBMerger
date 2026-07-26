@@ -15,4 +15,9 @@
     <PackageReference Include="SharpAssimp" Version="6.0.12" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Ball prop shown in BallAnchorForm's live preview instead of a placeholder sphere -->
+    <None Include="Assets\Football1.glb" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>

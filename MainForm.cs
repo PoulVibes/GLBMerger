@@ -2,15 +2,19 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Numerics;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using SharpGLTF.Schema2;
 
 namespace GlbMerger
 {
     public class MainForm : Form
     {
-        private Button btnFile1, btnMerge, btnSave, btnViewResult, btnFixJoints;
+        private Button btnFile1, btnClear, btnMerge, btnSave, btnViewResult, btnFixJoints, btnBallAnchor, btnStiffArm, btnSetHeight;
+        private NumericUpDown numModelHeightIn;
         private Label lblStatus;
+        private const float InchesToMeters = 0.0254f;
         private GlbInfoPanel panel1, panel2;
         private CheckBox chkDarkMode;
         private SplitContainer splitter;
@@ -30,16 +34,77 @@ namespace GlbMerger
             Height = 650;
             MinimumSize = new System.Drawing.Size(600, 450);
 
-            var toolbar = new Panel { Dock = DockStyle.Top, Height = 64, BorderStyle = BorderStyle.FixedSingle };
-            btnFile1 = new Button { Text = "Load Model 1", Left = 8, Top = 8, Width = 90 };
-            btnMerge = new Button { Text = "Process Merge", Left = 104, Top = 8, Width = 110, Enabled = false };
-            btnSave = new Button { Text = "Save...", Left = 220, Top = 8, Width = 90, Enabled = false };
-            btnViewResult = new Button { Text = "🖥️ Open Model Viewer", Left = 316, Top = 8, Width = 150, Enabled = false };
-            btnFixJoints = new Button { Text = "Fix Joint Orientation...", Left = 472, Top = 8, Width = 150, Enabled = false };
+            // A TableLayoutPanel (button row on top of the status label) with a FlowLayoutPanel
+            // for the buttons themselves - both AutoSize, so the whole toolbar's real height and
+            // each button's real width/position are resolved by the layout engine every time it
+            // runs, not computed once from a snapshot taken mid-construction. Manually computing
+            // Left/Top from AutoSize buttons' Width/Height in the constructor (the previous
+            // approach) read those values before the control tree was parented and DPI/font
+            // auto-scaling had run, so the numbers baked into Left/Top went stale as soon as
+            // scaling changed the buttons' real size afterward - which is what was still
+            // overlapping. Docked/flowed layout has no such snapshot to go stale.
+            var toolbar = new TableLayoutPanel
+            {
+                Dock = DockStyle.Top,
+                AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                ColumnCount = 1,
+                RowCount = 2,
+                BorderStyle = BorderStyle.FixedSingle,
+                Padding = new Padding(8),
+            };
 
-            lblStatus = new Label { Left = 8, Top = 38, Width = 700, AutoEllipsis = true };
+            var buttonRow = new FlowLayoutPanel
+            {
+                AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                FlowDirection = FlowDirection.LeftToRight,
+                WrapContents = false,
+                Margin = new Padding(0),
+            };
 
-            toolbar.Controls.AddRange(new Control[] { btnFile1, btnMerge, btnSave, btnViewResult, btnFixJoints, lblStatus });
+            static Button MakeToolbarButton(string text, bool enabled = true) => new Button
+            {
+                AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                Padding = new Padding(10, 0, 10, 0),
+                Margin = new Padding(0, 0, 8, 0),
+                Text = text,
+                Enabled = enabled
+            };
+            btnFile1 = MakeToolbarButton("Load Model 1");
+            btnClear = MakeToolbarButton("Clear");
+            btnMerge = MakeToolbarButton("Process Merge", enabled: false);
+            btnSave = MakeToolbarButton("Save...", enabled: false);
+            btnViewResult = MakeToolbarButton("🖥️ Open Model Viewer", enabled: false);
+            btnFixJoints = MakeToolbarButton("Fix Joint Orientation...", enabled: false);
+            btnBallAnchor = MakeToolbarButton("Ball Anchor...", enabled: false);
+            btnStiffArm = MakeToolbarButton("Stiff Arm Poses...", enabled: false);
+
+            var lblHeight = new Label
+            {
+                AutoSize = true,
+                Text = "Height (in):",
+                Margin = new Padding(8, 8, 4, 0),
+            };
+            numModelHeightIn = new NumericUpDown
+            {
+                Width = 65,
+                Margin = new Padding(0, 4, 4, 0),
+                Minimum = 1m,
+                Maximum = 999m,
+                DecimalPlaces = 1,
+                Increment = 0.5m,
+                Value = 70m,
+            };
+            btnSetHeight = MakeToolbarButton("Set Height", enabled: false);
+
+            buttonRow.Controls.AddRange(new Control[] { btnFile1, btnClear, btnMerge, btnSave, btnViewResult, btnFixJoints, btnBallAnchor, btnStiffArm, lblHeight, numModelHeightIn, btnSetHeight });
+
+            lblStatus = new Label { AutoSize = false, Width = 700, Height = 20, Margin = new Padding(0, 6, 0, 0), AutoEllipsis = true };
+
+            toolbar.Controls.Add(buttonRow, 0, 0);
+            toolbar.Controls.Add(lblStatus, 0, 1);
 
             // Bottom-right dark mode toggle, in its own strip so it stays clear of the resizable
             // boxes above it. Positioned manually (not just Anchor) so it tracks the right edge
@@ -98,6 +163,7 @@ namespace GlbMerger
             };
 
             btnFile1.Click += async (s, e) => await PickModel1();
+            btnClear.Click += (s, e) => ClearAll();
             btnMerge.Click += OnProcessMerge;
             btnSave.Click += OnSave;
 
@@ -120,6 +186,27 @@ namespace GlbMerger
                 lblStatus.Text = "Joint corrections applied.";
             };
 
+            // Same in-place-edit pattern as Fix Joint Orientation above: the
+            // form writes directly to latestMergedModel, so closing it just
+            // needs the preview file regenerated to reflect what changed.
+            btnBallAnchor.Click += (s, e) => {
+                if (latestMergedModel == null || latestPreviewPath == null) return;
+                using var anchorForm = new BallAnchorForm(latestMergedModel, _settings.DarkMode);
+                anchorForm.ShowDialog(this);
+                latestMergedModel.SaveGLB(latestPreviewPath);
+                lblStatus.Text = "Ball anchor updated.";
+            };
+
+            btnStiffArm.Click += (s, e) => {
+                if (latestMergedModel == null || latestPreviewPath == null) return;
+                using var stiffArmForm = new StiffArmPoseForm(latestMergedModel, _settings.DarkMode);
+                stiffArmForm.ShowDialog(this);
+                latestMergedModel.SaveGLB(latestPreviewPath);
+                lblStatus.Text = "Stiff-arm poses updated.";
+            };
+
+            btnSetHeight.Click += (s, e) => OnSetModelHeight();
+
             Controls.Add(splitter);
             Controls.Add(toolbar);
             Controls.Add(bottomBar);
@@ -141,6 +228,35 @@ namespace GlbMerger
             if (panel1.SecondarySplitFraction is double p1s) _settings.Panel1SecondarySplitFraction = p1s;
             _settings.Panel2PrimarySplitFraction = panel2.PrimarySplitFraction;
             _settings.Save();
+        }
+
+        // Resets the form to exactly how it looks right after opening: both slots' loaded
+        // files/animations forgotten, both panels wiped back to their default titles/empty
+        // grids, and every button re-disabled until the user loads something again. The scratch
+        // preview file on disk is deliberately left alone - it's regenerated (or simply
+        // overwritten) the next time Process Merge runs, so there's nothing to clean up here.
+        private void ClearAll()
+        {
+            path1 = null;
+            path2 = null;
+            fbxAnims1 = null;
+            fbxAnimsList2 = new List<FbxAnimationSource>();
+            latestMergedModel = null;
+            latestPreviewPath = null;
+
+            panel1.Reset("Model 1 (geometry, materials, animations)");
+            panel2.Reset("Model 2 - drop a GLB onto Materials, FBX file(s) onto Animations");
+
+            btnMerge.Enabled = false;
+            btnSave.Enabled = false;
+            btnViewResult.Enabled = false;
+            btnFixJoints.Enabled = false;
+            btnBallAnchor.Enabled = false;
+            btnStiffArm.Enabled = false;
+            btnSetHeight.Enabled = false;
+            numModelHeightIn.Value = 70m;
+
+            lblStatus.Text = "Cleared.";
         }
 
         // Slot 1 is always a single GLB or FBX picked via dialog, and always supplies the merged
@@ -174,6 +290,7 @@ namespace GlbMerger
                     fbxAnims1 = null;
                     panel1.UpdateTitle($"Model 1: {Path.GetFileName(dlg.FileName)}");
                     panel1.LoadModel(glbPath);
+                    UpdateHeightBoxFromGlb(glbPath);
                 }
 
                 lblStatus.Text = $"Loaded {Path.GetFileName(dlg.FileName)}";
@@ -302,7 +419,7 @@ namespace GlbMerger
             // Loading a new file invalidates whatever was last processed, so Save/View shouldn't
             // offer up a stale result while busy - once done, they stay off until Process Merge
             // runs again.
-            if (busy) { btnSave.Enabled = false; btnViewResult.Enabled = false; btnFixJoints.Enabled = false; }
+            if (busy) { btnSave.Enabled = false; btnViewResult.Enabled = false; btnFixJoints.Enabled = false; btnBallAnchor.Enabled = false; btnStiffArm.Enabled = false; btnSetHeight.Enabled = false; }
             Cursor = busy ? Cursors.WaitCursor : Cursors.Default;
             if (statusText != null) lblStatus.Text = statusText;
         }
@@ -360,6 +477,9 @@ namespace GlbMerger
                 btnSave.Enabled = true;
                 btnViewResult.Enabled = true;
                 btnFixJoints.Enabled = true;
+                btnBallAnchor.Enabled = true;
+                btnStiffArm.Enabled = true;
+                btnSetHeight.Enabled = true;
                 lblStatus.Text = "Merge processed - use View or Save.";
             }
             catch (Exception ex)
@@ -369,7 +489,159 @@ namespace GlbMerger
                 btnSave.Enabled = false;
                 btnViewResult.Enabled = false;
                 btnFixJoints.Enabled = false;
+                btnBallAnchor.Enabled = false;
+                btnStiffArm.Enabled = false;
+                btnSetHeight.Enabled = false;
                 MessageBox.Show(ex.ToString(), "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        // Rescales the whole merged model (mesh + skeleton together, via each
+        // DefaultScene root node's own local transform) so its rest-pose
+        // bounding-box height matches the requested inches value. Scaling at
+        // the root - rather than per-mesh - keeps a skinned mesh's world-space
+        // vertices consistent with its skeleton, since skin matrices are
+        // joint-world-matrix * inverse-bind-matrix: a uniform scale applied
+        // above both the mesh and the skeleton root scales that product
+        // correctly without needing to touch inverse bind matrices at all.
+        private void OnSetModelHeight()
+        {
+            if (latestMergedModel == null || latestPreviewPath == null) return;
+
+            try
+            {
+                float currentHeightMeters = ComputeModelHeightMeters(latestMergedModel);
+                if (currentHeightMeters <= 0f)
+                {
+                    MessageBox.Show(this, "Could not measure the current model height (no mesh geometry found).",
+                        "Set Height", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                float desiredMeters = (float)numModelHeightIn.Value * InchesToMeters;
+                float factor = desiredMeters / currentHeightMeters;
+
+                // A skinned mesh instance's own node is required (by the glTF spec, enforced by
+                // SharpGLTF) to carry an identity local transform - its vertices are positioned
+                // entirely by the skin's joint matrices instead. Scaling it directly throws
+                // ArgumentException("Node instances with a Skin must not contain spatial
+                // transformations."). Skipping it is safe: scaling its skeleton's root bone (a
+                // sibling root node here, not skinned itself) already scales every joint's world
+                // matrix, and thus the skinned mesh, by the same factor.
+                foreach (var node in latestMergedModel.DefaultScene.VisualChildren)
+                {
+                    if (node.Skin != null) continue;
+                    node.LocalMatrix = node.LocalMatrix * Matrix4x4.CreateScale(factor);
+                }
+
+                latestMergedModel.SaveGLB(latestPreviewPath);
+                lblStatus.Text = $"Model rescaled to {numModelHeightIn.Value} in (x{factor:0.###}).";
+            }
+            catch (Exception ex)
+            {
+                lblStatus.Text = "Error: " + ex.Message;
+                MessageBox.Show(this, ex.ToString(), "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        // Rest-pose height. For a rigid (unskinned) mesh, that's just its
+        // node's own WorldMatrix applied to POSITION. For a skinned mesh the
+        // node's WorldMatrix is meaningless - per the glTF spec a skinned
+        // mesh node must carry an identity local transform (see
+        // OnSetModelHeight), so its vertices are positioned entirely by the
+        // skin instead: each vertex's world position is the weighted blend,
+        // over its up-to-4 joints, of (inverseBindMatrix * jointWorldMatrix).
+        // This is what actually responds to scaling the skeleton root, so
+        // it's what has to be measured for the "before" and "after" of a
+        // Set Height rescale to agree with each other - a plain node.WorldMatrix
+        // read here would report the same bind-space height regardless of
+        // how the skeleton was scaled.
+        private static float ComputeModelHeightMeters(ModelRoot model)
+        {
+            float min = float.MaxValue, max = float.MinValue;
+            bool any = false;
+
+            void Accumulate(Vector3 worldPos)
+            {
+                if (worldPos.Y < min) min = worldPos.Y;
+                if (worldPos.Y > max) max = worldPos.Y;
+                any = true;
+            }
+
+            foreach (var node in model.LogicalNodes)
+            {
+                if (node.Mesh == null) continue;
+
+                if (node.Skin != null)
+                {
+                    var skin = node.Skin;
+                    var skinMatrices = new Matrix4x4[skin.JointsCount];
+                    for (int i = 0; i < skin.JointsCount; i++)
+                    {
+                        var (jointNode, invBind) = skin.GetJoint(i);
+                        skinMatrices[i] = invBind * jointNode.WorldMatrix;
+                    }
+
+                    foreach (var prim in node.Mesh.Primitives)
+                    {
+                        if (!prim.VertexAccessors.TryGetValue("POSITION", out var posAcc)) continue;
+                        if (!prim.VertexAccessors.TryGetValue("JOINTS_0", out var jAcc)) continue;
+                        if (!prim.VertexAccessors.TryGetValue("WEIGHTS_0", out var wAcc)) continue;
+
+                        var positions = posAcc.AsVector3Array();
+                        var joints = jAcc.AsVector4Array();
+                        var weights = wAcc.AsVector4Array();
+
+                        for (int i = 0; i < positions.Count; i++)
+                        {
+                            var p = positions[i];
+                            var j = joints[i];
+                            var w = weights[i];
+                            var blended =
+                                Vector3.Transform(p, skinMatrices[(int)j.X]) * w.X +
+                                Vector3.Transform(p, skinMatrices[(int)j.Y]) * w.Y +
+                                Vector3.Transform(p, skinMatrices[(int)j.Z]) * w.Z +
+                                Vector3.Transform(p, skinMatrices[(int)j.W]) * w.W;
+                            Accumulate(blended);
+                        }
+                    }
+                }
+                else
+                {
+                    var world = node.WorldMatrix;
+                    foreach (var prim in node.Mesh.Primitives)
+                    {
+                        if (!prim.VertexAccessors.TryGetValue("POSITION", out var posAcc)) continue;
+                        foreach (var p in posAcc.AsVector3Array())
+                            Accumulate(Vector3.Transform(p, world));
+                    }
+                }
+            }
+
+            return any ? (max - min) : 0f;
+        }
+
+        // Loads Model 1's freshly-picked GLB a second time (separately from panel1.LoadModel's
+        // own internal load, which doesn't expose the ModelRoot it reads) purely to measure its
+        // rest-pose height and seed the box with it - so the field starts at "what this model
+        // actually is" instead of always defaulting to 70". Best-effort: a measurement failure
+        // here shouldn't block the load that already succeeded, so it's swallowed rather than
+        // surfaced as an error.
+        private void UpdateHeightBoxFromGlb(string glbPath)
+        {
+            try
+            {
+                var model = ModelRoot.Load(glbPath);
+                float heightMeters = ComputeModelHeightMeters(model);
+                if (heightMeters <= 0f) return;
+
+                decimal heightInches = (decimal)(heightMeters / InchesToMeters);
+                numModelHeightIn.Value = Math.Clamp(heightInches, numModelHeightIn.Minimum, numModelHeightIn.Maximum);
+            }
+            catch
+            {
+                // Measurement is a convenience, not a requirement - leave whatever value was
+                // already in the box if this GLB can't be re-read for some reason.
             }
         }
 

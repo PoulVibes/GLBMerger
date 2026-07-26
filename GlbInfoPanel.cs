@@ -296,6 +296,23 @@ namespace GlbMerger
             mainGroup.Text = title;
         }
 
+        // Wipes this panel back to its just-opened state: empty grids, no remembered GLB/FBX
+        // animation names (so a later RebuildAnimationGrid call from a fresh load doesn't
+        // resurrect a previous drop's rows), and the caller-supplied default title.
+        public void Reset(string defaultTitle)
+        {
+            this.SuspendLayout();
+
+            grdGeometry.Rows.Clear();
+            grdMaterials.Rows.Clear();
+            grdAnimations.Rows.Clear();
+            _glbAnimNames = new List<string>();
+            _fbxAnimNames = new List<(string Name, string MergedAs)>();
+            mainGroup.Text = defaultTitle;
+
+            this.ResumeLayout(true);
+        }
+
         // Exclusive load: a GLB in this slot replaces anything previously loaded, including any
         // supplemental FBX animations. Used for slot 1's single-file picker.
         public void LoadModel(string path)
