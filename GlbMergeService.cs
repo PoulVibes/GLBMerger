@@ -26,6 +26,14 @@ namespace GlbMerger
             Dictionary<string, string>? matRenameMap1 = null, Dictionary<string, string>? matRenameMap2 = null,
             string? firstMatName1 = null, string? firstMatName2 = null,
             string? firstAnimName1 = null, string? firstAnimName2 = null,
+            // Frame range to keep for a given clip name, as [Start, End] keyframe indices into
+            // that clip's own distinct keyframe times (not a fixed sample rate - glTF/FBX clips
+            // don't store one) - a clip absent from the dictionary, or entirely, is left
+            // untouched. Applied to the source-agnostic AnimationClipData right after
+            // extraction/retargeting, before it's baked onto the output's NodeBuilders, so both a
+            // slot's native GLB clips and its supplemental FBX clips trim the same way.
+            Dictionary<string, (int Start, int End)>? frameTrimByName1 = null,
+            Dictionary<string, (int Start, int End)>? frameTrimByName2 = null,
             // Model 2 never contributes its own geometry (model 1's is always used), so only
             // model 1's mesh/node names need a user-controlled rename - keyed by the node's
             // original baseName (Mesh.Name, falling back to Node.Name), same as GlbInfoPanel's
@@ -142,6 +150,9 @@ namespace GlbMerger
             foreach (var fbxSource in fbxAnims2 ?? Enumerable.Empty<FbxAnimationSource>())
                 clips2.AddRange(RetargetFbxClips(fbxSource, targetReferenceTranslationsByName));
 
+            ApplyFrameTrim(clips1, frameTrimByName1);
+            ApplyFrameTrim(clips2, frameTrimByName2);
+
             // The animation the user marked "First" should end up at index 0 of the output's
             // animation array. SharpGLTF assigns indices in first-registered order (the order
             // WithLocalTranslation/Rotation/Scale are first called for a given animation name), so
@@ -170,6 +181,69 @@ namespace GlbMerger
             var clip = clips[index];
             clips.RemoveAt(index);
             clips.Insert(0, clip);
+        }
+
+        private static void ApplyFrameTrim(List<AnimationClipData> clips, Dictionary<string, (int Start, int End)>? trimByName)
+        {
+            if (trimByName == null || trimByName.Count == 0) return;
+
+            foreach (var clip in clips)
+                if (trimByName.TryGetValue(clip.Name, out var range))
+                    TrimClipToFrameRange(clip, range.Start, range.End);
+        }
+
+        // Total count of distinct keyframe times across every channel of this clip - the same
+        // "frame" numbering GlbInfoPanel's trim columns show and edit, computed the same way here
+        // so the two always agree on what frame index N means for a given clip.
+        public static int ComputeAnimationFrameCount(AnimationClipData clip) => CollectFrameTimes(clip).Count;
+
+        // Crops `clip` in place down to just [startFrame, endFrame] (inclusive, by index into its
+        // own distinct keyframe times), re-basing so the trimmed clip starts at time 0 - mirrors
+        // TrimAnimation's logic below, but operates on the source-agnostic AnimationClipData
+        // instead of an already-baked ModelRoot animation, so it works identically whether the
+        // clip came from a GLB or an FBX retarget.
+        public static void TrimClipToFrameRange(AnimationClipData clip, int startFrame, int endFrame)
+        {
+            var times = CollectFrameTimes(clip);
+            if (times.Count < 2) return;
+
+            startFrame = Math.Clamp(startFrame, 0, times.Count - 1);
+            endFrame = Math.Clamp(endFrame, startFrame, times.Count - 1);
+            float startTime = times[startFrame];
+            float endTime = times[endFrame];
+
+            foreach (var ch in clip.NodeChannels)
+            {
+                if (ch.Translation != null) ch.Translation = TrimKeyDict(ch.Translation, startTime, endTime);
+                if (ch.Rotation != null) ch.Rotation = TrimKeyDict(ch.Rotation, startTime, endTime);
+                if (ch.Scale != null) ch.Scale = TrimKeyDict(ch.Scale, startTime, endTime);
+            }
+        }
+
+        private static List<float> CollectFrameTimes(AnimationClipData clip)
+        {
+            var times = new SortedSet<float>();
+            foreach (var ch in clip.NodeChannels)
+            {
+                if (ch.Translation != null) foreach (var t in ch.Translation.Keys) times.Add(t);
+                if (ch.Rotation != null) foreach (var t in ch.Rotation.Keys) times.Add(t);
+                if (ch.Scale != null) foreach (var t in ch.Scale.Keys) times.Add(t);
+            }
+            return times.ToList();
+        }
+
+        private static Dictionary<float, T> TrimKeyDict<T>(Dictionary<float, T> keys, float startTime, float endTime)
+        {
+            var trimmed = keys.Where(k => k.Key >= startTime && k.Key <= endTime)
+                .ToDictionary(k => k.Key - startTime, k => k.Value);
+
+            if (trimmed.Count == 0)
+            {
+                var nearest = keys.OrderBy(k => Math.Abs(k.Key - startTime)).First();
+                trimmed = new Dictionary<float, T> { [0f] = nearest.Value };
+            }
+
+            return trimmed;
         }
 
         private static Dictionary<string, MaterialBuilder> ToMaterialLookup(IEnumerable<MaterialBuilder> materials) =>
@@ -564,6 +638,77 @@ namespace GlbMerger
             }
 
             return clips;
+        }
+
+        // Crops an existing animation in-place (on the already-loaded model) down to just the
+        // frame range [startFrame, endFrame], re-basing so the trimmed clip starts at time 0 -
+        // matching the correction pattern used by JointOrientationForm (Node.WithXAnimation
+        // replaces a node's channel data for a given animation outright, rather than merging).
+        // "Frame" here means one of the distinct keyframe times actually present across the
+        // clip's channels, not a fixed sample rate - that's the only frame numbering the caller
+        // (the model viewer's trim slider) can offer without guessing an FPS the source file
+        // never stored.
+        public static void TrimAnimation(ModelRoot model, string animationName, int startFrame, int endFrame)
+        {
+            var anim = model.LogicalAnimations.FirstOrDefault(a => (a.Name ?? $"Anim_{a.LogicalIndex}") == animationName)
+                ?? throw new InvalidOperationException($"Animation '{animationName}' not found.");
+
+            var channels = anim.Channels.ToList();
+
+            var frameTimes = new SortedSet<float>();
+            foreach (var ch in channels)
+            {
+                if (ch.TargetNodePath == PropertyPath.translation)
+                    foreach (var k in ch.GetTranslationSampler().GetLinearKeys()) frameTimes.Add(k.Key);
+                else if (ch.TargetNodePath == PropertyPath.rotation)
+                    foreach (var k in ch.GetRotationSampler().GetLinearKeys()) frameTimes.Add(k.Key);
+                else if (ch.TargetNodePath == PropertyPath.scale)
+                    foreach (var k in ch.GetScaleSampler().GetLinearKeys()) frameTimes.Add(k.Key);
+            }
+            var times = frameTimes.ToList();
+            if (times.Count < 2) return;
+
+            // Clamped to leave room for endFrame > startFrame below without the two bounds ever
+            // crossing (which Math.Clamp throws on) - e.g. a caller passing startFrame ==
+            // endFrame == times.Count - 1.
+            startFrame = Math.Clamp(startFrame, 0, times.Count - 2);
+            endFrame = Math.Clamp(endFrame, startFrame + 1, times.Count - 1);
+            float startTime = times[startFrame];
+            float endTime = times[endFrame];
+
+            foreach (var ch in channels)
+            {
+                var node = ch.TargetNode;
+                if (node == null) continue;
+
+                if (ch.TargetNodePath == PropertyPath.translation)
+                    node.WithTranslationAnimation(animationName, TrimKeys(ch.GetTranslationSampler().GetLinearKeys(), startTime, endTime));
+                else if (ch.TargetNodePath == PropertyPath.rotation)
+                    node.WithRotationAnimation(animationName, TrimKeys(ch.GetRotationSampler().GetLinearKeys(), startTime, endTime));
+                else if (ch.TargetNodePath == PropertyPath.scale)
+                    node.WithScaleAnimation(animationName, TrimKeys(ch.GetScaleSampler().GetLinearKeys(), startTime, endTime));
+            }
+        }
+
+        // Keeps only the keys within [startTime, endTime] and shifts them so the earliest kept
+        // key lands at time 0. Falls back to a single flat key (whatever was closest to
+        // startTime) if the window happens to fall between two keys with none inside it, so the
+        // channel is never left completely empty.
+        private static (float Time, T Value)[] TrimKeys<T>(IEnumerable<(float Key, T Value)> keys, float startTime, float endTime)
+        {
+            var all = keys.ToList();
+            var trimmed = all.Where(k => k.Key >= startTime && k.Key <= endTime)
+                .OrderBy(k => k.Key)
+                .Select(k => (k.Key - startTime, k.Value))
+                .ToArray();
+
+            if (trimmed.Length == 0)
+            {
+                var nearest = all.OrderBy(k => Math.Abs(k.Key - startTime)).First();
+                trimmed = new[] { (0f, nearest.Value) };
+            }
+
+            return trimmed;
         }
 
         private static void ApplyClipsToNodes(

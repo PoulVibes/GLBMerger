@@ -167,11 +167,16 @@ namespace GlbMerger
             btnMerge.Click += OnProcessMerge;
             btnSave.Click += OnSave;
 
+            // Trimming animation frames in the viewer writes directly onto latestMergedModel
+            // (same in-place-edit pattern as Fix Joint Orientation/Ball Anchor/Stiff Arm below),
+            // so Save picks up the trimmed frames with no separate "commit" step - the preview
+            // file just needs regenerating afterward so re-opening the viewer reflects it too.
             btnViewResult.Click += (s, e) => {
-                if (!string.IsNullOrEmpty(latestPreviewPath) && File.Exists(latestPreviewPath)) {
-                    using var viewer = new ViewerForm(latestPreviewPath, _settings.DarkMode);
-                    viewer.ShowDialog(this);
-                }
+                if (latestMergedModel == null || latestPreviewPath == null || !File.Exists(latestPreviewPath)) return;
+                using var viewer = new ViewerForm(latestMergedModel, latestPreviewPath, _settings.DarkMode);
+                viewer.ShowDialog(this);
+                latestMergedModel.SaveGLB(latestPreviewPath);
+                lblStatus.Text = "Viewer closed.";
             };
 
             // Corrections apply directly to latestMergedModel in place, so closing this dialog
@@ -280,7 +285,7 @@ namespace GlbMerger
                     path1 = null;
                     fbxAnims1 = renamed;
                     panel1.UpdateTitle($"Model 1: {Path.GetFileName(dlg.FileName)} (FBX - animation only)");
-                    panel1.LoadFbxAnimations(renamed.Clips.Select(c => c.Name).ToList());
+                    panel1.LoadFbxAnimations(renamed.Clips.Select(c => (c.Name, GlbMergeService.ComputeAnimationFrameCount(c))).ToList());
                 }
                 else
                 {
@@ -343,7 +348,7 @@ namespace GlbMerger
             try
             {
                 var usedNames = new HashSet<string>(panel2.GetAllAnimationNames());
-                var newlyAddedNames = new List<string>();
+                var newlyAddedClips = new List<(string Name, int FrameCount)>();
 
                 foreach (var fbxPath in fbxPaths)
                 {
@@ -351,11 +356,11 @@ namespace GlbMerger
                     var renamed = RenameClipsToUniqueNames(source, fbxPath, usedNames);
 
                     fbxAnimsList2.Add(renamed);
-                    newlyAddedNames.AddRange(renamed.Clips.Select(c => c.Name));
+                    newlyAddedClips.AddRange(renamed.Clips.Select(c => (c.Name, GlbMergeService.ComputeAnimationFrameCount(c))));
                 }
 
                 UpdateSlot2Title();
-                panel2.AddSupplementalFbxAnimations(newlyAddedNames);
+                panel2.AddSupplementalFbxAnimations(newlyAddedClips);
                 lblStatus.Text = $"Loaded {fbxPaths.Count} FBX file(s) into Model 2 animations";
             }
             catch (Exception ex)
@@ -449,6 +454,7 @@ namespace GlbMerger
                 var geomRenameMap1 = panel1.GetGeometryRenameMap();
                 var firstMat1 = panel1.GetFirstMaterialName();
                 var firstAnim1 = panel1.GetFirstAnimationName();
+                var frameTrim1 = panel1.GetFrameTrimByAnimation();
 
                 var selectedTextures2 = loaded2 ? panel2.GetSelectedMaterialNames() : new List<string>();
                 var selectedAnims2 = loaded2 ? panel2.GetSelectedAnimationNames() : new List<string>();
@@ -460,6 +466,7 @@ namespace GlbMerger
                 var matRenameMap2 = loaded2 ? panel2.GetMaterialRenameMap() : new Dictionary<string, string>();
                 var firstMat2 = loaded2 ? panel2.GetFirstMaterialName() : null;
                 var firstAnim2 = loaded2 ? panel2.GetFirstAnimationName() : null;
+                var frameTrim2 = loaded2 ? panel2.GetFrameTrimByAnimation() : new Dictionary<string, (int Start, int End)>();
 
                 latestMergedModel = GlbMergeService.MergeTargeted(
                     path1, selectedTextures1, selectedAnims1, inPlaceAnims1, fbxAnims1,
@@ -469,6 +476,7 @@ namespace GlbMerger
                     yRotationAnims1, yRotationAnims2, yOffsetAnims1, yOffsetAnims2,
                     matRenameMap1, matRenameMap2,
                     firstMat1, firstMat2, firstAnim1, firstAnim2,
+                    frameTrim1, frameTrim2,
                     geomRenameMap1: geomRenameMap1);
 
                 latestPreviewPath = Path.Combine(Path.GetTempPath(), "glbmerger_preview.glb");

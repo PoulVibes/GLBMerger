@@ -41,6 +41,13 @@ namespace GlbMerger
         public override Type ValueType => typeof(decimal);
         public override object DefaultNewRowValue => 0m;
 
+        // Per-cell override of the column's Minimum/Maximum - null means "use the column's own
+        // fixed range" (Y-rotation/Y-offset, same bounds for every row). Set when a row's valid
+        // range genuinely varies row-to-row, e.g. the frame-trim columns, where each animation
+        // clip has its own frame count.
+        public decimal? MinimumOverride { get; set; }
+        public decimal? MaximumOverride { get; set; }
+
         public override void InitializeEditingControl(int rowIndex, object? initialFormattedValue, DataGridViewCellStyle dataGridViewCellStyle)
         {
             base.InitializeEditingControl(rowIndex, initialFormattedValue, dataGridViewCellStyle);
@@ -48,12 +55,26 @@ namespace GlbMerger
             if (DataGridView?.EditingControl is not NumericUpDownEditingControl control) return;
             if (OwningColumn is not NumericUpDownColumn column) return;
 
-            control.Minimum = column.Minimum;
-            control.Maximum = column.Maximum;
+            var min = MinimumOverride ?? column.Minimum;
+            var max = MaximumOverride ?? column.Maximum;
+            control.Minimum = min;
+            control.Maximum = max;
             control.Increment = column.Increment;
             control.DecimalPlaces = column.DecimalPlaces;
             control.WrapAround = column.WrapAround;
-            control.Value = decimal.TryParse(Value?.ToString(), out var v) ? Math.Clamp(v, column.Minimum, column.Maximum) : 0m;
+            control.Value = decimal.TryParse(Value?.ToString(), out var v) ? Math.Clamp(v, min, max) : 0m;
+        }
+
+        // DataGridView clones the column's CellTemplate for every row it adds - without copying
+        // MinimumOverride/MaximumOverride here too, every row's cell would silently fall back to
+        // the column's fixed range and per-row overrides set right after Rows.Add would have
+        // nothing to stick to.
+        public override object Clone()
+        {
+            var clone = (NumericUpDownCell)base.Clone();
+            clone.MinimumOverride = MinimumOverride;
+            clone.MaximumOverride = MaximumOverride;
+            return clone;
         }
     }
 

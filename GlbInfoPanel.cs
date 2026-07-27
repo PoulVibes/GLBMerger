@@ -28,6 +28,13 @@ namespace GlbMerger
         // never wipes out whatever is already loaded in the other.
         private List<string> _glbAnimNames = new();
         private List<(string Name, string MergedAs)> _fbxAnimNames = new();
+        // Clip name -> total distinct-keyframe count, used to bound the frame-trim columns to
+        // each animation's own length (glTF/FBX clips don't store a frame count, so this is
+        // computed at load time the same way GlbMergeService computes it at merge time - see
+        // ComputeAnimationFrameCount). Entries persist across RebuildAnimationGrid calls same as
+        // _glbAnimNames/_fbxAnimNames, since dropping one more FBX shouldn't lose the frame counts
+        // of clips already loaded from the other source.
+        private readonly Dictionary<string, int> _animFrameCounts = new();
 
         public event Action<string>? GlbFileDropped;
         public event Action<List<string>>? FbxFilesDropped;
@@ -137,6 +144,21 @@ namespace GlbMerger
                 Minimum = -9999m, Maximum = 9999m, Increment = 1m, DecimalPlaces = 2
             });
 
+            // Which keyframes of the clip actually make it into the merge - editable right here
+            // instead of needing the model viewer's own trim sliders. Column-level Minimum/Maximum
+            // are just a fallback; each row's cell gets its own MaximumOverride set to that clip's
+            // real last-frame index once its frame count is known (see RebuildAnimationGrid).
+            grdAnimations.Columns.Add(new NumericUpDownColumn
+            {
+                Name = "StartFrame", HeaderText = "First Frame", FillWeight = 25,
+                Minimum = 0m, Maximum = 0m, Increment = 1m, DecimalPlaces = 0
+            });
+            grdAnimations.Columns.Add(new NumericUpDownColumn
+            {
+                Name = "EndFrame", HeaderText = "Last Frame", FillWeight = 25,
+                Minimum = 0m, Maximum = 0m, Increment = 1m, DecimalPlaces = 0
+            });
+
             // Marks which animation should be written first into the output's animation list
             // (some engines/tools default to playing/showing index 0) - only one row can be
             // marked at a time.
@@ -149,6 +171,7 @@ namespace GlbMerger
                     grdAnimations.CommitEdit(DataGridViewDataErrorContexts.Commit);
             };
             grdAnimations.CellValueChanged += (s, e) => EnforceSingleFirst(grdAnimations, e);
+            grdAnimations.CellValueChanged += (s, e) => EnforceFrameOrder(grdAnimations, e);
 
             // Each box (label + list/grid) sits in its own SplitContainer panel with a draggable
             // divider between it and its neighbor, instead of the old TableLayoutPanel's fixed
@@ -291,6 +314,25 @@ namespace GlbMerger
                     row.Cells["First"].Value = false;
         }
 
+        // Keeps a row's StartFrame from passing its own EndFrame (and vice versa) - pushes
+        // whichever handle wasn't just edited along with it instead of rejecting the edit, same
+        // trade-off the model viewer's trim sliders make. Setting the other cell re-triggers this
+        // handler, but by then Start == End so no further change happens - recursion stops there.
+        private static void EnforceFrameOrder(DataGridView grid, DataGridViewCellEventArgs e)
+        {
+            if (e.RowIndex < 0 || e.ColumnIndex < 0) return;
+            var colName = grid.Columns[e.ColumnIndex].Name;
+            if (colName != "StartFrame" && colName != "EndFrame") return;
+
+            var row = grid.Rows[e.RowIndex];
+            if (row.Cells["StartFrame"].Value is not decimal start) return;
+            if (row.Cells["EndFrame"].Value is not decimal end) return;
+            if (start <= end) return;
+
+            if (colName == "StartFrame") row.Cells["EndFrame"].Value = start;
+            else row.Cells["StartFrame"].Value = end;
+        }
+
         public void UpdateTitle(string title)
         {
             mainGroup.Text = title;
@@ -308,6 +350,7 @@ namespace GlbMerger
             grdAnimations.Rows.Clear();
             _glbAnimNames = new List<string>();
             _fbxAnimNames = new List<(string Name, string MergedAs)>();
+            _animFrameCounts.Clear();
             mainGroup.Text = defaultTitle;
 
             this.ResumeLayout(true);
@@ -324,10 +367,11 @@ namespace GlbMerger
         // FBX sources only ever contribute animation clips - geometry/materials are ignored, so
         // those two lists stay empty rather than trying to render a fake model for them. Exclusive
         // load: replaces anything previously loaded, including materials from a GLB. Used for
-        // slot 1's single-file picker. clipNames are already final, guaranteed-unique names
-        // (computed by the caller, e.g. from the FBX's filename) - matching and default "Merged
-        // As" both key off them directly.
-        public void LoadFbxAnimations(List<string> clipNames)
+        // slot 1's single-file picker. clips are already final, guaranteed-unique names (computed
+        // by the caller, e.g. from the FBX's filename) paired with that clip's own frame count
+        // (GlbMergeService.ComputeAnimationFrameCount, computed by the caller since it already has
+        // the raw AnimationClipData) - matching and default "Merged As" both key off the name.
+        public void LoadFbxAnimations(List<(string Name, int FrameCount)> clips)
         {
             this.SuspendLayout();
 
@@ -337,7 +381,8 @@ namespace GlbMerger
             grdMaterials.Rows.Clear();
 
             _glbAnimNames = new List<string>();
-            _fbxAnimNames = clipNames.Select(n => (Name: n, MergedAs: n)).ToList();
+            _fbxAnimNames = clips.Select(c => (Name: c.Name, MergedAs: c.Name)).ToList();
+            foreach (var c in clips) _animFrameCounts[c.Name] = c.FrameCount;
             RebuildAnimationGrid();
 
             this.ResumeLayout(true);
@@ -395,20 +440,42 @@ namespace GlbMerger
             }
 
             _glbAnimNames = model.LogicalAnimations.Select(a => a.Name ?? $"Anim_{a.LogicalIndex}").ToList();
+            foreach (var anim in model.LogicalAnimations)
+                _animFrameCounts[anim.Name ?? $"Anim_{anim.LogicalIndex}"] = ComputeGlbAnimationFrameCount(anim);
             RebuildAnimationGrid();
 
             this.ResumeLayout(true);
         }
 
+        // Distinct keyframe-time count for a glTF-native animation, read directly off the
+        // ModelRoot's own channel data - same "frame" numbering GlbMergeService.
+        // ComputeAnimationFrameCount uses for the AnimationClipData form, computed independently
+        // here only because this runs before that extraction step (at load time, for display).
+        private static int ComputeGlbAnimationFrameCount(Animation anim)
+        {
+            var times = new HashSet<float>();
+            foreach (var ch in anim.Channels)
+            {
+                if (ch.TargetNodePath == PropertyPath.translation)
+                    foreach (var k in ch.GetTranslationSampler().GetLinearKeys()) times.Add(k.Key);
+                else if (ch.TargetNodePath == PropertyPath.rotation)
+                    foreach (var k in ch.GetRotationSampler().GetLinearKeys()) times.Add(k.Key);
+                else if (ch.TargetNodePath == PropertyPath.scale)
+                    foreach (var k in ch.GetScaleSampler().GetLinearKeys()) times.Add(k.Key);
+            }
+            return times.Count;
+        }
+
         // Supplemental load for slot 2: ADDS this FBX's clips to the animation grid without
         // touching whatever materials/animations (or previously dropped FBX clips) are already
         // loaded - so dropping multiple FBX files at once, or one after another, accumulates
-        // rather than replaces. clipNames are already final, guaranteed-unique names (computed by
-        // the caller, e.g. from each FBX's filename).
-        public void AddSupplementalFbxAnimations(List<string> clipNames)
+        // rather than replaces. clips are already final, guaranteed-unique names (computed by the
+        // caller, e.g. from each FBX's filename) paired with that clip's own frame count.
+        public void AddSupplementalFbxAnimations(List<(string Name, int FrameCount)> clips)
         {
             this.SuspendLayout();
-            _fbxAnimNames.AddRange(clipNames.Select(n => (Name: n, MergedAs: n)));
+            _fbxAnimNames.AddRange(clips.Select(c => (Name: c.Name, MergedAs: c.Name)));
+            foreach (var c in clips) _animFrameCounts[c.Name] = c.FrameCount;
             RebuildAnimationGrid();
             this.ResumeLayout(true);
         }
@@ -425,12 +492,13 @@ namespace GlbMerger
         }
 
         // Preserves any per-row settings the user already configured (Include, Merged As, Lock In
-        // Place, Fix Floating, Rot, Offset, First), keyed by clip name, across a rebuild - so
-        // dropping an additional GLB/FBX into this slot only adds rows for its own new clips,
-        // without resetting settings on animations that were already there from an earlier drop.
+        // Place, Fix Floating, Rot, Offset, frame trim, First), keyed by clip name, across a
+        // rebuild - so dropping an additional GLB/FBX into this slot only adds rows for its own
+        // new clips, without resetting settings on animations that were already there from an
+        // earlier drop.
         private void RebuildAnimationGrid()
         {
-            var previousSettings = new Dictionary<string, (bool Include, string MergedAs, bool InPlace, bool GroundFix, decimal YRotation, decimal YOffset, bool First)>();
+            var previousSettings = new Dictionary<string, (bool Include, string MergedAs, bool InPlace, bool GroundFix, decimal YRotation, decimal YOffset, decimal StartFrame, decimal EndFrame, bool First)>();
             foreach (DataGridViewRow row in grdAnimations.Rows)
             {
                 var name = (string)row.Cells["Name"].Value!;
@@ -441,6 +509,8 @@ namespace GlbMerger
                     row.Cells["GroundFix"].Value is bool gf && gf,
                     row.Cells["YRotation"].Value is decimal yr ? yr : 0m,
                     row.Cells["YOffset"].Value is decimal yo ? yo : 0m,
+                    row.Cells["StartFrame"].Value is decimal sf ? sf : 0m,
+                    row.Cells["EndFrame"].Value is decimal ef ? ef : 0m,
                     row.Cells["First"].Value is bool f && f);
             }
 
@@ -448,10 +518,31 @@ namespace GlbMerger
 
             void AddRow(string name, string defaultMergedAs)
             {
+                // 0 (rather than the true keyframe count) for a clip this panel never computed a
+                // frame count for - shouldn't happen in practice (every load path sets one), but
+                // falling back to "no trim range available" is safer than a misleading bound.
+                int lastFrame = Math.Max(0, _animFrameCounts.GetValueOrDefault(name, 1) - 1);
+
+                int rowIndex;
                 if (previousSettings.TryGetValue(name, out var s))
-                    grdAnimations.Rows.Add(s.Include, name, s.MergedAs, s.InPlace, s.GroundFix, s.YRotation, s.YOffset, s.First);
+                {
+                    decimal start = Math.Clamp(s.StartFrame, 0m, lastFrame);
+                    decimal end = Math.Clamp(s.EndFrame, start, lastFrame);
+                    rowIndex = grdAnimations.Rows.Add(s.Include, name, s.MergedAs, s.InPlace, s.GroundFix, s.YRotation, s.YOffset, start, end, s.First);
+                }
                 else
-                    grdAnimations.Rows.Add(true, name, defaultMergedAs, false, false, 0m, 0m, false);
+                {
+                    rowIndex = grdAnimations.Rows.Add(true, name, defaultMergedAs, false, false, 0m, 0m, 0m, (decimal)lastFrame, false);
+                }
+
+                var row = grdAnimations.Rows[rowIndex];
+                var startCell = (NumericUpDownCell)row.Cells["StartFrame"];
+                var endCell = (NumericUpDownCell)row.Cells["EndFrame"];
+                startCell.MaximumOverride = lastFrame;
+                endCell.MaximumOverride = lastFrame;
+                // A clip with fewer than 2 distinct keyframes has nothing to trim - disable the
+                // cells rather than offering a range that can only ever be [0, 0].
+                startCell.ReadOnly = endCell.ReadOnly = lastFrame == 0;
             }
 
             foreach (var name in _glbAnimNames)
@@ -596,6 +687,30 @@ namespace GlbMerger
                 if (!float.TryParse(row.Cells["YOffset"].Value?.ToString(), out var offset) || offset == 0f) continue;
 
                 result[(string)row.Cells["Name"].Value!] = Math.Clamp(offset, -9999f, 9999f);
+            }
+            return result;
+        }
+
+        // [Start, End] keyframe-index range per included clip, only present when it doesn't cover
+        // the clip's full length (Start != 0 or End != its last frame) - so a row nobody touched
+        // costs nothing extra in the merge, same "absent means default" convention as
+        // GetYRotationByAnimation/GetYOffsetByAnimation. Passed straight through to
+        // GlbMergeService.MergeTargeted's frameTrimByName parameter.
+        public Dictionary<string, (int Start, int End)> GetFrameTrimByAnimation()
+        {
+            var result = new Dictionary<string, (int Start, int End)>();
+            foreach (DataGridViewRow row in grdAnimations.Rows)
+            {
+                if (row.Cells["Include"].Value is not bool included || !included) continue;
+                if (row.Cells["StartFrame"] is not NumericUpDownCell startCell) continue;
+                if (row.Cells["EndFrame"] is not NumericUpDownCell endCell) continue;
+                if (startCell.MaximumOverride is not decimal maxFrame) continue;
+
+                int start = row.Cells["StartFrame"].Value is decimal sv ? (int)sv : 0;
+                int end = row.Cells["EndFrame"].Value is decimal ev ? (int)ev : (int)maxFrame;
+                if (start == 0 && end == (int)maxFrame) continue;
+
+                result[(string)row.Cells["Name"].Value!] = (start, end);
             }
             return result;
         }
