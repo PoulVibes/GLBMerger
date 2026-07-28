@@ -642,11 +642,11 @@ namespace GlbMerger
 
         // Crops an existing animation in-place (on the already-loaded model) down to just the
         // frame range [startFrame, endFrame], re-basing so the trimmed clip starts at time 0 -
-        // matching the correction pattern used by JointOrientationForm (Node.WithXAnimation
+        // matching the correction pattern used by JointOrientationEditor (Node.WithXAnimation
         // replaces a node's channel data for a given animation outright, rather than merging).
         // "Frame" here means one of the distinct keyframe times actually present across the
         // clip's channels, not a fixed sample rate - that's the only frame numbering the caller
-        // (the model viewer's trim slider) can offer without guessing an FPS the source file
+        // (the Animation Trim editor's frame sliders) can offer without guessing an FPS the source file
         // never stored.
         public static void TrimAnimation(ModelRoot model, string animationName, int startFrame, int endFrame)
         {

@@ -19,7 +19,7 @@ namespace GlbMerger
     // re-tuned by eye, per model, every time the rig changes.
     //
     // Deliberately NOT tied to any particular animation clip (unlike
-    // JointOrientationForm) - an anchor is a single constant offset from the
+    // JointOrientationEditor) - an anchor is a single constant offset from the
     // hand bone, and the game always re-derives the ball's world position by
     // carrying that same local offset through whatever pose the hand is in
     // that frame (see ModelRenderer::HandWorld), so there is nothing to
@@ -36,7 +36,11 @@ namespace GlbMerger
     // all - it just previews the shared mid-handoff arm pose (see
     // CurrentArmCategory) with the ball left wherever Right/Left last
     // animated it to.
-    public class BallAnchorForm : Form
+    //
+    // One of the four modes hosted by ModelEditorForm (see EditorMode there),
+    // which owns the window chrome shared by all four, so this control only
+    // contributes its own left-hand controls and 3D preview.
+    public class BallAnchorEditor : UserControl
     {
         private readonly ModelRoot _model;
 
@@ -120,7 +124,7 @@ namespace GlbMerger
         };
         private static readonly string[] JointNames = { "Shoulder", "Elbow", "Wrist" };
 
-        public BallAnchorForm(ModelRoot model, bool darkMode = false)
+        public BallAnchorEditor(ModelRoot model, bool darkMode = false)
         {
             _model = model;
             _rightHand = FindHandNode(right: true);
@@ -130,11 +134,7 @@ namespace GlbMerger
             _rightShoulder = _rightElbow?.VisualParent;
             _leftShoulder = _leftElbow?.VisualParent;
 
-            Text = "Ball Anchor";
-            Width = 950;
-            Height = 820;
-            MinimumSize = new System.Drawing.Size(700, 600);
-            StartPosition = FormStartPosition.CenterParent;
+            Dock = DockStyle.Fill;
 
             BuildUi();
             LoadExistingAnchor(right: true);
@@ -438,10 +438,6 @@ namespace GlbMerger
 
             BuildArmPoseSection(flow);
 
-            var btnClose = new Button { Text = "Done", AutoSize = true, Margin = new Padding(3, 4, 3, 4), DialogResult = DialogResult.OK };
-            flow.Controls.Add(btnClose);
-            AcceptButton = btnClose;
-
             controlPanel.Controls.Add(flow);
 
             _webView = new WebView2 { Dock = DockStyle.Fill };
@@ -454,7 +450,7 @@ namespace GlbMerger
         // correctly-placed ball anchor still looks wrong on a badly-bent
         // arm, so this lives in the same dialog as the ball offset rather
         // than a separate tool. Row geometry is computed from named
-        // constants (see StiffArmPoseForm's own joint GroupBoxes, where an
+        // constants (see StiffArmPoseEditor's own joint GroupBoxes, where an
         // earlier hand-picked mismatch between row pitch and a fixed
         // GroupBox height actually clipped the third slider) so the box
         // height can't drift out of sync with the rows again.
@@ -555,7 +551,7 @@ namespace GlbMerger
             flow.Controls.Add(_armPosePanel);
         }
 
-        // Unitless (same reasoning as JointOrientationForm's position
+        // Unitless (same reasoning as JointOrientationEditor's position
         // controls): the file's own translation units vary by rig scale, so
         // a fixed +/-9999 range works regardless of how big or small this
         // particular model is. Integer-only per-click step, not fractional -
@@ -907,7 +903,7 @@ namespace GlbMerger
         // Mirror guess: X (flex/extend) keeps the same sign, Y (twist) and Z
         // (raise/cross) flip sign - the same convention ArmIKConfig's own
         // rightStiff was originally guessed from a tuned leftStiff (see
-        // ModelRenderer.h and StiffArmPoseForm.CopyFromOtherArm). Copies the
+        // ModelRenderer.h and StiffArmPoseEditor.CopyFromOtherArm). Copies the
         // SAME pose type on the other side - rightCarry from leftCarry,
         // rightMeet from leftMeet, never across the carry/meet divide, since
         // those are different poses entirely. Only ever a starting point;
@@ -978,7 +974,15 @@ namespace GlbMerger
 
         private async System.Threading.Tasks.Task InitializeViewerAsync()
         {
-            await _webView.EnsureCoreWebView2Async(null);
+            // Switching the editor's mode dropdown disposes this control while this
+            // fire-and-forget startup may still be mid-await, so both the await itself
+            // and everything after it have to tolerate that.
+            try
+            {
+                await _webView.EnsureCoreWebView2Async(null);
+            }
+            catch (ObjectDisposedException) { return; }
+            if (IsDisposed || _webView.IsDisposed) return;
 
             string tempFolder = Path.GetTempPath();
             string previewPath = Path.Combine(tempFolder, "glbmerger_ball_anchor_preview.glb");
@@ -1007,7 +1011,7 @@ namespace GlbMerger
             };
 
             // Saved once just to give the loader a file to read, same as
-            // JointOrientationForm's viewer - everything after that is live
+            // JointOrientationEditor's viewer - everything after that is live
             // Three.js scene manipulation, no further save/reload.
             _model.SaveGLB(previewPath);
             var previewFileName = Path.GetFileName(previewPath);

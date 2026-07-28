@@ -11,7 +11,7 @@ namespace GlbMerger
 {
     public class MainForm : Form
     {
-        private Button btnFile1, btnClear, btnMerge, btnSave, btnViewResult, btnFixJoints, btnBallAnchor, btnStiffArm, btnSetHeight;
+        private Button btnFile1, btnClear, btnMerge, btnSave, btnEditModel, btnSetHeight;
         private NumericUpDown numModelHeightIn;
         private Label lblStatus;
         private const float InchesToMeters = 0.0254f;
@@ -23,7 +23,6 @@ namespace GlbMerger
         private FbxAnimationSource? fbxAnims1; // slot 1's single FBX source, if it holds one
         private List<FbxAnimationSource> fbxAnimsList2 = new(); // slot 2 accumulates any number of dropped FBX sources
         private SharpGLTF.Schema2.ModelRoot? latestMergedModel; // in-memory result of the last "Process Merge" - not yet saved anywhere the user chose
-        private string? latestPreviewPath; // scratch copy of latestMergedModel, used only so the viewer has a file to load
 
         public MainForm()
         {
@@ -53,13 +52,21 @@ namespace GlbMerger
                 BorderStyle = BorderStyle.FixedSingle,
                 Padding = new Padding(8),
             };
+            // The single column takes the toolbar's whole width so the button row below can be
+            // docked into it. Without that the row would be sized to whatever one unwrapped line
+            // needs, which is what used to push the last button (Set Height) off the right edge at
+            // the default window width.
+            toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
 
             var buttonRow = new FlowLayoutPanel
             {
+                Dock = DockStyle.Fill,
                 AutoSize = true,
                 AutoSizeMode = AutoSizeMode.GrowAndShrink,
                 FlowDirection = FlowDirection.LeftToRight,
-                WrapContents = false,
+                // Wraps onto a second line rather than clipping when the window is too narrow to
+                // fit every button; the AutoSize toolbar grows to match.
+                WrapContents = true,
                 Margin = new Padding(0),
             };
 
@@ -76,10 +83,7 @@ namespace GlbMerger
             btnClear = MakeToolbarButton("Clear");
             btnMerge = MakeToolbarButton("Process Merge", enabled: false);
             btnSave = MakeToolbarButton("Save...", enabled: false);
-            btnViewResult = MakeToolbarButton("🖥️ Open Model Viewer", enabled: false);
-            btnFixJoints = MakeToolbarButton("Fix Joint Orientation...", enabled: false);
-            btnBallAnchor = MakeToolbarButton("Ball Anchor...", enabled: false);
-            btnStiffArm = MakeToolbarButton("Stiff Arm Poses...", enabled: false);
+            btnEditModel = MakeToolbarButton("🖥️ Open Model Editor", enabled: false);
 
             var lblHeight = new Label
             {
@@ -99,7 +103,19 @@ namespace GlbMerger
             };
             btnSetHeight = MakeToolbarButton("Set Height", enabled: false);
 
-            buttonRow.Controls.AddRange(new Control[] { btnFile1, btnClear, btnMerge, btnSave, btnViewResult, btnFixJoints, btnBallAnchor, btnStiffArm, lblHeight, numModelHeightIn, btnSetHeight });
+            // The three height controls flow as one unit, so a wrap can't leave the label stranded
+            // on the line above the box it labels.
+            var heightGroup = new FlowLayoutPanel
+            {
+                AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                FlowDirection = FlowDirection.LeftToRight,
+                WrapContents = false,
+                Margin = new Padding(0),
+            };
+            heightGroup.Controls.AddRange(new Control[] { lblHeight, numModelHeightIn, btnSetHeight });
+
+            buttonRow.Controls.AddRange(new Control[] { btnFile1, btnClear, btnMerge, btnSave, btnEditModel, heightGroup });
 
             lblStatus = new Label { AutoSize = false, Width = 700, Height = 20, Margin = new Padding(0, 6, 0, 0), AutoEllipsis = true };
 
@@ -167,47 +183,15 @@ namespace GlbMerger
             btnMerge.Click += OnProcessMerge;
             btnSave.Click += OnSave;
 
-            // Trimming animation frames in the viewer writes directly onto latestMergedModel
-            // (same in-place-edit pattern as Fix Joint Orientation/Ball Anchor/Stiff Arm below),
-            // so Save picks up the trimmed frames with no separate "commit" step - the preview
-            // file just needs regenerating afterward so re-opening the viewer reflects it too.
-            btnViewResult.Click += (s, e) => {
-                if (latestMergedModel == null || latestPreviewPath == null || !File.Exists(latestPreviewPath)) return;
-                using var viewer = new ViewerForm(latestMergedModel, latestPreviewPath, _settings.DarkMode);
-                viewer.ShowDialog(this);
-                latestMergedModel.SaveGLB(latestPreviewPath);
-                lblStatus.Text = "Viewer closed.";
-            };
-
-            // Corrections apply directly to latestMergedModel in place, so closing this dialog
-            // needs no extra "commit" step - Save already picks up whatever was changed. The
-            // on-disk preview file is regenerated too, so "Open Model Viewer" reflects the
-            // corrected result as well, not just Save.
-            btnFixJoints.Click += (s, e) => {
-                if (latestMergedModel == null || latestPreviewPath == null) return;
-                using var jointForm = new JointOrientationForm(latestMergedModel, _settings.DarkMode);
-                jointForm.ShowDialog(this);
-                latestMergedModel.SaveGLB(latestPreviewPath);
-                lblStatus.Text = "Joint corrections applied.";
-            };
-
-            // Same in-place-edit pattern as Fix Joint Orientation above: the
-            // form writes directly to latestMergedModel, so closing it just
-            // needs the preview file regenerated to reflect what changed.
-            btnBallAnchor.Click += (s, e) => {
-                if (latestMergedModel == null || latestPreviewPath == null) return;
-                using var anchorForm = new BallAnchorForm(latestMergedModel, _settings.DarkMode);
-                anchorForm.ShowDialog(this);
-                latestMergedModel.SaveGLB(latestPreviewPath);
-                lblStatus.Text = "Ball anchor updated.";
-            };
-
-            btnStiffArm.Click += (s, e) => {
-                if (latestMergedModel == null || latestPreviewPath == null) return;
-                using var stiffArmForm = new StiffArmPoseForm(latestMergedModel, _settings.DarkMode);
-                stiffArmForm.ShowDialog(this);
-                latestMergedModel.SaveGLB(latestPreviewPath);
-                lblStatus.Text = "Stiff-arm poses updated.";
+            // Every mode of the editor (joint corrections, ball anchor, stiff-arm poses, animation
+            // trimming) edits latestMergedModel in place, so closing it needs no extra "commit"
+            // step - Save already writes out whatever was changed. Each mode also stages its own
+            // preview file for its 3D view, so there's nothing here to keep in sync either.
+            btnEditModel.Click += (s, e) => {
+                if (latestMergedModel == null) return;
+                using var editor = new ModelEditorForm(latestMergedModel, _settings.DarkMode);
+                editor.ShowDialog(this);
+                lblStatus.Text = "Model editor closed - use Save to write the result out.";
             };
 
             btnSetHeight.Click += (s, e) => OnSetModelHeight();
@@ -238,8 +222,8 @@ namespace GlbMerger
         // Resets the form to exactly how it looks right after opening: both slots' loaded
         // files/animations forgotten, both panels wiped back to their default titles/empty
         // grids, and every button re-disabled until the user loads something again. The scratch
-        // preview file on disk is deliberately left alone - it's regenerated (or simply
-        // overwritten) the next time Process Merge runs, so there's nothing to clean up here.
+        // preview files the editor writes into the temp folder are deliberately left alone -
+        // they're rewritten the next time the editor opens, so there's nothing to clean up here.
         private void ClearAll()
         {
             path1 = null;
@@ -247,17 +231,13 @@ namespace GlbMerger
             fbxAnims1 = null;
             fbxAnimsList2 = new List<FbxAnimationSource>();
             latestMergedModel = null;
-            latestPreviewPath = null;
 
             panel1.Reset("Model 1 (geometry, materials, animations)");
             panel2.Reset("Model 2 - drop a GLB onto Materials, FBX file(s) onto Animations");
 
             btnMerge.Enabled = false;
             btnSave.Enabled = false;
-            btnViewResult.Enabled = false;
-            btnFixJoints.Enabled = false;
-            btnBallAnchor.Enabled = false;
-            btnStiffArm.Enabled = false;
+            btnEditModel.Enabled = false;
             btnSetHeight.Enabled = false;
             numModelHeightIn.Value = 70m;
 
@@ -421,10 +401,10 @@ namespace GlbMerger
         {
             btnFile1.Enabled = !busy;
             btnMerge.Enabled = !busy && CanMerge();
-            // Loading a new file invalidates whatever was last processed, so Save/View shouldn't
+            // Loading a new file invalidates whatever was last processed, so Save/Edit shouldn't
             // offer up a stale result while busy - once done, they stay off until Process Merge
             // runs again.
-            if (busy) { btnSave.Enabled = false; btnViewResult.Enabled = false; btnFixJoints.Enabled = false; btnBallAnchor.Enabled = false; btnStiffArm.Enabled = false; btnSetHeight.Enabled = false; }
+            if (busy) { btnSave.Enabled = false; btnEditModel.Enabled = false; btnSetHeight.Enabled = false; }
             Cursor = busy ? Cursors.WaitCursor : Cursors.Default;
             if (statusText != null) lblStatus.Text = statusText;
         }
@@ -432,8 +412,8 @@ namespace GlbMerger
         // Model 1 always supplies geometry, so it's the only thing strictly required to merge.
         private bool CanMerge() => path1 != null;
 
-        // Builds the merge in memory and stages a scratch copy for the viewer, without asking
-        // where to save it - "Save..." handles that as its own separate step.
+        // Builds the merge in memory, without asking where to save it - "Save..." handles that as
+        // its own separate step, and the editor works off the same in-memory result.
         private void OnProcessMerge(object? sender, EventArgs e)
         {
             try
@@ -479,26 +459,17 @@ namespace GlbMerger
                     frameTrim1, frameTrim2,
                     geomRenameMap1: geomRenameMap1);
 
-                latestPreviewPath = Path.Combine(Path.GetTempPath(), "glbmerger_preview.glb");
-                latestMergedModel.SaveGLB(latestPreviewPath);
-
                 btnSave.Enabled = true;
-                btnViewResult.Enabled = true;
-                btnFixJoints.Enabled = true;
-                btnBallAnchor.Enabled = true;
-                btnStiffArm.Enabled = true;
+                btnEditModel.Enabled = true;
                 btnSetHeight.Enabled = true;
-                lblStatus.Text = "Merge processed - use View or Save.";
+                lblStatus.Text = "Merge processed - use Open Model Editor or Save.";
             }
             catch (Exception ex)
             {
                 lblStatus.Text = "Error: " + ex.Message;
                 latestMergedModel = null;
                 btnSave.Enabled = false;
-                btnViewResult.Enabled = false;
-                btnFixJoints.Enabled = false;
-                btnBallAnchor.Enabled = false;
-                btnStiffArm.Enabled = false;
+                btnEditModel.Enabled = false;
                 btnSetHeight.Enabled = false;
                 MessageBox.Show(ex.ToString(), "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
@@ -514,7 +485,7 @@ namespace GlbMerger
         // correctly without needing to touch inverse bind matrices at all.
         private void OnSetModelHeight()
         {
-            if (latestMergedModel == null || latestPreviewPath == null) return;
+            if (latestMergedModel == null) return;
 
             try
             {
@@ -542,7 +513,6 @@ namespace GlbMerger
                     node.LocalMatrix = node.LocalMatrix * Matrix4x4.CreateScale(factor);
                 }
 
-                latestMergedModel.SaveGLB(latestPreviewPath);
                 lblStatus.Text = $"Model rescaled to {numModelHeightIn.Value} in (x{factor:0.###}).";
             }
             catch (Exception ex)

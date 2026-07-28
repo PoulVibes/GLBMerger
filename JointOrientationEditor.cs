@@ -19,7 +19,11 @@ namespace GlbMerger
     // rotation channel only (or the bind pose, if "None (Static Pose)" is selected). Switching
     // to a different animation discards any not-yet-saved adjustments, since they were only ever
     // meant to apply to the animation they were dialed in against.
-    public class JointOrientationForm : Form
+    //
+    // One of the four modes hosted by ModelEditorForm (see EditorMode there), which owns the
+    // window chrome - the title, the sizing, and the single "Done" button shared by all four -
+    // so this control only contributes its own left-hand controls and 3D preview.
+    public class JointOrientationEditor : UserControl
     {
         private readonly ModelRoot _model;
 
@@ -88,15 +92,11 @@ namespace GlbMerger
 
         private bool _suppressSliderEvents;
 
-        public JointOrientationForm(ModelRoot model, bool darkMode = false)
+        public JointOrientationEditor(ModelRoot model, bool darkMode = false)
         {
             _model = model;
 
-            Text = "Fix Joint Orientation";
-            Width = 1000;
-            Height = 850;
-            MinimumSize = new System.Drawing.Size(700, 600);
-            StartPosition = FormStartPosition.CenterParent;
+            Dock = DockStyle.Fill;
 
             BuildUi();
             PopulateBoneList();
@@ -182,9 +182,6 @@ namespace GlbMerger
             y += btnReset.Height + gap;
 
             _lblStatus = new Label { Left = 12, Top = y, Width = 280, Height = 32, AutoSize = false, ForeColor = System.Drawing.Color.LightGreen };
-            y += _lblStatus.Height + gap;
-
-            var btnClose = new Button { Text = "Done", Left = 12, Top = y, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowOnly, MinimumSize = new System.Drawing.Size(280, 0), DialogResult = DialogResult.OK };
 
             controlPanel.Controls.AddRange(new Control[]
             {
@@ -196,9 +193,8 @@ namespace GlbMerger
                 _lblPosX, _numPosX, _chkMirrorPosX, _chkInversePosX,
                 _lblPosY, _numPosY, _chkMirrorPosY, _chkInversePosY,
                 _lblPosZ, _numPosZ, _chkMirrorPosZ, _chkInversePosZ,
-                btnSave, btnReset, _lblStatus, btnClose
+                btnSave, btnReset, _lblStatus
             });
-            AcceptButton = btnClose;
 
             _webView = new WebView2 { Dock = DockStyle.Fill };
 
@@ -208,7 +204,15 @@ namespace GlbMerger
 
         private async System.Threading.Tasks.Task InitializeViewerAsync()
         {
-            await _webView.EnsureCoreWebView2Async(null);
+            // Switching the editor's mode dropdown disposes this control while this fire-and-forget
+            // startup may still be mid-await, so both the await itself and everything after it have
+            // to tolerate the control having gone away underneath them.
+            try
+            {
+                await _webView.EnsureCoreWebView2Async(null);
+            }
+            catch (ObjectDisposedException) { return; }
+            if (IsDisposed || _webView.IsDisposed) return;
 
             string tempFolder = Path.GetTempPath();
             string previewPath = Path.Combine(tempFolder, "glbmerger_joint_preview.glb");
@@ -218,7 +222,7 @@ namespace GlbMerger
             // The model is only ever saved to disk *once*, just to give the loader something to
             // read - after that, every correction is applied directly to the loaded Three.js bone
             // object in the render loop, with no further saving or reloading. That's what makes
-            // this live: model-viewer (used by the main "Open Model Viewer") only knows how to
+            // this live: model-viewer (used by the Animation Trim mode) only knows how to
             // load a whole file and has no API for touching an individual bone, so getting a
             // correction on screen there means writing a new file and reloading it from scratch -
             // the flicker the user was seeing. Raw Three.js exposes the actual bone objects, so a

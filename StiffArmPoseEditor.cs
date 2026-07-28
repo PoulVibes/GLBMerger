@@ -12,7 +12,7 @@ using SharpGLTF.Schema2;
 namespace GlbMerger
 {
     // Places the 3 stiff-arm reference poses (Forward/Side/Down) for each
-    // hand directly into the model, the same way BallAnchorForm bakes the
+    // hand directly into the model, the same way BallAnchorEditor bakes the
     // ball's hand offset in - these poses turned out to be just as rig-
     // specific as the ball offset was (ModelRenderer::ArmIKConfig's
     // hardcoded Euler-degree defaults were tuned against one rig's bind/
@@ -29,7 +29,11 @@ namespace GlbMerger
     // parent - so the marker's own local rotation, relative to that shared
     // parent, IS directly the value to assign. ModelRenderer::
     // ApplyBakedStiffArmPoses on the game side looks for exactly that.
-    public class StiffArmPoseForm : Form
+    //
+    // One of the four modes hosted by ModelEditorForm (see EditorMode there),
+    // which owns the window chrome shared by all four, so this control only
+    // contributes its own left-hand controls and 3D preview.
+    public class StiffArmPoseEditor : UserControl
     {
         private readonly ModelRoot _model;
 
@@ -45,7 +49,7 @@ namespace GlbMerger
 
         // [shoulder=0/elbow=1/wrist=2] slider triplets for whichever
         // side+pose is currently selected - rebuilt from _deg on every
-        // switch (see RefreshUiFromState), same pattern as BallAnchorForm.
+        // switch (see RefreshUiFromState), same pattern as BallAnchorEditor.
         private TrackBar[,] _sliders = new TrackBar[3, 3];   // [joint, axis]
         private Label[,] _sliderLabels = new Label[3, 3];
 
@@ -66,7 +70,7 @@ namespace GlbMerger
         private static readonly string[] PoseNames = { "Forward", "Side", "Down" };
         private static readonly string[] JointNames = { "Shoulder", "Elbow", "Wrist" };
 
-        public StiffArmPoseForm(ModelRoot model, bool darkMode = false)
+        public StiffArmPoseEditor(ModelRoot model, bool darkMode = false)
         {
             _model = model;
             _rightWrist = FindHandNode(right: true);
@@ -76,11 +80,7 @@ namespace GlbMerger
             _rightShoulder = _rightElbow?.VisualParent;
             _leftShoulder = _leftElbow?.VisualParent;
 
-            Text = "Stiff Arm Poses";
-            Width = 980;
-            Height = 820;
-            MinimumSize = new System.Drawing.Size(760, 600);
-            StartPosition = FormStartPosition.CenterParent;
+            Dock = DockStyle.Fill;
 
             BuildUi();
             LoadAllExisting();
@@ -323,13 +323,9 @@ namespace GlbMerger
                 Margin = new Padding(3, 6, 3, 10), ForeColor = System.Drawing.Color.LightGreen
             };
 
-            var btnClose = new Button { Text = "Done", AutoSize = true, Margin = new Padding(3, 4, 3, 4), DialogResult = DialogResult.OK };
-
             flow.Controls.Add(btnSave);
             flow.Controls.Add(btnReset);
             flow.Controls.Add(_lblStatus);
-            flow.Controls.Add(btnClose);
-            AcceptButton = btnClose;
 
             controlPanel.Controls.Add(flow);
 
@@ -497,7 +493,15 @@ namespace GlbMerger
 
         private async System.Threading.Tasks.Task InitializeViewerAsync()
         {
-            await _webView.EnsureCoreWebView2Async(null);
+            // Switching the editor's mode dropdown disposes this control while this
+            // fire-and-forget startup may still be mid-await, so both the await itself
+            // and everything after it have to tolerate that.
+            try
+            {
+                await _webView.EnsureCoreWebView2Async(null);
+            }
+            catch (ObjectDisposedException) { return; }
+            if (IsDisposed || _webView.IsDisposed) return;
 
             string tempFolder = Path.GetTempPath();
             string previewPath = Path.Combine(tempFolder, "glbmerger_stiffarm_preview.glb");

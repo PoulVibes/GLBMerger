@@ -64,6 +64,13 @@ namespace GlbMerger
                 case Panel pnl:
                     pnl.BackColor = dark ? DarkBack : SystemColors.Control;
                     break;
+                // Not a Panel (UserControl descends from ContainerControl), so the editor panes
+                // ModelEditorForm hosts need their own case or they'd keep the light default
+                // behind their child controls.
+                case UserControl uc:
+                    uc.BackColor = dark ? DarkBack : SystemColors.Control;
+                    uc.ForeColor = dark ? DarkFore : SystemColors.ControlText;
+                    break;
                 case Form form:
                     form.BackColor = dark ? DarkBack : SystemColors.Control;
                     form.ForeColor = dark ? DarkFore : SystemColors.ControlText;
