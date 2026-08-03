@@ -21,6 +21,7 @@ namespace GlbMerger
             BallAnchor,
             StiffArm,
             AnimationTrim,
+            OptimizeGeometry,
         }
 
         // Dropdown order and labels, indexed by EditorMode.
@@ -30,6 +31,7 @@ namespace GlbMerger
             (EditorMode.BallAnchor,       "Ball Anchor"),
             (EditorMode.StiffArm,         "Stiff Arm Poses"),
             (EditorMode.AnimationTrim,    "Animation Start / Stop (Trim)"),
+            (EditorMode.OptimizeGeometry, "Optimize Geometry"),
         };
 
         private readonly ModelRoot _model;
@@ -134,6 +136,7 @@ namespace GlbMerger
                     EditorMode.BallAnchor => new BallAnchorEditor(_model, _darkMode),
                     EditorMode.StiffArm => new StiffArmPoseEditor(_model, _darkMode),
                     EditorMode.AnimationTrim => new AnimationTrimEditor(_model, _darkMode),
+                    EditorMode.OptimizeGeometry => new GeometryOptimizerEditor(_model, _darkMode),
                     _ => throw new ArgumentOutOfRangeException(nameof(mode)),
                 };
 
