@@ -29,6 +29,7 @@ namespace GlbMerger
 
         private ComboBox _boneDropdown = null!;
         private ComboBox _animDropdown = null!;
+        private CheckBox _chkApplyToAllAnimations = null!;
         private TrackBar _sliderX = null!, _sliderY = null!, _sliderZ = null!;
         private Label _lblX = null!, _lblY = null!, _lblZ = null!;
         private NumericUpDown _numPosX = null!, _numPosY = null!, _numPosZ = null!;
@@ -67,15 +68,19 @@ namespace GlbMerger
         // the bone's parent chain is itself animated.
         private readonly Dictionary<string, (float X, float Y, float Z)> _pendingTranslationOffsets = new();
 
-        // Bone name -> its rotation keys (or bind rotation) exactly as they were before any
-        // adjustment this "session" (i.e. since the bone was first touched after the last
-        // animation swap). Saving re-derives the correction from this baseline every time rather
-        // than from whatever is currently in the model, so hitting Save repeatedly while still
-        // moving the slider doesn't compound the rotation onto itself.
-        private readonly Dictionary<string, (float Time, Quaternion Value)[]> _originalKeysCache = new();
+        // (Bone name, animation name or null for the static/bind pose) -> its rotation keys
+        // exactly as they were before any adjustment this "session" (i.e. since the bone was
+        // first touched after the last animation swap). Saving re-derives the correction from
+        // this baseline every time rather than from whatever is currently in the model, so
+        // hitting Save repeatedly while still moving the slider doesn't compound the rotation onto
+        // itself. Keyed per-animation (not just per-bone) so "Apply to All Animations" can cache
+        // each animation's own untouched baseline independently the first time Save writes to it,
+        // and stay non-compounding across repeated Save clicks the same way the single-animation
+        // path already does.
+        private readonly Dictionary<(string Bone, string? Anim), (float Time, Quaternion Value)[]> _originalKeysCache = new();
 
         // Translation counterpart to _originalKeysCache, same anti-compounding purpose.
-        private readonly Dictionary<string, (float Time, Vector3 Value)[]> _originalTranslationKeysCache = new();
+        private readonly Dictionary<(string Bone, string? Anim), (float Time, Vector3 Value)[]> _originalTranslationKeysCache = new();
 
         // Bone name -> which rotation/position axes have "Mirror" checked for that bone, kept per
         // bone (like _pendingOffsets) so switching away and back restores the checkboxes exactly.
@@ -140,7 +145,15 @@ namespace GlbMerger
             // floor instead of letting "Pause" shrink the button down from it.
             _btnPause = new Button { Text = "Pause", Left = 210, Top = y, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowOnly, MinimumSize = new System.Drawing.Size(82, 0) };
             _btnPause.Click += (s, e) => TogglePause();
-            y += Math.Max(_animDropdown.Height, _btnPause.Height) + gap * 2;
+            y += Math.Max(_animDropdown.Height, _btnPause.Height) + gap;
+
+            // When checked, Save writes the currently dialed-in offset onto every animation in the
+            // model (not just whichever one is selected above) - the dropdown/preview stay
+            // single-animation as before, this only changes what Save actually writes. Has no
+            // effect while "None (Static Pose)" is selected, since there's no "every animation"
+            // analogue for the bind pose - it just writes the bind pose either way.
+            _chkApplyToAllAnimations = new CheckBox { Text = "Apply to All Animations", Left = 12, Top = y, AutoSize = true };
+            y += _chkApplyToAllAnimations.Height + gap * 2;
 
             (_lblX, _sliderX, _chkMirrorX, _chkInverseX) = MakeSlider("X Rotation", ref y);
             (_lblY, _sliderY, _chkMirrorY, _chkInverseY) = MakeSlider("Y Rotation", ref y);
@@ -185,7 +198,7 @@ namespace GlbMerger
 
             controlPanel.Controls.AddRange(new Control[]
             {
-                lblBone, _boneDropdown, lblAnim, _animDropdown, _btnPause,
+                lblBone, _boneDropdown, lblAnim, _animDropdown, _btnPause, _chkApplyToAllAnimations,
                 _lblX, _sliderX, _chkMirrorX, _chkInverseX,
                 _lblY, _sliderY, _chkMirrorY, _chkInverseY,
                 _lblZ, _sliderZ, _chkMirrorZ, _chkInverseZ,
@@ -415,6 +428,27 @@ namespace GlbMerger
                                 var size = box.getSize(new THREE.Vector3());
                                 var center = box.getCenter(new THREE.Vector3());
                                 var maxDim = (Math.max(size.x, size.y, size.z) || 1) * 2.5;
+
+                                // A flat ground reference at the model's own lowest point (its bind
+                                // pose - computed once at load, not re-measured per animation frame),
+                                // so a foot sinking below or floating above it during playback is
+                                // visible at a glance instead of having to eyeball it against nothing.
+                                var groundSize = (Math.max(size.x, size.z) || 1) * 4;
+                                var groundY = box.min.y;
+                                var groundQuad = new THREE.Mesh(
+                                    new THREE.PlaneGeometry(groundSize, groundSize),
+                                    new THREE.MeshStandardMaterial({ color: 0x30343a, side: THREE.DoubleSide, transparent: true, opacity: 0.85, metalness: 0, roughness: 1 })
+                                );
+                                groundQuad.rotation.x = -Math.PI / 2;
+                                groundQuad.position.set(center.x, groundY, center.z);
+                                scene.add(groundQuad);
+
+                                var groundGrid = new THREE.GridHelper(groundSize, 20, 0x6a6f76, 0x454951);
+                                // Nudged up a hair (scaled to the model's own size, not a fixed
+                                // world unit, since rigs in this app range from ~1 to 100+ units
+                                // tall) so the grid lines don't z-fight with the quad underneath them.
+                                groundGrid.position.set(center.x, groundY + maxDim * 0.0005, center.z);
+                                scene.add(groundGrid);
 
                                 controls.target.copy(center);
                                 camera.position.copy(center).add(new THREE.Vector3(maxDim, maxDim * 0.6, maxDim));
@@ -784,7 +818,8 @@ namespace GlbMerger
         // whatever is currently in the model, so repeated saves don't stack the offset on itself.
         private (float Time, Quaternion Value)[] GetOrCacheOriginalKeys(string boneName, bool isStaticPose, Animation? anim, Node node)
         {
-            if (_originalKeysCache.TryGetValue(boneName, out var cached)) return cached;
+            var cacheKey = (boneName, isStaticPose ? null : anim!.Name);
+            if (_originalKeysCache.TryGetValue(cacheKey, out var cached)) return cached;
 
             (float Time, Quaternion Value)[] keys;
             var channel = isStaticPose ? null : anim!.Channels.FirstOrDefault(c => c.TargetNode == node && c.TargetNodePath == PropertyPath.rotation);
@@ -802,7 +837,7 @@ namespace GlbMerger
                 keys = new[] { (0f, Quaternion.Normalize(bind)) };
             }
 
-            _originalKeysCache[boneName] = keys;
+            _originalKeysCache[cacheKey] = keys;
             return keys;
         }
 
@@ -811,7 +846,8 @@ namespace GlbMerger
         // (the common case for anything that isn't the animation's root motion bone).
         private (float Time, Vector3 Value)[] GetOrCacheOriginalTranslationKeys(string boneName, bool isStaticPose, Animation? anim, Node node)
         {
-            if (_originalTranslationKeysCache.TryGetValue(boneName, out var cached)) return cached;
+            var cacheKey = (boneName, isStaticPose ? null : anim!.Name);
+            if (_originalTranslationKeysCache.TryGetValue(cacheKey, out var cached)) return cached;
 
             (float Time, Vector3 Value)[] keys;
             var channel = isStaticPose ? null : anim!.Channels.FirstOrDefault(c => c.TargetNode == node && c.TargetNodePath == PropertyPath.translation);
@@ -826,7 +862,7 @@ namespace GlbMerger
                 keys = new[] { (0f, bindTranslation) };
             }
 
-            _originalTranslationKeysCache[boneName] = keys;
+            _originalTranslationKeysCache[cacheKey] = keys;
             return keys;
         }
 
@@ -835,23 +871,28 @@ namespace GlbMerger
             if (_boneDropdown.SelectedItem is not string boneName) return;
 
             var node = _model.LogicalNodes.First(n => n.Name == boneName);
+            // Only undoes the live/not-yet-saved state for the currently selected animation (or
+            // bind pose) - any other animation's baseline cached by a previous "Apply to All
+            // Animations" Save is already-written, saved data, not something this button touches.
+            bool isStaticPose = _animDropdown.SelectedIndex <= 0;
+            var cacheKey = (boneName, isStaticPose ? null : (string?)_animDropdown.SelectedItem!);
 
-            if (_originalKeysCache.TryGetValue(boneName, out var originalKeys))
+            if (_originalKeysCache.TryGetValue(cacheKey, out var originalKeys))
             {
-                if (_animDropdown.SelectedIndex <= 0)
+                if (isStaticPose)
                     node.WithLocalRotation(originalKeys[0].Value);
                 else
                     node.WithRotationAnimation((string)_animDropdown.SelectedItem!, originalKeys);
-                _originalKeysCache.Remove(boneName);
+                _originalKeysCache.Remove(cacheKey);
             }
 
-            if (_originalTranslationKeysCache.TryGetValue(boneName, out var originalTranslationKeys))
+            if (_originalTranslationKeysCache.TryGetValue(cacheKey, out var originalTranslationKeys))
             {
-                if (_animDropdown.SelectedIndex <= 0)
+                if (isStaticPose)
                     node.WithLocalTranslation(originalTranslationKeys[0].Value);
                 else
                     node.WithTranslationAnimation((string)_animDropdown.SelectedItem!, originalTranslationKeys);
-                _originalTranslationKeysCache.Remove(boneName);
+                _originalTranslationKeysCache.Remove(cacheKey);
             }
 
             _pendingOffsets.Remove(boneName);
@@ -1042,8 +1083,16 @@ namespace GlbMerger
             }
 
             bool isStaticPose = _animDropdown.SelectedIndex <= 0;
-            string? animName = isStaticPose ? null : (string)_animDropdown.SelectedItem!;
-            Animation? anim = isStaticPose ? null : _model.LogicalAnimations.First(a => a.Name == animName);
+
+            // Normally just the one currently-selected animation (or the static/bind pose). With
+            // "Apply to All Animations" checked, every animation in the model becomes a target
+            // instead - there's no "every animation" analogue for the bind pose, so that checkbox
+            // is simply ignored while "None (Static Pose)" is selected.
+            List<Animation?> targetAnims = isStaticPose
+                ? new List<Animation?> { null }
+                : _chkApplyToAllAnimations.Checked
+                    ? _model.LogicalAnimations.Select(a => (Animation?)a).ToList()
+                    : new List<Animation?> { _model.LogicalAnimations.First(a => a.Name == (string)_animDropdown.SelectedItem!) };
 
             // A bone can have a pending rotation offset, a pending position offset, or both -
             // ApplyCorrection always sets both dictionaries together, so in practice this union is
@@ -1056,40 +1105,45 @@ namespace GlbMerger
             {
                 var node = _model.LogicalNodes.First(n => n.Name == boneName);
 
-                if (_pendingOffsets.TryGetValue(boneName, out var degrees))
+                foreach (var targetAnim in targetAnims)
                 {
-                    var offset = ComputeOffsetQuaternion(degrees.X, degrees.Y, degrees.Z);
-                    var originalKeys = GetOrCacheOriginalKeys(boneName, isStaticPose, anim, node);
+                    string? targetAnimName = targetAnim?.Name;
 
-                    if (isStaticPose)
-                        node.WithLocalRotation(Quaternion.Normalize(Quaternion.Multiply(offset, originalKeys[0].Value)));
-                    else
+                    if (_pendingOffsets.TryGetValue(boneName, out var degrees))
                     {
-                        var corrected = originalKeys.Select(k => (k.Time, Quaternion.Normalize(Quaternion.Multiply(offset, k.Value)))).ToArray();
-                        node.WithRotationAnimation(animName!, corrected);
+                        var offset = ComputeOffsetQuaternion(degrees.X, degrees.Y, degrees.Z);
+                        var originalKeys = GetOrCacheOriginalKeys(boneName, isStaticPose, targetAnim, node);
+
+                        if (isStaticPose)
+                            node.WithLocalRotation(Quaternion.Normalize(Quaternion.Multiply(offset, originalKeys[0].Value)));
+                        else
+                        {
+                            var corrected = originalKeys.Select(k => (k.Time, Quaternion.Normalize(Quaternion.Multiply(offset, k.Value)))).ToArray();
+                            node.WithRotationAnimation(targetAnimName!, corrected);
+                        }
                     }
-                }
 
-                if (_pendingTranslationOffsets.TryGetValue(boneName, out var posOffset))
-                {
-                    // Treated as a WORLD-space delta (e.g. "always 10cm lower"), not a raw local
-                    // one - see ToParentLocalOffset for why a plain local add wobbles when the
-                    // bone's parent chain is itself animated (a spine swaying with a breathing
-                    // idle, say).
-                    var worldOffset = new Vector3(posOffset.X, posOffset.Y, posOffset.Z);
-                    var originalTranslationKeys = GetOrCacheOriginalTranslationKeys(boneName, isStaticPose, anim, node);
+                    if (_pendingTranslationOffsets.TryGetValue(boneName, out var posOffset))
+                    {
+                        // Treated as a WORLD-space delta (e.g. "always 10cm lower"), not a raw local
+                        // one - see ToParentLocalOffset for why a plain local add wobbles when the
+                        // bone's parent chain is itself animated (a spine swaying with a breathing
+                        // idle, say).
+                        var worldOffset = new Vector3(posOffset.X, posOffset.Y, posOffset.Z);
+                        var originalTranslationKeys = GetOrCacheOriginalTranslationKeys(boneName, isStaticPose, targetAnim, node);
 
-                    if (isStaticPose)
-                    {
-                        var localDelta = ToParentLocalOffset(node, null, 0f, worldOffset);
-                        node.WithLocalTranslation(originalTranslationKeys[0].Value + localDelta);
-                    }
-                    else
-                    {
-                        var corrected = originalTranslationKeys
-                            .Select(k => (k.Time, k.Value + ToParentLocalOffset(node, anim, k.Time, worldOffset)))
-                            .ToArray();
-                        node.WithTranslationAnimation(animName!, corrected);
+                        if (isStaticPose)
+                        {
+                            var localDelta = ToParentLocalOffset(node, null, 0f, worldOffset);
+                            node.WithLocalTranslation(originalTranslationKeys[0].Value + localDelta);
+                        }
+                        else
+                        {
+                            var corrected = originalTranslationKeys
+                                .Select(k => (k.Time, k.Value + ToParentLocalOffset(node, targetAnim, k.Time, worldOffset)))
+                                .ToArray();
+                            node.WithTranslationAnimation(targetAnimName!, corrected);
+                        }
                     }
                 }
             }
@@ -1101,7 +1155,9 @@ namespace GlbMerger
             // one specific animation (or bind pose) it was computed against.
             _lblStatus.Text = isStaticPose
                 ? "Saved to bind (static) pose."
-                : $"Saved to '{animName}'.";
+                : _chkApplyToAllAnimations.Checked
+                    ? $"Saved to all {targetAnims.Count} animations."
+                    : $"Saved to '{(string)_animDropdown.SelectedItem!}'.";
         }
     }
 }

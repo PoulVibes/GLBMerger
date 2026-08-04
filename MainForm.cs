@@ -427,6 +427,8 @@ namespace GlbMerger
                 var selectedAnims1 = panel1.GetSelectedAnimationNames();
                 var inPlaceAnims1 = panel1.GetInPlaceAnimationNames();
                 var groundFixAnims1 = panel1.GetGroundFixAnimationNames();
+                var retargetBoneLengthAnims1 = panel1.GetRetargetBoneLengthAnimationNames();
+                var retargetRotationAnims1 = panel1.GetRetargetRotationAnimationNames();
                 var yRotationAnims1 = panel1.GetYRotationByAnimation();
                 var yOffsetAnims1 = panel1.GetYOffsetByAnimation();
                 var renameMap1 = panel1.GetAnimationRenameMap();
@@ -440,6 +442,8 @@ namespace GlbMerger
                 var selectedAnims2 = loaded2 ? panel2.GetSelectedAnimationNames() : new List<string>();
                 var inPlaceAnims2 = loaded2 ? panel2.GetInPlaceAnimationNames() : new List<string>();
                 var groundFixAnims2 = loaded2 ? panel2.GetGroundFixAnimationNames() : new List<string>();
+                var retargetBoneLengthAnims2 = loaded2 ? panel2.GetRetargetBoneLengthAnimationNames() : new List<string>();
+                var retargetRotationAnims2 = loaded2 ? panel2.GetRetargetRotationAnimationNames() : new List<string>();
                 var yRotationAnims2 = loaded2 ? panel2.GetYRotationByAnimation() : new Dictionary<string, float>();
                 var yOffsetAnims2 = loaded2 ? panel2.GetYOffsetByAnimation() : new Dictionary<string, float>();
                 var renameMap2 = loaded2 ? panel2.GetAnimationRenameMap() : new Dictionary<string, string>();
@@ -457,6 +461,8 @@ namespace GlbMerger
                     matRenameMap1, matRenameMap2,
                     firstMat1, firstMat2, firstAnim1, firstAnim2,
                     frameTrim1, frameTrim2,
+                    retargetBoneLengthAnims1, retargetBoneLengthAnims2,
+                    retargetRotationAnims1, retargetRotationAnims2,
                     geomRenameMap1: geomRenameMap1);
 
                 btnSave.Enabled = true;

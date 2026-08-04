@@ -99,6 +99,8 @@ namespace GlbMerger
                     grdMaterials.CommitEdit(DataGridViewDataErrorContexts.Commit);
             };
             grdMaterials.CellValueChanged += (s, e) => EnforceSingleFirst(grdMaterials, e);
+            grdMaterials.ColumnHeaderMouseClick += (s, e) => ToggleAllInColumn(
+                grdMaterials, e.ColumnIndex, new HashSet<string> { "Include" });
 
             lblAnim = MakeLabel("Animation Clips (Check to Inject)");
 
@@ -126,6 +128,23 @@ namespace GlbMerger
             // uniform float/sink that can happen when a retargeted clip's natural knee-bend leaves
             // its feet slightly off the ground even though the root translation itself is correct.
             grdAnimations.Columns.Add(new DataGridViewCheckBoxColumn { Name = "GroundFix", HeaderText = "Fix Floating", FillWeight = 30 });
+            // Re-anchors this clip's translation channels (usually just a bone's static length,
+            // repeated every frame) from the source rig's own bone lengths onto the target rig's,
+            // so a differently-proportioned donor rig doesn't stretch/squish the target's limbs.
+            // Checked by default - purely geometric, a no-op whenever both rigs already share the
+            // same proportions.
+            grdAnimations.Columns.Add(new DataGridViewCheckBoxColumn { Name = "RetargetBoneLength", HeaderText = "Fix Bone Length", FillWeight = 30 });
+            // Corrects per-joint bind-pose *rotation* mismatches when this clip comes from a
+            // different rig than the merge's structural model (same bone names, different
+            // authored rest orientation). Unchecked by default: unlike bone length, this is only
+            // a coordinate-convention fix when both rigs' bind poses are otherwise neutral - if a
+            // donor rig's bind pose itself encodes a stance (e.g. a permanently athletic/crouched
+            // rest pose), subtracting that whole difference over-rotates the target (verified
+            // against an actual squat clip: the corrected thigh rotation blew past the target's
+            // own natural crouch range, reading as the leg lifting instead of the hips settling
+            // down - the *uncorrected* rotation matched the target's own convention better there).
+            // Leave off unless a clip visibly twists with it off.
+            grdAnimations.Columns.Add(new DataGridViewCheckBoxColumn { Name = "RetargetRotation", HeaderText = "Fix Bind Rotation", FillWeight = 30 });
             // Manual turn of the whole clip around the world Y axis (facing direction and root
             // motion path both rotate together, pivoting on the clip's own starting position) -
             // for cases where the retargeted clip simply faces/walks the wrong way. Out-of-range
@@ -172,6 +191,12 @@ namespace GlbMerger
             };
             grdAnimations.CellValueChanged += (s, e) => EnforceSingleFirst(grdAnimations, e);
             grdAnimations.CellValueChanged += (s, e) => EnforceFrameOrder(grdAnimations, e);
+            // Clicking a checkbox column's header toggles that checkbox for every row at once -
+            // "First" is excluded since only one row can ever be marked First (EnforceSingleFirst
+            // would just immediately undo a bulk-check anyway).
+            grdAnimations.ColumnHeaderMouseClick += (s, e) => ToggleAllInColumn(
+                grdAnimations, e.ColumnIndex,
+                new HashSet<string> { "Include", "InPlace", "GroundFix", "RetargetBoneLength", "RetargetRotation" });
 
             // Each box (label + list/grid) sits in its own SplitContainer panel with a draggable
             // divider between it and its neighbor, instead of the old TableLayoutPanel's fixed
@@ -297,6 +322,28 @@ namespace GlbMerger
 
             var files = (string[])e.Data.GetData(DataFormats.FileDrop)!;
             return files.Where(f => f.EndsWith(requiredExtension, StringComparison.OrdinalIgnoreCase)).ToList();
+        }
+
+        // Lets a checkbox column's header act as a "select all" button: if every row is currently
+        // checked, unchecks them all; otherwise checks them all (so a partially-checked column
+        // fills the rest in, rather than requiring a second click). Only columns named in
+        // toggleableColumns respond - e.g. "First" is deliberately excluded wherever this is
+        // wired up, since EnforceSingleFirst would immediately collapse a bulk-check back down to
+        // one row anyway.
+        private static void ToggleAllInColumn(DataGridView grid, int columnIndex, HashSet<string> toggleableColumns)
+        {
+            if (columnIndex < 0 || columnIndex >= grid.Columns.Count) return;
+            if (grid.Rows.Count == 0) return;
+
+            var column = grid.Columns[columnIndex];
+            if (!toggleableColumns.Contains(column.Name)) return;
+
+            bool allChecked = grid.Rows.Cast<DataGridViewRow>()
+                .All(r => r.Cells[columnIndex].Value is bool b && b);
+            bool newValue = !allChecked;
+
+            foreach (DataGridViewRow row in grid.Rows)
+                row.Cells[columnIndex].Value = newValue;
         }
 
         // Keeps the "First" checkbox mutually exclusive within a grid: checking one row's "First"
@@ -498,7 +545,7 @@ namespace GlbMerger
         // earlier drop.
         private void RebuildAnimationGrid()
         {
-            var previousSettings = new Dictionary<string, (bool Include, string MergedAs, bool InPlace, bool GroundFix, decimal YRotation, decimal YOffset, decimal StartFrame, decimal EndFrame, bool First)>();
+            var previousSettings = new Dictionary<string, (bool Include, string MergedAs, bool InPlace, bool GroundFix, bool RetargetBoneLength, bool RetargetRotation, decimal YRotation, decimal YOffset, decimal StartFrame, decimal EndFrame, bool First)>();
             foreach (DataGridViewRow row in grdAnimations.Rows)
             {
                 var name = (string)row.Cells["Name"].Value!;
@@ -507,6 +554,8 @@ namespace GlbMerger
                     (string?)row.Cells["MergedAs"].Value ?? name,
                     row.Cells["InPlace"].Value is bool ip && ip,
                     row.Cells["GroundFix"].Value is bool gf && gf,
+                    row.Cells["RetargetBoneLength"].Value is bool rbl && rbl,
+                    row.Cells["RetargetRotation"].Value is bool rr && rr,
                     row.Cells["YRotation"].Value is decimal yr ? yr : 0m,
                     row.Cells["YOffset"].Value is decimal yo ? yo : 0m,
                     row.Cells["StartFrame"].Value is decimal sf ? sf : 0m,
@@ -528,11 +577,15 @@ namespace GlbMerger
                 {
                     decimal start = Math.Clamp(s.StartFrame, 0m, lastFrame);
                     decimal end = Math.Clamp(s.EndFrame, start, lastFrame);
-                    rowIndex = grdAnimations.Rows.Add(s.Include, name, s.MergedAs, s.InPlace, s.GroundFix, s.YRotation, s.YOffset, start, end, s.First);
+                    rowIndex = grdAnimations.Rows.Add(s.Include, name, s.MergedAs, s.InPlace, s.GroundFix, s.RetargetBoneLength, s.RetargetRotation, s.YRotation, s.YOffset, start, end, s.First);
                 }
                 else
                 {
-                    rowIndex = grdAnimations.Rows.Add(true, name, defaultMergedAs, false, false, 0m, 0m, 0m, (decimal)lastFrame, false);
+                    // RetargetBoneLength defaults on (purely geometric, safe); RetargetRotation
+                    // defaults off (can over-rotate when a donor rig's bind pose itself encodes a
+                    // stance rather than a neutral rest position - opt in per clip if it visibly
+                    // twists without it).
+                    rowIndex = grdAnimations.Rows.Add(true, name, defaultMergedAs, false, false, true, false, 0m, 0m, 0m, (decimal)lastFrame, false);
                 }
 
                 var row = grdAnimations.Rows[rowIndex];
@@ -643,6 +696,32 @@ namespace GlbMerger
                 bool included = row.Cells["Include"].Value is bool inc && inc;
                 bool groundFix = row.Cells["GroundFix"].Value is bool gf && gf;
                 if (included && groundFix)
+                    result.Add((string)row.Cells["Name"].Value!);
+            }
+            return result;
+        }
+
+        public List<string> GetRetargetBoneLengthAnimationNames()
+        {
+            var result = new List<string>();
+            foreach (DataGridViewRow row in grdAnimations.Rows)
+            {
+                bool included = row.Cells["Include"].Value is bool inc && inc;
+                bool retargetBoneLength = row.Cells["RetargetBoneLength"].Value is bool rbl && rbl;
+                if (included && retargetBoneLength)
+                    result.Add((string)row.Cells["Name"].Value!);
+            }
+            return result;
+        }
+
+        public List<string> GetRetargetRotationAnimationNames()
+        {
+            var result = new List<string>();
+            foreach (DataGridViewRow row in grdAnimations.Rows)
+            {
+                bool included = row.Cells["Include"].Value is bool inc && inc;
+                bool retargetRotation = row.Cells["RetargetRotation"].Value is bool rr && rr;
+                if (included && retargetRotation)
                     result.Add((string)row.Cells["Name"].Value!);
             }
             return result;
