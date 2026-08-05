@@ -131,20 +131,17 @@ namespace GlbMerger
             // Re-anchors this clip's translation channels (usually just a bone's static length,
             // repeated every frame) from the source rig's own bone lengths onto the target rig's,
             // so a differently-proportioned donor rig doesn't stretch/squish the target's limbs.
-            // Checked by default - purely geometric, a no-op whenever both rigs already share the
-            // same proportions.
-            grdAnimations.Columns.Add(new DataGridViewCheckBoxColumn { Name = "RetargetBoneLength", HeaderText = "Fix Bone Length", FillWeight = 30 });
-            // Corrects per-joint bind-pose *rotation* mismatches when this clip comes from a
-            // different rig than the merge's structural model (same bone names, different
-            // authored rest orientation). Unchecked by default: unlike bone length, this is only
-            // a coordinate-convention fix when both rigs' bind poses are otherwise neutral - if a
-            // donor rig's bind pose itself encodes a stance (e.g. a permanently athletic/crouched
-            // rest pose), subtracting that whole difference over-rotates the target (verified
-            // against an actual squat clip: the corrected thigh rotation blew past the target's
-            // own natural crouch range, reading as the leg lifting instead of the hips settling
-            // down - the *uncorrected* rotation matched the target's own convention better there).
-            // Leave off unless a clip visibly twists with it off.
-            grdAnimations.Columns.Add(new DataGridViewCheckBoxColumn { Name = "RetargetRotation", HeaderText = "Fix Bind Rotation", FillWeight = 30 });
+            // Purely geometric - doesn't touch rotation at all. Checked by default: a no-op
+            // whenever both rigs already share the same proportions.
+            grdAnimations.Columns.Add(new DataGridViewCheckBoxColumn { Name = "FixBoneLength", HeaderText = "Fix Bone Length", FillWeight = 30 });
+            // Corrects just the Hips joint's rotation using a fixed delta computed from each rig's
+            // own Hips bind pose - narrower than a full per-joint rotation retarget (which this
+            // app tried and found made limb rotations worse). Hips is the exception: its own
+            // bind-rotation mismatch between two independently-authored rigs shows up as the torso
+            // reading as tilted/shifted relative to the legs, without any downstream joint able to
+            // absorb it the way a leg can absorb its own bind mismatch. Off by default - only
+            // needed when the torso visibly leans/shifts relative to the hips.
+            grdAnimations.Columns.Add(new DataGridViewCheckBoxColumn { Name = "FixHipRotation", HeaderText = "Fix Hip Rotation", FillWeight = 30 });
             // Manual turn of the whole clip around the world Y axis (facing direction and root
             // motion path both rotate together, pivoting on the clip's own starting position) -
             // for cases where the retargeted clip simply faces/walks the wrong way. Out-of-range
@@ -196,7 +193,7 @@ namespace GlbMerger
             // would just immediately undo a bulk-check anyway).
             grdAnimations.ColumnHeaderMouseClick += (s, e) => ToggleAllInColumn(
                 grdAnimations, e.ColumnIndex,
-                new HashSet<string> { "Include", "InPlace", "GroundFix", "RetargetBoneLength", "RetargetRotation" });
+                new HashSet<string> { "Include", "InPlace", "GroundFix", "FixBoneLength", "FixHipRotation" });
 
             // Each box (label + list/grid) sits in its own SplitContainer panel with a draggable
             // divider between it and its neighbor, instead of the old TableLayoutPanel's fixed
@@ -545,7 +542,7 @@ namespace GlbMerger
         // earlier drop.
         private void RebuildAnimationGrid()
         {
-            var previousSettings = new Dictionary<string, (bool Include, string MergedAs, bool InPlace, bool GroundFix, bool RetargetBoneLength, bool RetargetRotation, decimal YRotation, decimal YOffset, decimal StartFrame, decimal EndFrame, bool First)>();
+            var previousSettings = new Dictionary<string, (bool Include, string MergedAs, bool InPlace, bool GroundFix, bool FixBoneLength, bool FixHipRotation, decimal YRotation, decimal YOffset, decimal StartFrame, decimal EndFrame, bool First)>();
             foreach (DataGridViewRow row in grdAnimations.Rows)
             {
                 var name = (string)row.Cells["Name"].Value!;
@@ -554,8 +551,8 @@ namespace GlbMerger
                     (string?)row.Cells["MergedAs"].Value ?? name,
                     row.Cells["InPlace"].Value is bool ip && ip,
                     row.Cells["GroundFix"].Value is bool gf && gf,
-                    row.Cells["RetargetBoneLength"].Value is bool rbl && rbl,
-                    row.Cells["RetargetRotation"].Value is bool rr && rr,
+                    row.Cells["FixBoneLength"].Value is bool fbl && fbl,
+                    row.Cells["FixHipRotation"].Value is bool fhr && fhr,
                     row.Cells["YRotation"].Value is decimal yr ? yr : 0m,
                     row.Cells["YOffset"].Value is decimal yo ? yo : 0m,
                     row.Cells["StartFrame"].Value is decimal sf ? sf : 0m,
@@ -577,14 +574,13 @@ namespace GlbMerger
                 {
                     decimal start = Math.Clamp(s.StartFrame, 0m, lastFrame);
                     decimal end = Math.Clamp(s.EndFrame, start, lastFrame);
-                    rowIndex = grdAnimations.Rows.Add(s.Include, name, s.MergedAs, s.InPlace, s.GroundFix, s.RetargetBoneLength, s.RetargetRotation, s.YRotation, s.YOffset, start, end, s.First);
+                    rowIndex = grdAnimations.Rows.Add(s.Include, name, s.MergedAs, s.InPlace, s.GroundFix, s.FixBoneLength, s.FixHipRotation, s.YRotation, s.YOffset, start, end, s.First);
                 }
                 else
                 {
-                    // RetargetBoneLength defaults on (purely geometric, safe); RetargetRotation
-                    // defaults off (can over-rotate when a donor rig's bind pose itself encodes a
-                    // stance rather than a neutral rest position - opt in per clip if it visibly
-                    // twists without it).
+                    // FixBoneLength defaults on - purely geometric, safe even when both rigs
+                    // already share the same proportions. FixHipRotation defaults off - only
+                    // needed when the torso visibly leans/shifts relative to the hips.
                     rowIndex = grdAnimations.Rows.Add(true, name, defaultMergedAs, false, false, true, false, 0m, 0m, 0m, (decimal)lastFrame, false);
                 }
 
@@ -701,27 +697,27 @@ namespace GlbMerger
             return result;
         }
 
-        public List<string> GetRetargetBoneLengthAnimationNames()
+        public List<string> GetFixBoneLengthAnimationNames()
         {
             var result = new List<string>();
             foreach (DataGridViewRow row in grdAnimations.Rows)
             {
                 bool included = row.Cells["Include"].Value is bool inc && inc;
-                bool retargetBoneLength = row.Cells["RetargetBoneLength"].Value is bool rbl && rbl;
-                if (included && retargetBoneLength)
+                bool fixBoneLength = row.Cells["FixBoneLength"].Value is bool fbl && fbl;
+                if (included && fixBoneLength)
                     result.Add((string)row.Cells["Name"].Value!);
             }
             return result;
         }
 
-        public List<string> GetRetargetRotationAnimationNames()
+        public List<string> GetFixHipRotationAnimationNames()
         {
             var result = new List<string>();
             foreach (DataGridViewRow row in grdAnimations.Rows)
             {
                 bool included = row.Cells["Include"].Value is bool inc && inc;
-                bool retargetRotation = row.Cells["RetargetRotation"].Value is bool rr && rr;
-                if (included && retargetRotation)
+                bool fixHipRotation = row.Cells["FixHipRotation"].Value is bool fhr && fhr;
+                if (included && fixHipRotation)
                     result.Add((string)row.Cells["Name"].Value!);
             }
             return result;

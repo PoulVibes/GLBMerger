@@ -4,6 +4,7 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Numerics;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Windows.Forms;
 using Microsoft.Web.WebView2.Core;
@@ -29,7 +30,6 @@ namespace GlbMerger
 
         private ComboBox _boneDropdown = null!;
         private ComboBox _animDropdown = null!;
-        private CheckBox _chkApplyToAllAnimations = null!;
         private TrackBar _sliderX = null!, _sliderY = null!, _sliderZ = null!;
         private Label _lblX = null!, _lblY = null!, _lblZ = null!;
         private NumericUpDown _numPosX = null!, _numPosY = null!, _numPosZ = null!;
@@ -49,6 +49,9 @@ namespace GlbMerger
         // TOTAL bend and is split evenly across every spine joint instead of applied to just the
         // one joint.
         private CheckBox _chkDistributeSpine = null!;
+        // Toggles small marker spheres over every joint in the live preview, which can be clicked
+        // to select that joint (same effect as picking it from the bone dropdown).
+        private CheckBox _chkShowJoints = null!;
         private Label _lblStatus = null!;
         private Button _btnPause = null!;
         private WebView2 _webView = null!;
@@ -147,13 +150,11 @@ namespace GlbMerger
             _btnPause.Click += (s, e) => TogglePause();
             y += Math.Max(_animDropdown.Height, _btnPause.Height) + gap;
 
-            // When checked, Save writes the currently dialed-in offset onto every animation in the
-            // model (not just whichever one is selected above) - the dropdown/preview stay
-            // single-animation as before, this only changes what Save actually writes. Has no
-            // effect while "None (Static Pose)" is selected, since there's no "every animation"
-            // analogue for the bind pose - it just writes the bind pose either way.
-            _chkApplyToAllAnimations = new CheckBox { Text = "Apply to All Animations", Left = 12, Top = y, AutoSize = true };
-            y += _chkApplyToAllAnimations.Height + gap * 2;
+            // Off by default so the preview looks the same as before this feature existed until
+            // the user opts in.
+            _chkShowJoints = new CheckBox { Text = "Show Joints (click to select)", Left = 12, Top = y, AutoSize = true };
+            _chkShowJoints.CheckedChanged += (s, e) => PushShowJoints();
+            y += _chkShowJoints.Height + gap * 2;
 
             (_lblX, _sliderX, _chkMirrorX, _chkInverseX) = MakeSlider("X Rotation", ref y);
             (_lblY, _sliderY, _chkMirrorY, _chkInverseY) = MakeSlider("Y Rotation", ref y);
@@ -187,8 +188,12 @@ namespace GlbMerger
             // width (matching the rest of this column) but grows instead of clipping if the
             // text needs more room than that under the runtime font/DPI.
             var btnSave = new Button { Text = "Save Adjustments to Animation", Left = 12, Top = y, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowOnly, MinimumSize = new System.Drawing.Size(280, 0) };
-            btnSave.Click += (s, e) => SaveAdjustments();
+            btnSave.Click += (s, e) => SaveAdjustments(applyToAll: false);
             y += btnSave.Height + gap;
+
+            var btnSaveAll = new Button { Text = "Save Adjustments to All Animations", Left = 12, Top = y, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowOnly, MinimumSize = new System.Drawing.Size(280, 0) };
+            btnSaveAll.Click += (s, e) => SaveAdjustments(applyToAll: true);
+            y += btnSaveAll.Height + gap;
 
             var btnReset = new Button { Text = "Reset This Joint", Left = 12, Top = y, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowOnly, MinimumSize = new System.Drawing.Size(280, 0) };
             btnReset.Click += (s, e) => ResetCurrentBone();
@@ -198,7 +203,7 @@ namespace GlbMerger
 
             controlPanel.Controls.AddRange(new Control[]
             {
-                lblBone, _boneDropdown, lblAnim, _animDropdown, _btnPause, _chkApplyToAllAnimations,
+                lblBone, _boneDropdown, lblAnim, _animDropdown, _btnPause, _chkShowJoints,
                 _lblX, _sliderX, _chkMirrorX, _chkInverseX,
                 _lblY, _sliderY, _chkMirrorY, _chkInverseY,
                 _lblZ, _sliderZ, _chkMirrorZ, _chkInverseZ,
@@ -206,7 +211,7 @@ namespace GlbMerger
                 _lblPosX, _numPosX, _chkMirrorPosX, _chkInversePosX,
                 _lblPosY, _numPosY, _chkMirrorPosY, _chkInversePosY,
                 _lblPosZ, _numPosZ, _chkMirrorPosZ, _chkInversePosZ,
-                btnSave, btnReset, _lblStatus
+                btnSave, btnSaveAll, btnReset, _lblStatus
             });
 
             _webView = new WebView2 { Dock = DockStyle.Fill };
@@ -230,7 +235,10 @@ namespace GlbMerger
             string tempFolder = Path.GetTempPath();
             string previewPath = Path.Combine(tempFolder, "glbmerger_joint_preview.glb");
             _webView.CoreWebView2.SetVirtualHostNameToFolderMapping("appassets.local", tempFolder, CoreWebView2HostResourceAccessKind.Allow);
-            _webView.CoreWebView2.NavigationCompleted += (s, e) => _viewerReady = e.IsSuccess;
+            _webView.CoreWebView2.NavigationCompleted += (s, e) => { _viewerReady = e.IsSuccess; PushShowJoints(); };
+            _webView.CoreWebView2.WebMessageReceived += OnWebMessageReceived;
+
+            var jointNamesJson = JsonSerializer.Serialize(GetJointNames(_model));
 
             // The model is only ever saved to disk *once*, just to give the loader something to
             // read - after that, every correction is applied directly to the loaded Three.js bone
@@ -302,6 +310,10 @@ namespace GlbMerger
                         var clock = new THREE.Clock();
                         var paused = false;
                         var bonesByName = {};
+                        var jointNames = " + jointNamesJson + @";
+                        var jointMarkerMeshes = [];
+                        var jointMarkersVisible = false;
+                        var selectedJointName = null;
                         // The currently-playing clip and its action, kept as direct references (not
                         // looked up via mixer's private/internal action list) so the correction
                         // loops below can sample track data straight from the clip regardless of
@@ -388,6 +400,27 @@ namespace GlbMerger
                             paused = value;
                         };
 
+                        // Markers are created once the model finishes loading (see below), but the
+                        // checkbox driving this can be toggled before that - both functions just
+                        // update state and re-apply it, so whichever happens first is a no-op until
+                        // the other catches up.
+                        function applyJointMarkersVisibility() {
+                            jointMarkerMeshes.forEach(function (m) { m.visible = jointMarkersVisible; });
+                        }
+                        function applySelectedJointHighlight() {
+                            jointMarkerMeshes.forEach(function (m) {
+                                m.material.color.set(m.userData.boneName === selectedJointName ? 0xffee00 : 0x00e5ff);
+                            });
+                        }
+                        window.setJointMarkersVisible = function (value) {
+                            jointMarkersVisible = value;
+                            applyJointMarkersVisibility();
+                        };
+                        window.setSelectedJoint = function (name) {
+                            selectedJointName = name;
+                            applySelectedJointHighlight();
+                        };
+
                         var loader = new THREE.GLTFLoader();
                         loader.load('https://appassets.local/" + previewFileName + @"', function (gltf) {
                             try {
@@ -450,6 +483,32 @@ namespace GlbMerger
                                 groundGrid.position.set(center.x, groundY + maxDim * 0.0005, center.z);
                                 scene.add(groundGrid);
 
+                                // One small sphere per joint. Deliberately added to `scene` rather
+                                // than parented to the bone itself: a bone's LOCAL scale is often
+                                // not 1 (e.g. a root bone scaled down 0.01x, common on Mixamo-style
+                                // rigs), and a plain child would inherit that scale too, shrinking
+                                // (or, for non-uniform scale, stretching) the sphere into invisible
+                                // or distorted geometry. Instead each marker keeps a fixed world-space
+                                // size and just copies the bone's world position onto itself every
+                                // frame (see animate() below). depthTest is off so a marker stays
+                                // visible even when it's inside the mesh.
+                                var jointGeom = new THREE.SphereGeometry(1, 12, 8);
+                                var jointRadius = maxDim * 0.008;
+                                jointNames.forEach(function (name) {
+                                    var bone = bonesByName[name];
+                                    if (!bone) return;
+                                    var marker = new THREE.Mesh(jointGeom, new THREE.MeshBasicMaterial({ color: 0x00e5ff, depthTest: false }));
+                                    marker.scale.setScalar(jointRadius);
+                                    marker.renderOrder = 999;
+                                    marker.visible = jointMarkersVisible;
+                                    marker.userData.boneName = name;
+                                    marker.userData.bone = bone;
+                                    scene.add(marker);
+                                    jointMarkerMeshes.push(marker);
+                                });
+                                applyJointMarkersVisibility();
+                                applySelectedJointHighlight();
+
                                 controls.target.copy(center);
                                 camera.position.copy(center).add(new THREE.Vector3(maxDim, maxDim * 0.6, maxDim));
                                 camera.near = maxDim / 1000;
@@ -479,6 +538,23 @@ namespace GlbMerger
                             camera.aspect = window.innerWidth / window.innerHeight;
                             camera.updateProjectionMatrix();
                             renderer.setSize(window.innerWidth, window.innerHeight);
+                        });
+
+                        // Invisible markers are skipped by THREE's own hit-testing (it checks
+                        // .visible internally), so this doesn't need to gate on jointMarkersVisible
+                        // itself - a hidden marker just can't be hit.
+                        var raycaster = new THREE.Raycaster();
+                        var pickVec = new THREE.Vector2();
+                        canvas.addEventListener('click', function (event) {
+                            if (jointMarkerMeshes.length === 0) return;
+                            var rect = canvas.getBoundingClientRect();
+                            pickVec.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+                            pickVec.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+                            raycaster.setFromCamera(pickVec, camera);
+                            var hits = raycaster.intersectObjects(jointMarkerMeshes, false);
+                            if (hits.length > 0 && window.chrome && window.chrome.webview) {
+                                window.chrome.webview.postMessage(JSON.stringify({ action: 'jointSelected', bone: hits[0].object.userData.boneName }));
+                            }
                         });
 
                         function animate() {
@@ -543,6 +619,13 @@ namespace GlbMerger
                                 posBone.position.copy(basePositions[posName]).add(localDelta);
                             }
 
+                            if (jointMarkersVisible) {
+                                for (var mi = 0; mi < jointMarkerMeshes.length; mi++) {
+                                    var marker = jointMarkerMeshes[mi];
+                                    marker.userData.bone.getWorldPosition(marker.position);
+                                }
+                            }
+
                             controls.update();
                             renderer.render(scene, camera);
                         }
@@ -598,6 +681,40 @@ namespace GlbMerger
 
         private static string EscapeJs(string s) => s.Replace("\\", "\\\\").Replace("'", "\\'");
 
+        private void PushShowJoints()
+        {
+            if (!_viewerReady) return;
+            _webView.CoreWebView2.ExecuteScriptAsync($"setJointMarkersVisible({(_chkShowJoints.Checked ? "true" : "false")});");
+        }
+
+        // Fired when the JS side clicks a joint marker sphere (see the canvas 'click' listener in
+        // InitializeViewerAsync). Selecting the matching item in the bone dropdown does the rest -
+        // its own SelectedIndexChanged handler (OnBoneSelected) already restores that bone's
+        // sliders/checkboxes exactly as if it had been picked from the dropdown directly.
+        private void OnWebMessageReceived(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
+        {
+            ViewerMessage? message;
+            try
+            {
+                message = JsonSerializer.Deserialize<ViewerMessage>(e.TryGetWebMessageAsString(),
+                    new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+            }
+            catch
+            {
+                return;
+            }
+
+            if (message?.Action != "jointSelected" || message.Bone == null || IsDisposed) return;
+            if (_boneDropdown.Items.Contains(message.Bone))
+                _boneDropdown.SelectedItem = message.Bone;
+        }
+
+        private sealed class ViewerMessage
+        {
+            public string? Action { get; set; }
+            public string? Bone { get; set; }
+        }
+
         private (Label, TrackBar, CheckBox, CheckBox) MakeSlider(string text, ref int y)
         {
             var lbl = new Label { Text = $"{text}: 0°", Left = 12, Top = y, AutoSize = true };
@@ -650,8 +767,18 @@ namespace GlbMerger
         // geometry names, which is what showed up as clutter in this dropdown.
         private void PopulateBoneList()
         {
+            var names = GetJointNames(_model);
+            _boneDropdown.Items.AddRange(names);
+            if (names.Length > 0) _boneDropdown.SelectedIndex = 0;
+        }
+
+        // Every node name that actually acts as a skin's joint (see PopulateBoneList's comment
+        // for why that's narrower than every LogicalNode). Also used to tell the JS side which
+        // nodes to drop joint marker spheres on.
+        private static string[] GetJointNames(ModelRoot model)
+        {
             var jointNames = new HashSet<string>();
-            foreach (var skin in _model.LogicalSkins)
+            foreach (var skin in model.LogicalSkins)
                 for (int i = 0; i < skin.JointsCount; i++)
                 {
                     var (jointNode, _) = skin.GetJoint(i);
@@ -659,10 +786,7 @@ namespace GlbMerger
                         jointNames.Add(jointNode.Name);
                 }
 
-            var names = jointNames.OrderBy(n => n).ToArray();
-
-            _boneDropdown.Items.AddRange(names);
-            if (names.Length > 0) _boneDropdown.SelectedIndex = 0;
+            return jointNames.OrderBy(n => n).ToArray();
         }
 
         private static Quaternion ComputeOffsetQuaternion(int xDeg, int yDeg, int zDeg)
@@ -810,6 +934,9 @@ namespace GlbMerger
             // Restores whatever not-yet-saved offset was already dialed in for this bone, so
             // switching away and back doesn't lose it - the live 3D view is left untouched too,
             // since it's already showing this same pending offset.
+
+            if (_viewerReady)
+                _webView.CoreWebView2.ExecuteScriptAsync($"setSelectedJoint('{EscapeJs(boneName)}');");
         }
 
         // Captures a bone's rotation data (its keys in the currently selected animation, or its
@@ -1073,7 +1200,11 @@ namespace GlbMerger
             ApplyCorrection();
         }
 
-        private void SaveAdjustments()
+        // `applyToAll`: normally just the one currently-selected animation (or the static/bind
+        // pose) is written. When true, every animation in the model becomes a target instead -
+        // there's no "every animation" analogue for the bind pose, so this is simply ignored while
+        // "None (Static Pose)" is selected.
+        private void SaveAdjustments(bool applyToAll)
         {
             if (_pendingOffsets.Count == 0 && _pendingTranslationOffsets.Count == 0)
             {
@@ -1084,13 +1215,9 @@ namespace GlbMerger
 
             bool isStaticPose = _animDropdown.SelectedIndex <= 0;
 
-            // Normally just the one currently-selected animation (or the static/bind pose). With
-            // "Apply to All Animations" checked, every animation in the model becomes a target
-            // instead - there's no "every animation" analogue for the bind pose, so that checkbox
-            // is simply ignored while "None (Static Pose)" is selected.
             List<Animation?> targetAnims = isStaticPose
                 ? new List<Animation?> { null }
-                : _chkApplyToAllAnimations.Checked
+                : applyToAll
                     ? _model.LogicalAnimations.Select(a => (Animation?)a).ToList()
                     : new List<Animation?> { _model.LogicalAnimations.First(a => a.Name == (string)_animDropdown.SelectedItem!) };
 
@@ -1155,7 +1282,7 @@ namespace GlbMerger
             // one specific animation (or bind pose) it was computed against.
             _lblStatus.Text = isStaticPose
                 ? "Saved to bind (static) pose."
-                : _chkApplyToAllAnimations.Checked
+                : applyToAll
                     ? $"Saved to all {targetAnims.Count} animations."
                     : $"Saved to '{(string)_animDropdown.SelectedItem!}'.";
         }

@@ -34,19 +34,25 @@ namespace GlbMerger
             // slot's native GLB clips and its supplemental FBX clips trim the same way.
             Dictionary<string, (int Start, int End)>? frameTrimByName1 = null,
             Dictionary<string, (int Start, int End)>? frameTrimByName2 = null,
-            // Per-joint bind-pose correction for clips whose source rig merely shares bone names
-            // with the structural model but was authored with different rest proportions/
-            // orientation. Split into two independent knobs because they fail differently:
-            // bone-length re-anchoring is purely geometric (safe pretty much always), while
-            // rotation re-anchoring assumes both rigs' bind poses are neutral rest poses - if a
-            // donor rig's bind pose itself encodes a stance, subtracting that difference can
-            // over-rotate the target past a natural range. Both are no-ops for slot 1 (its clips
-            // are already in the structural model's own frame) - kept as parameters anyway to
-            // stay parallel with every other per-animation option, which all come in matched pairs.
-            List<string>? retargetBoneLengthAnims1 = null,
-            List<string>? retargetBoneLengthAnims2 = null,
-            List<string>? retargetRotationAnims1 = null,
-            List<string>? retargetRotationAnims2 = null,
+            // Re-anchors a clip's translation channels (usually just a bone's static length,
+            // repeated every frame) from the source rig's own bone lengths onto the target rig's,
+            // so a differently-proportioned donor rig doesn't stretch/squish the target's limbs.
+            // Purely geometric - doesn't touch rotation at all, unlike the rotation-retargeting
+            // this app tried and backed out of. A no-op for slot 1 (its own clips are already in
+            // the structural model's own bone lengths) - kept as a parameter anyway to stay
+            // parallel with every other per-animation option, which all come in matched pairs.
+            List<string>? fixBoneLengthAnims1 = null,
+            List<string>? fixBoneLengthAnims2 = null,
+            // Corrects just the Hips joint's rotation, using a fixed delta computed from each
+            // rig's own Hips bind pose - deliberately narrower than the full per-joint/chain
+            // rotation retargeting this app tried and backed out of (that made limb rotations
+            // worse). Hips is a special case: unlike a limb, its bind rotation difference between
+            // two independently-authored rigs is primarily a coordinate-convention/lean mismatch
+            // rather than a "different stance" one, so a plain bind-pose delta suits it without
+            // the over-rotation problems seen on legs. A no-op for slot 1, kept as a parameter
+            // anyway to stay parallel with every other per-animation option.
+            List<string>? fixHipRotationAnims1 = null,
+            List<string>? fixHipRotationAnims2 = null,
             // Model 2 never contributes its own geometry (model 1's is always used), so only
             // model 1's mesh/node names need a user-controlled rename - keyed by the node's
             // original baseName (Mesh.Name, falling back to Node.Name), same as GlbInfoPanel's
@@ -139,36 +145,41 @@ namespace GlbMerger
             // and caused a small but consistent vertical offset - most visible on stationary
             // clips like a planted throwing motion, where there's no walking-cycle bounce to mask it.
             var targetReferenceTranslationsByName = new Dictionary<string, Vector3>();
-            // Per-joint bind rotation of the structural model's own rebuilt hierarchy, and (when a
-            // second model is loaded) of that model's own hierarchy - used below to compute each
-            // shared joint's bind-pose rotation delta, so Model 2's animation rotations can be
-            // re-expressed in Model 1's rest-pose frame before being written onto Model 1's nodes.
-            var targetBindRotationsByName = new Dictionary<string, Quaternion>();
             foreach (var node in nodeMap.Keys)
             {
                 if (node.Name == null) continue;
-                Matrix4x4.Decompose(node.LocalMatrix, out _, out var bindRotation, out var bindTranslation);
+                Matrix4x4.Decompose(node.LocalMatrix, out _, out _, out var bindTranslation);
                 targetReferenceTranslationsByName[node.Name] = bindTranslation;
-                targetBindRotationsByName[node.Name] = bindRotation;
             }
 
-            var sourceBindRotationsByName = new Dictionary<string, Quaternion>();
-            // Per-joint bind translation of Model 2's own hierarchy - a bone's translation
-            // channel is usually just its (static, every-frame-identical) bone length, not real
-            // motion. Copied verbatim onto Model 1's differently-proportioned rig, that bone
-            // length overwrites Model 1's own, visibly squishing/stretching limbs. Needed to
-            // re-anchor those channels onto Model 1's own bone lengths the same way root motion
-            // already is (see targetReferenceTranslationsByName above and RetargetFbxClips).
+            // Per-joint bind translation of Model 2's own hierarchy - see ApplyBoneLengthCorrection
+            // for why this is needed alongside targetReferenceTranslationsByName above.
             var sourceBindTranslationsByName = new Dictionary<string, Vector3>();
             if (model2 != null)
             {
                 foreach (var node in otherNodesByName.Values)
                 {
                     if (node.Name == null) continue;
-                    Matrix4x4.Decompose(node.LocalMatrix, out _, out var bindRotation, out var srcBindTranslation);
-                    sourceBindRotationsByName[node.Name] = bindRotation;
+                    Matrix4x4.Decompose(node.LocalMatrix, out _, out _, out var srcBindTranslation);
                     sourceBindTranslationsByName[node.Name] = srcBindTranslation;
                 }
+            }
+
+            // Hips' own bind rotation on each side - see ApplyHipRotationCorrection for why only
+            // this one joint gets a rotation correction.
+            Quaternion? targetHipsBindRotation = null;
+            var targetHipsNode = nodeMap.Keys.FirstOrDefault(n => n.Name == "Hips");
+            if (targetHipsNode != null)
+            {
+                Matrix4x4.Decompose(targetHipsNode.LocalMatrix, out _, out var tgtHipsRot, out _);
+                targetHipsBindRotation = tgtHipsRot;
+            }
+
+            Quaternion? sourceHipsBindRotation = null;
+            if (model2 != null && otherNodesByName.TryGetValue("Hips", out var srcHipsNode))
+            {
+                Matrix4x4.Decompose(srcHipsNode.LocalMatrix, out _, out var srcHipsRot, out _);
+                sourceHipsBindRotation = srcHipsRot;
             }
 
             // Port over selected animation tracks directly onto the matching structural
@@ -187,15 +198,15 @@ namespace GlbMerger
             if (model2 != null)
             {
                 var nativeClips2 = ExtractGlbAnimationClips(model2);
-                // Only Model 2's own native clips get the bind-pose correction - FBX sources
-                // already went through their own (root-only) axis correction above, and
-                // re-applying a second correction on top would double up.
-                ApplyBindPoseCorrection(
+                ApplyBoneLengthCorrection(
                     nativeClips2,
-                    sourceBindRotationsByName, targetBindRotationsByName,
                     sourceBindTranslationsByName, targetReferenceTranslationsByName,
-                    new HashSet<string>(retargetBoneLengthAnims2 ?? new List<string>()),
-                    new HashSet<string>(retargetRotationAnims2 ?? new List<string>()));
+                    new HashSet<string>(fixBoneLengthAnims2 ?? new List<string>()));
+                if (sourceHipsBindRotation.HasValue && targetHipsBindRotation.HasValue)
+                    ApplyHipRotationCorrection(
+                        nativeClips2,
+                        sourceHipsBindRotation.Value, targetHipsBindRotation.Value,
+                        new HashSet<string>(fixHipRotationAnims2 ?? new List<string>()));
                 clips2.AddRange(nativeClips2);
             }
             foreach (var fbxSource in fbxAnims2 ?? Enumerable.Empty<FbxAnimationSource>())
@@ -634,66 +645,90 @@ namespace GlbMerger
             return result;
         }
 
-        // Generalizes RetargetFbxClips' single-bone (Hips-only) corrections into a per-joint one,
-        // computed automatically from each model's own authored bind pose instead of a hand-tuned
-        // constant. When two rigs share bone names but were authored with different per-joint
-        // rest orientations/proportions, copying keyframes verbatim either twists joints
-        // (rotation) or overwrites the target's own bone lengths with the source rig's differently
-        // scaled ones (translation, visible as squishing/stretching).
-        //
-        // Rotation and bone-length correction are gated independently (separate enabled-name
-        // sets) because they fail differently: bone-length re-anchoring is purely geometric and
-        // safe even when the two rigs' bind poses differ arbitrarily, but rotation re-anchoring
-        // assumes both bind poses are neutral rest poses - if a donor rig's bind pose itself
-        // encodes a stance, subtracting that whole difference over-rotates the target well past
-        // its own natural range, reading as a completely different motion. Applies uniformly to
-        // every joint (including legs) when checked - if a specific bone still needs a further
-        // manual tweak after this, use the per-bone "Fix Joint Orientation" editor post-merge.
-        private static void ApplyBindPoseCorrection(
+        // Re-anchors a clip's translation channels from the source rig's own bone lengths onto
+        // the target rig's - a bone's translation channel is usually just its (static,
+        // every-frame-identical) bone length, not real motion, so copied verbatim onto a
+        // differently-proportioned target rig it overwrites the target's own bone lengths,
+        // visibly squishing/stretching limbs. Takes the delta from this clip's own bind
+        // translation (usually zero, since most non-root channels are just a static bone length
+        // repeated every frame) and re-anchors it onto the target's own bone length/resting
+        // position, the same technique RetargetFbxClips already uses for Hips' root motion.
+        // Deliberately rotation-only-untouched: this only ever writes Translation, never Rotation.
+        private static void ApplyBoneLengthCorrection(
             List<AnimationClipData> clips,
-            IReadOnlyDictionary<string, Quaternion> sourceBindRotationsByName,
-            IReadOnlyDictionary<string, Quaternion> targetBindRotationsByName,
             IReadOnlyDictionary<string, Vector3> sourceBindTranslationsByName,
             IReadOnlyDictionary<string, Vector3> targetBindTranslationsByName,
-            HashSet<string> enabledBoneLengthClipNames,
-            HashSet<string> enabledRotationClipNames)
+            HashSet<string> enabledClipNames)
         {
             foreach (var clip in clips)
             {
-                bool fixRotation = enabledRotationClipNames.Contains(clip.Name);
-                bool fixBoneLength = enabledBoneLengthClipNames.Contains(clip.Name);
-                if (!fixRotation && !fixBoneLength) continue;
+                if (!enabledClipNames.Contains(clip.Name)) continue;
 
                 foreach (var ch in clip.NodeChannels)
                 {
-                    if (fixRotation && ch.Rotation != null
-                        && sourceBindRotationsByName.TryGetValue(ch.NodeName, out var srcBindRot)
-                        && targetBindRotationsByName.TryGetValue(ch.NodeName, out var tgtBindRot))
-                    {
-                        // Same pre-multiply pattern as RetargetFbxClips' Hips correction
-                        // (correction * rawRotation, not the other way around - post-multiplying
-                        // lands ~90 degrees off there, for the same reason it would here).
-                        var deltaRot = Quaternion.Normalize(Quaternion.Multiply(tgtBindRot, Quaternion.Inverse(srcBindRot)));
+                    if (ch.Translation == null) continue;
+                    if (!sourceBindTranslationsByName.TryGetValue(ch.NodeName, out var srcBindPos)) continue;
+                    if (!targetBindTranslationsByName.TryGetValue(ch.NodeName, out var tgtBindPos)) continue;
 
-                        ch.Rotation = ch.Rotation.ToDictionary(
-                            k => k.Key,
-                            k => Quaternion.Normalize(Quaternion.Multiply(deltaRot, k.Value)));
-                    }
+                    ch.Translation = ch.Translation.ToDictionary(
+                        k => k.Key,
+                        k => tgtBindPos + (k.Value - srcBindPos));
+                }
+            }
+        }
 
-                    if (fixBoneLength && ch.Translation != null
-                        && sourceBindTranslationsByName.TryGetValue(ch.NodeName, out var srcBindPos)
-                        && targetBindTranslationsByName.TryGetValue(ch.NodeName, out var tgtBindPos))
-                    {
-                        // Same delta-and-reanchor technique RetargetFbxClips already uses for
-                        // Hips' root motion, generalized to every joint: take the delta from this
-                        // clip's own bind translation (usually zero, since most non-root channels
-                        // are just a static bone length repeated every frame) and re-anchor it
-                        // onto the target's own bone length/resting position, instead of letting
-                        // the source rig's differently-scaled bone length overwrite the target's.
-                        ch.Translation = ch.Translation.ToDictionary(
-                            k => k.Key,
-                            k => tgtBindPos + (k.Value - srcBindPos));
-                    }
+        // Direct children of Hips whose own rotation needs to counter-rotate by the Hips
+        // correction's inverse - see ApplyHipRotationCorrection's own comment for why.
+        private static readonly string[] HipsChildBonesNeedingInverseCorrection = { "Spine02", "LeftUpLeg", "RightUpLeg" };
+
+        // Corrects the Hips joint's rotation with a fixed bind-pose delta (targetBind *
+        // inverse(sourceBind), pre-multiplied onto the raw rotation - same pattern as
+        // RetargetFbxClips' own root correction). Deliberately narrow: this app previously tried
+        // applying an equivalent correction to every joint (and later a more sophisticated
+        // world-space chain solve), and both made limb rotations worse, not better - copied raw,
+        // legs and arms already land close to the target rig's own convention. Hips is the
+        // exception: as the root, its own bind-rotation mismatch between two independently
+        // authored rigs (a coordinate-convention/lean difference, not a "different stance" the
+        // way a leg's can be) propagates into how the whole spine/leg attachment reads.
+        //
+        // Because delta pre-multiplies Hips' own rotation, it also pre-multiplies (i.e.
+        // propagates unchanged into) the WORLD rotation of every direct child of Hips - Spine02
+        // and both UpLegs - since a child's world rotation is parentWorld * childLocal, and
+        // parentWorld just picked up an extra `delta` on its left. Their own raw local rotation
+        // was authored assuming Hips' *uncorrected* rotation, so left alone they inherit that
+        // same delta a second time, which is what threw the feet and torso off after fixing Hips
+        // alone. Pre-multiplying their own rotation by delta's inverse cancels that inherited
+        // rotation back out, restoring their world orientation to what it was before Hips was
+        // corrected - only these three bones, since only they're Hips' immediate children.
+        private static void ApplyHipRotationCorrection(
+            List<AnimationClipData> clips,
+            Quaternion sourceHipsBindRotation,
+            Quaternion targetHipsBindRotation,
+            HashSet<string> enabledClipNames)
+        {
+            var delta = Quaternion.Normalize(Quaternion.Multiply(targetHipsBindRotation, Quaternion.Inverse(sourceHipsBindRotation)));
+            var inverseDelta = Quaternion.Normalize(Quaternion.Inverse(delta));
+
+            foreach (var clip in clips)
+            {
+                if (!enabledClipNames.Contains(clip.Name)) continue;
+
+                var hipsChannel = clip.NodeChannels.FirstOrDefault(c => c.NodeName == "Hips");
+                if (hipsChannel?.Rotation != null)
+                {
+                    hipsChannel.Rotation = hipsChannel.Rotation.ToDictionary(
+                        k => k.Key,
+                        k => Quaternion.Normalize(Quaternion.Multiply(delta, k.Value)));
+                }
+
+                foreach (var childBoneName in HipsChildBonesNeedingInverseCorrection)
+                {
+                    var childChannel = clip.NodeChannels.FirstOrDefault(c => c.NodeName == childBoneName);
+                    if (childChannel?.Rotation == null) continue;
+
+                    childChannel.Rotation = childChannel.Rotation.ToDictionary(
+                        k => k.Key,
+                        k => Quaternion.Normalize(Quaternion.Multiply(inverseDelta, k.Value)));
                 }
             }
         }
