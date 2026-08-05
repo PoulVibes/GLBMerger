@@ -700,6 +700,16 @@ namespace GlbMerger
         // alone. Pre-multiplying their own rotation by delta's inverse cancels that inherited
         // rotation back out, restoring their world orientation to what it was before Hips was
         // corrected - only these three bones, since only they're Hips' immediate children.
+        //
+        // Also neutralizes Hips' own YAW drift (facing direction turning over the course of the
+        // clip) once corrected, locking it to the target's own resting facing direction while
+        // leaving the corrected rotation's lean/sway (everything else about it) animating
+        // normally - a swing-twist split around world Y, same technique as Lock In Place's
+        // translation lock but for rotation. This used to live in Lock In Place itself, gated on
+        // that checkbox, but Lock In Place needs to keep working unmodified for same-rig (no
+        // retargeting) copies, where there's no cross-rig yaw mismatch to correct in the first
+        // place - it belongs here, tied to the correction that's actually responsible for it, so
+        // it only ever runs alongside the rest of this correction.
         private static void ApplyHipRotationCorrection(
             List<AnimationClipData> clips,
             Quaternion sourceHipsBindRotation,
@@ -708,6 +718,7 @@ namespace GlbMerger
         {
             var delta = Quaternion.Normalize(Quaternion.Multiply(targetHipsBindRotation, Quaternion.Inverse(sourceHipsBindRotation)));
             var inverseDelta = Quaternion.Normalize(Quaternion.Inverse(delta));
+            var targetYaw = DecomposeTwist(targetHipsBindRotation, Vector3.UnitY);
 
             foreach (var clip in clips)
             {
@@ -718,7 +729,12 @@ namespace GlbMerger
                 {
                     hipsChannel.Rotation = hipsChannel.Rotation.ToDictionary(
                         k => k.Key,
-                        k => Quaternion.Normalize(Quaternion.Multiply(delta, k.Value)));
+                        k =>
+                        {
+                            var corrected = Quaternion.Normalize(Quaternion.Multiply(delta, k.Value));
+                            var swing = DecomposeSwing(corrected, Vector3.UnitY);
+                            return Quaternion.Normalize(Quaternion.Multiply(swing, targetYaw));
+                        });
                 }
 
                 foreach (var childBoneName in HipsChildBonesNeedingInverseCorrection)
@@ -1024,6 +1040,23 @@ namespace GlbMerger
                 k => k.Key,
                 k => new Vector3(k.Value.X, k.Value.Y - deltaY, k.Value.Z));
         }
+
+        // Standard swing-twist split: the component of `q` that's a pure rotation about unit axis
+        // `axis` (twist), found by projecting q's vector part onto that axis, and everything else
+        // (swing - q with that twist divided back out). Used by Lock In Place to isolate Hips'
+        // yaw (twist about world Y) from its lean/sway (swing) so only the yaw gets locked.
+        private static Quaternion DecomposeTwist(Quaternion q, Vector3 axis)
+        {
+            var qv = new Vector3(q.X, q.Y, q.Z);
+            var proj = Vector3.Dot(qv, axis) * axis;
+            var twist = new Quaternion(proj.X, proj.Y, proj.Z, q.W);
+            // Degenerates to a near-zero quaternion when q's rotation angle is at/near 180 degrees
+            // around an axis perpendicular to `axis` - falls back to no twist rather than NaN.
+            return twist.LengthSquared() < 1e-12f ? Quaternion.Identity : Quaternion.Normalize(twist);
+        }
+
+        private static Quaternion DecomposeSwing(Quaternion q, Vector3 axis) =>
+            Quaternion.Normalize(Quaternion.Multiply(q, Quaternion.Inverse(DecomposeTwist(q, axis))));
 
         // Manually turns the whole clip around the world Y axis: the root's horizontal (X/Z)
         // path rotates around its own starting position (so the clip doesn't also drift away from
