@@ -303,8 +303,11 @@ namespace GlbMerger
                         Minimum = -180, Maximum = 180, Value = 0, TickFrequency = 30
                     };
                     slider.ValueChanged += (s, e) => { lbl.Text = AxisLabel(a) + $": {slider.Value}°"; OnSliderChanged(); };
+                    var (btnMinus, btnPlus) = SliderNudge.Attach(slider);
                     group.Controls.Add(lbl);
                     group.Controls.Add(slider);
+                    group.Controls.Add(btnMinus);
+                    group.Controls.Add(btnPlus);
                     _sliders[joint, axis] = slider;
                     _sliderLabels[joint, axis] = lbl;
                 }

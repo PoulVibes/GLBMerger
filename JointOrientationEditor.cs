@@ -156,9 +156,13 @@ namespace GlbMerger
             _chkShowJoints.CheckedChanged += (s, e) => PushShowJoints();
             y += _chkShowJoints.Height + gap * 2;
 
+            Button btnMinusX, btnPlusX, btnMinusY, btnPlusY, btnMinusZ, btnPlusZ;
             (_lblX, _sliderX, _chkMirrorX, _chkInverseX) = MakeSlider("X Rotation", ref y);
+            (btnMinusX, btnPlusX) = SliderNudge.Attach(_sliderX);
             (_lblY, _sliderY, _chkMirrorY, _chkInverseY) = MakeSlider("Y Rotation", ref y);
+            (btnMinusY, btnPlusY) = SliderNudge.Attach(_sliderY);
             (_lblZ, _sliderZ, _chkMirrorZ, _chkInverseZ) = MakeSlider("Z Rotation", ref y);
+            (btnMinusZ, btnPlusZ) = SliderNudge.Attach(_sliderZ);
             _chkMirrorX.CheckedChanged += (s, e) => OnMirrorFlagChanged();
             _chkMirrorY.CheckedChanged += (s, e) => OnMirrorFlagChanged();
             _chkMirrorZ.CheckedChanged += (s, e) => OnMirrorFlagChanged();
@@ -204,9 +208,9 @@ namespace GlbMerger
             controlPanel.Controls.AddRange(new Control[]
             {
                 lblBone, _boneDropdown, lblAnim, _animDropdown, _btnPause, _chkShowJoints,
-                _lblX, _sliderX, _chkMirrorX, _chkInverseX,
-                _lblY, _sliderY, _chkMirrorY, _chkInverseY,
-                _lblZ, _sliderZ, _chkMirrorZ, _chkInverseZ,
+                _lblX, _sliderX, btnMinusX, btnPlusX, _chkMirrorX, _chkInverseX,
+                _lblY, _sliderY, btnMinusY, btnPlusY, _chkMirrorY, _chkInverseY,
+                _lblZ, _sliderZ, btnMinusZ, btnPlusZ, _chkMirrorZ, _chkInverseZ,
                 _chkDistributeSpine,
                 _lblPosX, _numPosX, _chkMirrorPosX, _chkInversePosX,
                 _lblPosY, _numPosY, _chkMirrorPosY, _chkInversePosY,

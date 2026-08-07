@@ -143,6 +143,9 @@ namespace GlbMerger
             _sliderEnd = new TrackBar { Left = 3, Top = endRowTop + kLabelToSlider, Width = 290, Height = kSliderHeight, Minimum = 0, Maximum = 0, TickStyle = TickStyle.None };
             _sliderEnd.ValueChanged += (s, e) => OnTrimSliderChanged(movedStart: false);
 
+            var (btnMinusStart, btnPlusStart) = SliderNudge.Attach(_sliderStart);
+            var (btnMinusEnd, btnPlusEnd) = SliderNudge.Attach(_sliderEnd);
+
             // Loops playback between just the two handles, so this shows what the clip will look
             // like after Apply cuts everything outside that window - rather than the full
             // untrimmed clip the animation dropdown plays.
@@ -154,7 +157,10 @@ namespace GlbMerger
 
             _trimPanel.Controls.AddRange(new Control[]
             {
-                lblTrimHeader, _lblStart, _sliderStart, _lblEnd, _sliderEnd, _btnPlayRange, _btnApplyTrim
+                lblTrimHeader,
+                _lblStart, _sliderStart, btnMinusStart, btnPlusStart,
+                _lblEnd, _sliderEnd, btnMinusEnd, btnPlusEnd,
+                _btnPlayRange, _btnApplyTrim
             });
             flow.Controls.Add(_trimPanel);
 

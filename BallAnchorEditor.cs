@@ -408,11 +408,16 @@ namespace GlbMerger
             (_lblRotX, _sliderRotX) = MakeSlider("X Rotation", rotBlockTop);
             (_lblRotY, _sliderRotY) = MakeSlider("Y Rotation", rotBlockTop + kRotRowPitch);
             (_lblRotZ, _sliderRotZ) = MakeSlider("Z Rotation", rotBlockTop + 2 * kRotRowPitch);
+            var (btnMinusRotX, btnPlusRotX) = SliderNudge.Attach(_sliderRotX);
+            var (btnMinusRotY, btnPlusRotY) = SliderNudge.Attach(_sliderRotY);
+            var (btnMinusRotZ, btnPlusRotZ) = SliderNudge.Attach(_sliderRotZ);
 
             _handEditPanel.Controls.AddRange(new Control[]
             {
                 lblPos, lblX, lblY, lblZ, _numPosX, _numPosY, _numPosZ,
-                _lblRotX, _sliderRotX, _lblRotY, _sliderRotY, _lblRotZ, _sliderRotZ
+                _lblRotX, _sliderRotX, btnMinusRotX, btnPlusRotX,
+                _lblRotY, _sliderRotY, btnMinusRotY, btnPlusRotY,
+                _lblRotZ, _sliderRotZ, btnMinusRotZ, btnPlusRotZ
             });
             flow.Controls.Add(_handEditPanel);
 
@@ -511,8 +516,11 @@ namespace GlbMerger
                         Minimum = -180, Maximum = 180, Value = 0, TickFrequency = 30
                     };
                     slider.ValueChanged += (s, e) => { lbl.Text = axisLabel + $": {slider.Value}°"; OnArmSliderChanged(); };
+                    var (btnMinus, btnPlus) = SliderNudge.Attach(slider);
                     group.Controls.Add(lbl);
                     group.Controls.Add(slider);
+                    group.Controls.Add(btnMinus);
+                    group.Controls.Add(btnPlus);
                     _armSliders[joint, axis] = slider;
                     _armSliderLabels[joint, axis] = lbl;
                 }
