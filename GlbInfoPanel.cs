@@ -479,7 +479,7 @@ namespace GlbMerger
                     if (found.HasValue && found.Value.Texture != null)
                         channels.Add(ch);
                 }
-                var matName = mat.Name ?? $"Material_{mat.LogicalIndex}";
+                var matName = GlbMergeService.GetEffectiveMaterialName(mat);
                 grdMaterials.Rows.Add(true, matName, string.Join(", ", channels), matName, false);
             }
 

@@ -14,6 +14,15 @@ namespace GlbMerger
 {
     public static class GlbMergeService
     {
+        // The single source of truth for naming an unnamed material, used everywhere a material
+        // is identified by name: the UI's Include-selection list (GlbInfoPanel), material
+        // extraction, and primitive-to-material matching below. glTF material names are optional,
+        // and AI-exported models (e.g. Meshy AI) frequently omit them entirely - if any of these
+        // three sites ever generates a different fallback string than the others, the material
+        // silently fails to match and every primitive using it falls back to plain white.
+        public static string GetEffectiveMaterialName(Material mat) =>
+            mat.Name ?? $"Material_{mat.LogicalIndex}";
+
         // Builds and returns the merged model without saving it anywhere - callers decide when
         // and where to persist it (letting "process" and "save" be separate UI actions).
         public static ModelRoot MergeTargeted(
@@ -72,9 +81,9 @@ namespace GlbMerger
             var model1 = structuralModel;
             var model2 = otherModel;
 
-            var materialsByName1 = ToMaterialLookup(ExtractMaterials(model1, "G1").Where(m => allowedMats1.Contains(m.Name)));
+            var materialsByName1 = ToMaterialLookup(ExtractMaterials(model1).Where(m => allowedMats1.Contains(m.Name)));
             var materialsByName2 = model2 != null
-                ? ToMaterialLookup(ExtractMaterials(model2, "G2").Where(m => allowedMats2.Contains(m.Name)))
+                ? ToMaterialLookup(ExtractMaterials(model2).Where(m => allowedMats2.Contains(m.Name)))
                 : new Dictionary<string, MaterialBuilder>();
 
             // Rename only the output MaterialBuilder's own name - the dictionary keys (used just
@@ -384,11 +393,11 @@ namespace GlbMerger
                 // model) onto every primitive.
                 var variants = new List<(MaterialBuilder material, string? originalName)>();
 
-                var structuralMatName = prim.Material?.Name;
+                var structuralMatName = prim.Material != null ? GetEffectiveMaterialName(prim.Material) : null;
                 if (structuralMatName != null && structuralMats.TryGetValue(structuralMatName, out var structuralMb))
                     variants.Add((structuralMb, structuralMatName));
 
-                var otherMatName = otherPrim?.Material?.Name;
+                var otherMatName = otherPrim?.Material != null ? GetEffectiveMaterialName(otherPrim.Material) : null;
                 if (otherMatName != null && otherMats.TryGetValue(otherMatName, out var otherMb))
                     variants.Add((otherMb, otherMatName));
 
@@ -1103,14 +1112,14 @@ namespace GlbMerger
                 k => new Vector3(k.Value.X, k.Value.Y + offset, k.Value.Z));
         }
 
-        private static List<MaterialBuilder> ExtractMaterials(ModelRoot model, string suffix)
+        private static List<MaterialBuilder> ExtractMaterials(ModelRoot model)
         {
             var result = new List<MaterialBuilder>();
 
             foreach (var mat in model.LogicalMaterials)
             {
                 // We keep the original clean material name so selection mapping works exactly
-                var matName = mat.Name ?? $"Material_{suffix}_{mat.LogicalIndex}";
+                var matName = GetEffectiveMaterialName(mat);
                 var mb = new MaterialBuilder(matName);
 
                 mb.WithAlpha(mat.Alpha switch
