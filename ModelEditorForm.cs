@@ -23,6 +23,7 @@ namespace GlbMerger
             AnimationTrim,
             OptimizeGeometry,
             ModelAdjuster,
+            TextureEditor,
         }
 
         // Dropdown order and labels, indexed by EditorMode.
@@ -34,6 +35,7 @@ namespace GlbMerger
             (EditorMode.AnimationTrim,    "Animation Start / Stop (Trim)"),
             (EditorMode.OptimizeGeometry, "Optimize Geometry"),
             (EditorMode.ModelAdjuster,    "Model Adjuster"),
+            (EditorMode.TextureEditor,    "Texture Editor"),
         };
 
         private readonly ModelRoot _model;
@@ -143,6 +145,7 @@ namespace GlbMerger
                         _settings.AnimationTrimPlaybackSpeed, speed => _settings.AnimationTrimPlaybackSpeed = speed),
                     EditorMode.OptimizeGeometry => new GeometryOptimizerEditor(_model, _darkMode),
                     EditorMode.ModelAdjuster => new ModelAdjusterEditor(_model, _darkMode),
+                    EditorMode.TextureEditor => new TextureEditorEditor(_model, _darkMode),
                     _ => throw new ArgumentOutOfRangeException(nameof(mode)),
                 };
 
