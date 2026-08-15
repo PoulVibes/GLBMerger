@@ -110,6 +110,23 @@ namespace GlbMerger
                     .ToDictionary(g => g.Key, g => g.First())
                 : new Dictionary<string, Node>();
 
+            // Fallback for when name-based matching can't apply at all - e.g. a source file
+            // whose mesh node was never named (some exporters, including glTF/GLB round-trips
+            // through other tools, omit it entirely), or the two sides just happen to use
+            // different naming conventions. If each model has exactly one mesh-bearing node,
+            // there's no ambiguity about which one's material belongs to which - pair them
+            // positionally instead of leaving the match to fail silently. Left null (no fallback)
+            // whenever either side has more than one mesh node, since guessing pairing order
+            // there risks applying the wrong texture to the wrong part.
+            Node? singleMeshFallbackNode = null;
+            if (otherModel != null)
+            {
+                var structuralMeshNodes = structuralModel.LogicalNodes.Where(n => n.Mesh != null).ToList();
+                var otherMeshNodes = otherModel.LogicalNodes.Where(n => n.Mesh != null).ToList();
+                if (structuralMeshNodes.Count == 1 && otherMeshNodes.Count == 1)
+                    singleMeshFallbackNode = otherMeshNodes[0];
+            }
+
             var outScene = new SceneBuilder();
 
             // Rebuild the structural model's node hierarchy 1:1 instead of flattening it into
@@ -134,7 +151,8 @@ namespace GlbMerger
                     pair.Key, pair.Value,
                     structuralMats, otherMats,
                     otherNodesByName, anyMaterialSelected, fallbackMaterial,
-                    outScene, nodeMap, firstMaterialOriginalName, geomRenameMap1);
+                    outScene, nodeMap, firstMaterialOriginalName, geomRenameMap1,
+                    singleMeshFallbackNode);
 
             var nodeBuildersByName = nodeMap.Values
                 .GroupBy(n => n.Name)
@@ -366,13 +384,19 @@ namespace GlbMerger
             SceneBuilder outScene,
             Dictionary<Node, NodeBuilder> nodeMap,
             string? firstMaterialOriginalName,
-            IReadOnlyDictionary<string, string>? geomRenameMap)
+            IReadOnlyDictionary<string, string>? geomRenameMap,
+            Node? singleMeshFallbackNode = null)
         {
             if (srcNode.Mesh == null) return;
 
             Node? otherNode = null;
             if (srcNode.Name != null)
                 otherNodesByName.TryGetValue(srcNode.Name, out otherNode);
+            // Name-based lookup found nothing (either this node has no name, or the two files
+            // just name it differently) - if there's no ambiguity about the pairing (exactly one
+            // mesh node per side), use that instead of leaving this node without its "other"
+            // material entirely.
+            otherNode ??= singleMeshFallbackNode;
 
             var joints = srcNode.Skin != null ? ResolveJoints(srcNode.Skin, nodeMap) : null;
 

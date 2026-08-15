@@ -32,10 +32,17 @@ namespace GlbMerger
         // The live in-memory merge result - trimming writes straight onto this.
         private readonly ModelRoot _model;
 
+        // Persisted across sessions via AppSettings (see ModelEditorForm) - onSpeedChanged is
+        // called on every change so the caller can stash it back onto the shared settings object,
+        // the same fire-and-forget-until-app-close pattern the splitter fractions use.
+        private readonly double _initialSpeed;
+        private readonly Action<double>? _onSpeedChanged;
+
         private WebView2 _webView = null!;
         private ComboBox _animDropdown = null!;
         private ComboBox _matDropdown = null!;
         private TrackBar _sliderStart = null!, _sliderEnd = null!;
+        private NumericUpDown _numSpeed = null!;
         private Label _lblStart = null!, _lblEnd = null!, _lblStatus = null!;
         private Button _btnPause = null!, _btnPlayRange = null!, _btnApplyTrim = null!;
         private Panel _trimPanel = null!;
@@ -60,9 +67,11 @@ namespace GlbMerger
         private int _previewVersion;
         private string? _previewPath;
 
-        public AnimationTrimEditor(ModelRoot model, bool darkMode = false)
+        public AnimationTrimEditor(ModelRoot model, bool darkMode = false, double initialSpeed = 1.0, Action<double>? onSpeedChanged = null)
         {
             _model = model;
+            _initialSpeed = initialSpeed > 0 ? initialSpeed : 1.0;
+            _onSpeedChanged = onSpeedChanged;
             _frameTimes = ComputeAnimFrameTimes(model);
 
             Dock = DockStyle.Fill;
@@ -110,6 +119,22 @@ namespace GlbMerger
             animRow.Controls.Add(_animDropdown);
             animRow.Controls.Add(_btnPause);
             flow.Controls.Add(animRow);
+
+            flow.Controls.Add(new Label { Text = "Playback speed:", AutoSize = true, Margin = new Padding(3, 0, 3, 4) });
+            var speedRow = MakeRow();
+            _numSpeed = new NumericUpDown
+            {
+                Width = 70, DecimalPlaces = 2, Increment = 0.1m, Minimum = 0.1m, Maximum = 4m,
+                Value = (decimal)Math.Clamp(_initialSpeed, 0.1, 4.0),
+                Margin = new Padding(3, 3, 8, 12),
+            };
+            _numSpeed.ValueChanged += (s, e) => OnSpeedChanged();
+            var btnResetSpeed = new Button { Text = "1x", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowOnly, MinimumSize = new System.Drawing.Size(40, 0), Margin = new Padding(0, 3, 3, 12) };
+            btnResetSpeed.Click += (s, e) => _numSpeed.Value = 1m;
+            speedRow.Controls.Add(_numSpeed);
+            speedRow.Controls.Add(new Label { Text = "x", AutoSize = true, Margin = new Padding(0, 7, 8, 3) });
+            speedRow.Controls.Add(btnResetSpeed);
+            flow.Controls.Add(speedRow);
 
             flow.Controls.Add(new Label { Text = "Isolate material:", AutoSize = true, Margin = new Padding(3, 0, 3, 4) });
             _matDropdown = new ComboBox { Width = 290, DropDownStyle = ComboBoxStyle.DropDownList, Margin = new Padding(3, 3, 3, 12) };
@@ -337,6 +362,13 @@ namespace GlbMerger
             Exec("stopRange();");
         }
 
+        private void OnSpeedChanged()
+        {
+            double speed = (double)_numSpeed.Value;
+            Exec($"setPlaybackSpeed({Inv((float)speed)});");
+            _onSpeedChanged?.Invoke(speed);
+        }
+
         private void PushMaterialIsolation()
         {
             // Item 0 is "All materials", so the logical material index is one less than the
@@ -417,7 +449,37 @@ namespace GlbMerger
                 <script>
                     var viewer = document.querySelector('#viewer');
                     var loaded = false;
-                    var rangeActive = false, rangeStart = 0, rangeEnd = 0, rangeRaf = null;
+                    var rangeActive = false, rangeStart = 0, rangeEnd = 0, rangeRaf = null, rangeLastTs = null;
+
+                    // model-viewer has no native playback-rate control, so both plain playback and
+                    // range playback below drive viewer.currentTime by hand each frame instead of
+                    // calling viewer.play() - that's the only way to make speed adjustable. Set via
+                    // setPlaybackSpeed(), read by whichever loop (playLoopTick/rangeTick) is active.
+                    var currentSpeed = 1;
+                    var playLoopActive = false, playRaf = null, playLastTs = null;
+
+                    window.setPlaybackSpeed = function (rate) {
+                        currentSpeed = rate > 0 ? rate : 1;
+                    };
+
+                    function stopPlayLoopInternal() {
+                        playLoopActive = false;
+                        playLastTs = null;
+                        if (playRaf !== null) { cancelAnimationFrame(playRaf); playRaf = null; }
+                    }
+
+                    function playLoopTick(ts) {
+                        if (!playLoopActive) return;
+                        if (playLastTs === null) playLastTs = ts;
+                        var dt = (ts - playLastTs) / 1000;
+                        playLastTs = ts;
+                        var duration = viewer.duration || 0;
+                        if (duration > 0) {
+                            var t = viewer.currentTime + dt * currentSpeed;
+                            viewer.currentTime = t >= duration ? (t % duration) : t;
+                        }
+                        playRaf = requestAnimationFrame(playLoopTick);
+                    }
 
                     // The .NET side holds all the state (which clip, which material, paused or
                     // not), so the page never tries to remember any of it across a reload - it
@@ -441,18 +503,33 @@ namespace GlbMerger
 
                     window.setAnimation = function (name) {
                         stopRangeInternal();
+                        stopPlayLoopInternal();
                         if (!loaded) return;
-                        if (name) { viewer.animationName = name; viewer.currentTime = 0; viewer.play(); }
-                        else { viewer.pause(); viewer.currentTime = 0; }
+                        viewer.pause(); // time is driven manually below so speed stays adjustable
+                        if (name) {
+                            viewer.animationName = name;
+                            viewer.currentTime = 0;
+                            playLoopActive = true;
+                            playRaf = requestAnimationFrame(playLoopTick);
+                        } else {
+                            viewer.currentTime = 0;
+                        }
                     };
 
                     window.setPaused = function (p) {
                         if (!loaded) return;
-                        if (p) viewer.pause(); else viewer.play();
+                        if (p) {
+                            stopPlayLoopInternal();
+                        } else if (viewer.animationName) {
+                            playLoopActive = true;
+                            playLastTs = null;
+                            playRaf = requestAnimationFrame(playLoopTick);
+                        }
                     };
 
                     window.seekTo = function (t) {
                         stopRangeInternal();
+                        stopPlayLoopInternal();
                         if (!loaded) return;
                         viewer.pause();
                         viewer.currentTime = t;
@@ -460,21 +537,27 @@ namespace GlbMerger
 
                     function stopRangeInternal() {
                         rangeActive = false;
+                        rangeLastTs = null;
                         if (rangeRaf !== null) { cancelAnimationFrame(rangeRaf); rangeRaf = null; }
                     }
 
-                    function rangeTick() {
+                    function rangeTick(ts) {
                         if (!rangeActive) return;
-                        if (viewer.currentTime < rangeStart || viewer.currentTime >= rangeEnd) viewer.currentTime = rangeStart;
+                        if (rangeLastTs === null) rangeLastTs = ts;
+                        var dt = (ts - rangeLastTs) / 1000;
+                        rangeLastTs = ts;
+                        var t = viewer.currentTime + dt * currentSpeed;
+                        viewer.currentTime = (t < rangeStart || t >= rangeEnd) ? rangeStart : t;
                         rangeRaf = requestAnimationFrame(rangeTick);
                     }
 
                     window.playRange = function (a, b) {
                         if (!loaded) return;
                         stopRangeInternal();
+                        stopPlayLoopInternal();
                         rangeStart = a; rangeEnd = b; rangeActive = true;
                         viewer.currentTime = a;
-                        viewer.play();
+                        viewer.pause();
                         rangeRaf = requestAnimationFrame(rangeTick);
                     };
 
@@ -499,6 +582,7 @@ namespace GlbMerger
                     // afterward, which is what re-announces readiness so .NET can re-push state.
                     window.reloadModel = function (url) {
                         stopRangeInternal();
+                        stopPlayLoopInternal();
                         loaded = false;
                         viewer.src = url;
                     };
@@ -561,6 +645,7 @@ namespace GlbMerger
         private void PushViewerState()
         {
             PushMaterialIsolation();
+            Exec($"setPlaybackSpeed({Inv((float)_numSpeed.Value)});");
 
             var name = CurrentAnimationName();
             Exec(name == null ? "setAnimation('');" : $"setAnimation('{EscapeJs(name)}');");
