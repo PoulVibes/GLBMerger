@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
+using SharpGLTF.Scenes;
 using SharpGLTF.Schema2;
 
 namespace GlbMerger
@@ -47,6 +48,23 @@ namespace GlbMerger
             /// <summary>How hard meshopt tries to preserve normals and UVs relative to position error.</summary>
             public float NormalWeight { get; set; } = 0.2f;
             public float UvWeight { get; set; } = 1.0f;
+
+            /// <summary>
+            /// Restricts simplification to a painted subset of triangles, per primitive. A primitive
+            /// with no entry here (or a null/empty Selection altogether) is simplified in full, same
+            /// as before this existed. Triangles outside the selection are left byte-for-byte as they
+            /// were, and every welded vertex they touch is locked so the selected region can never
+            /// pull away from them and open a gap.
+            /// </summary>
+            public Dictionary<(int MeshIndex, int PrimitiveIndex), HashSet<int>>? Selection { get; set; }
+
+            /// <summary>
+            /// Flips <see cref="Selection"/> from the region to simplify into the region to protect:
+            /// everything EXCEPT the painted triangles is simplified, and the painted ones are left
+            /// byte-for-byte as they were. Same border locking either way, since it's the same
+            /// border - only which side of it moves changes. Ignored when Selection is null.
+            /// </summary>
+            public bool InvertSelection { get; set; }
         }
 
         public sealed class PrimitiveResult
@@ -97,7 +115,25 @@ namespace GlbMerger
                         PrimitiveIndex = primIdx,
                     };
                     report.Primitives.Add(result);
-                    AnalyzePrimitive(mesh.Primitives[primIdx], options, result);
+                    // When a selection is active at all, every primitive is restricted by it - one
+                    // with no entry in the dictionary was never painted, so it gets an empty set
+                    // (nothing eligible, left untouched) rather than null (which means "no
+                    // restriction, optimize the whole primitive" and is only correct when Selection
+                    // itself is absent, i.e. neither region checkbox is on).
+                    //
+                    // Inverted, an unpainted primitive means the opposite: nothing there to protect,
+                    // so the whole thing is eligible - null, not an empty set. AnalyzePrimitive takes
+                    // the complement of the painted ones, where the triangle count is already known.
+                    HashSet<int>? selection = null;
+                    if (options.Selection != null)
+                    {
+                        options.Selection.TryGetValue((meshIdx, primIdx), out var painted);
+                        selection = options.InvertSelection
+                            ? (painted != null && painted.Count > 0 ? painted : null)
+                            : (painted ?? new HashSet<int>());
+                    }
+
+                    AnalyzePrimitive(mesh.Primitives[primIdx], options, selection, result);
                 }
             }
 
@@ -141,26 +177,185 @@ namespace GlbMerger
         // to stay UNSIGNED_BYTE/SHORT; writing it as float produces a glTF runtimes reject).
         // Returns how many vertices were removed.
         //
-        // NOT currently exposed in the editor, and deliberately so. It does compact the mesh
-        // correctly - verified at 53,117 -> 24,433 vertices with joint encodings and weights intact
-        // - but SharpGLTF has no way to release the accessors it replaces: WithVertexAccessor
-        // creates new ones and the old buffer views stay in LogicalAccessors, so MergeBuffers packs
-        // both copies and the saved GLB comes out LARGER than it went in. Reclaiming them needs the
-        // whole model rebuilt (SceneBuilder.CreateFrom(scene).ToGltf2() does drop them, ~48.4MB vs
-        // 50.0MB on the test character), which produces a new ModelRoot rather than editing this
-        // one in place - so it needs the shared model reference swapped across every editor mode,
-        // plus proof that the hand-authored BallAnchor/StiffArm marker nodes survive the rebuild.
-        // That belongs in its own change; this is left here as the piece it will build on.
-        public static int CompactUnusedVertices(ModelRoot model)
+        // On its own this makes the file BIGGER, not smaller: SharpGLTF has no way to release the
+        // accessors it replaces - WithVertexAccessor creates new ones and the old buffer views stay
+        // in LogicalAccessors - so MergeBuffers packs both copies. It is only half the job, and the
+        // other half is BuildCleanedCopy below, which rebuilds the model to drop what this orphans.
+        // Nothing should call this directly except that.
+        public static int CompactUnusedVertices(ModelRoot model, bool mergeBuffers = true)
         {
             int removed = 0;
             foreach (var mesh in model.LogicalMeshes)
                 foreach (var prim in mesh.Primitives)
                     removed += CompactPrimitive(prim);
 
-            if (removed > 0) model.MergeBuffers();
+            if (removed > 0 && mergeBuffers) model.MergeBuffers();
             return removed;
         }
+
+        // What a save would reclaim, measured without touching the model. Two separate kinds of
+        // waste accumulate here and they are counted separately because they have different causes:
+        //
+        //  - Unused vertices. Simplification only ever rewrites indices, so every vertex the new
+        //    index buffer stopped referencing is still sitting in the vertex buffer at full size.
+        //  - Orphaned buffer views. Each Apply calls WithIndicesAccessor, which mints a new accessor
+        //    and leaves the old one in LogicalAccessors with nothing pointing at it. Six passes over
+        //    a mesh leave six dead index buffers, all of them written out on save.
+        public sealed class CleanupEstimate
+        {
+            public int UnusedVertices { get; init; }
+            public int TotalVertices { get; init; }
+            public long UnusedVertexBytes { get; init; }
+            public int OrphanedBufferViews { get; init; }
+            public long OrphanedBytes { get; init; }
+
+            public long ReclaimableBytes => UnusedVertexBytes + OrphanedBytes;
+            public bool HasWaste => UnusedVertices > 0 || OrphanedBufferViews > 0;
+        }
+
+        public static CleanupEstimate EstimateCleanup(ModelRoot model)
+        {
+            // Which accessors something still points at. Only mesh data is collected: an accessor on
+            // an untargeted buffer view (animation samplers, inverse bind matrices) is skipped
+            // entirely below rather than judged against this set, so leaving those out is safe.
+            var liveIndices = new HashSet<Accessor>();
+            var liveVertices = new HashSet<Accessor>();
+
+            int unused = 0, total = 0;
+            long unusedBytes = 0;
+
+            foreach (var prim in model.LogicalMeshes.SelectMany(m => m.Primitives))
+            {
+                if (prim.IndexAccessor != null) liveIndices.Add(prim.IndexAccessor);
+                foreach (var accessor in prim.VertexAccessors.Values) liveVertices.Add(accessor);
+                for (int target = 0; target < prim.MorphTargetsCount; target++)
+                    foreach (var accessor in prim.GetMorphTargetAccessors(target).Values)
+                        liveVertices.Add(accessor);
+
+                if (!prim.VertexAccessors.TryGetValue("POSITION", out var posAcc)) continue;
+                total += posAcc.Count;
+
+                // Mirrors CompactPrimitive's own guards exactly - a primitive it will refuse to
+                // touch must not be counted here, or the dialog promises bytes back that the
+                // cleanup then can't deliver.
+                if (prim.DrawPrimitiveType != PrimitiveType.TRIANGLES) continue;
+                if (prim.MorphTargetsCount > 0) continue;
+
+                var used = new bool[posAcc.Count];
+                foreach (var (a, b, c) in prim.GetTriangleIndices()) { used[a] = true; used[b] = true; used[c] = true; }
+
+                int dead = 0;
+                foreach (var u in used) if (!u) dead++;
+                if (dead == 0) continue;
+
+                long bytesPerVertex = prim.VertexAccessors.Values.Sum(a => (long)a.Format.ByteSizePadded);
+                unused += dead;
+                unusedBytes += dead * bytesPerVertex;
+            }
+
+            // A buffer view is dead when nothing live reads any accessor over it. Views are counted
+            // rather than accessors because an interleaved view is shared by POSITION/NORMAL/UV and
+            // its bytes must not be counted three times.
+            int deadViews = 0;
+            long deadBytes = 0;
+            foreach (var view in model.LogicalBufferViews)
+            {
+                // Untargeted views hold image bytes, animation curves and inverse bind matrices.
+                // None of those are reachable from the accessor sets above, so classifying them
+                // here would report every one of them as garbage.
+                if (!view.IsIndexBuffer && !view.IsVertexBuffer) continue;
+
+                bool anyLive = false;
+                foreach (var accessor in view.FindAccessors())
+                    if (liveIndices.Contains(accessor) || liveVertices.Contains(accessor)) { anyLive = true; break; }
+
+                if (anyLive) continue;
+                deadViews++;
+                deadBytes += view.Content.Count;
+            }
+
+            return new CleanupEstimate
+            {
+                UnusedVertices = unused,
+                TotalVertices = total,
+                UnusedVertexBytes = unusedBytes,
+                OrphanedBufferViews = deadViews,
+                OrphanedBytes = deadBytes,
+            };
+        }
+
+        // Returns a cleaned copy, leaving the model it was given untouched - the live model is
+        // shared by every editor mode and swapping that reference out is a much larger change than
+        // this needs to be. The copy is what gets written to disk; the session carries on with the
+        // original.
+        //
+        // Order matters. Compaction has to run first, and it orphans the vertex accessors it
+        // replaces on the way, so the rebuild has to run second: SceneBuilder walks the scene and
+        // re-emits only what it can actually reach, which is what finally drops both those
+        // accessors and the dead index buffers left by earlier Apply passes.
+        public static ModelRoot BuildCleanedCopy(ModelRoot model)
+        {
+            var working = model.DeepClone();
+            CompactUnusedVertices(working, mergeBuffers: false);
+
+            var cleaned = SceneBuilder.ToGltf2(SceneBuilder.CreateFrom(working), SceneBuilderSchema2Settings.Default);
+            cleaned.MergeBuffers();
+            return cleaned;
+        }
+
+        // The rebuild in BuildCleanedCopy re-emits the scene rather than editing it, so anything
+        // SceneBuilder cannot reach is silently gone. The hand-authored BallAnchor/StiffArm markers
+        // are the exposed case - they are empty named nodes parented to a joint, carrying nothing
+        // but a local rotation - so the result is checked against the original before it is written
+        // instead of trusted. Returns null when nothing was lost.
+        public static string? DescribeLosses(ModelRoot before, ModelRoot after)
+        {
+            var losses = new List<string>();
+
+            // Only named nodes are compared. Unnamed ones are structural, and reorganizing those is
+            // exactly what the rebuild is entitled to do.
+            var namesBefore = NamedNodes(before);
+            var namesAfter = NamedNodes(after);
+            var missingNodes = namesBefore.Except(namesAfter).OrderBy(n => n).ToList();
+            if (missingNodes.Count > 0)
+                losses.Add($"{missingNodes.Count} named node(s): {string.Join(", ", missingNodes.Take(8))}"
+                    + (missingNodes.Count > 8 ? ", ..." : ""));
+
+            var animsBefore = before.LogicalAnimations.ToDictionary(a => a.Name ?? $"Anim_{a.LogicalIndex}", a => a.Channels.Count);
+            var animsAfter = after.LogicalAnimations.ToDictionary(a => a.Name ?? $"Anim_{a.LogicalIndex}", a => a.Channels.Count);
+            foreach (var (name, channels) in animsBefore)
+            {
+                if (!animsAfter.TryGetValue(name, out var afterChannels))
+                    losses.Add($"animation \"{name}\"");
+                else if (afterChannels < channels)
+                    losses.Add($"animation \"{name}\": {channels} channels -> {afterChannels}");
+            }
+
+            if (after.LogicalSkins.Count < before.LogicalSkins.Count)
+                losses.Add($"skins: {before.LogicalSkins.Count} -> {after.LogicalSkins.Count}");
+            if (after.LogicalMaterials.Count < before.LogicalMaterials.Count)
+                losses.Add($"materials: {before.LogicalMaterials.Count} -> {after.LogicalMaterials.Count}");
+            if (after.LogicalImages.Count < before.LogicalImages.Count)
+                losses.Add($"textures: {before.LogicalImages.Count} -> {after.LogicalImages.Count}");
+
+            int trisBefore = CountTriangles(before), trisAfter = CountTriangles(after);
+            if (trisAfter != trisBefore)
+                losses.Add($"triangles: {trisBefore:N0} -> {trisAfter:N0}");
+
+            return losses.Count == 0 ? null : string.Join(Environment.NewLine, losses.Select(l => "  - " + l));
+        }
+
+        private static HashSet<string> NamedNodes(ModelRoot model) =>
+            model.LogicalNodes
+                .Select(n => n.Name)
+                .Where(n => !string.IsNullOrEmpty(n))
+                .ToHashSet()!;
+
+        private static int CountTriangles(ModelRoot model) =>
+            model.LogicalMeshes
+                .SelectMany(m => m.Primitives)
+                .Where(p => p.DrawPrimitiveType == PrimitiveType.TRIANGLES)
+                .Sum(p => p.GetTriangleIndices().Count());
 
         private static int CompactPrimitive(MeshPrimitive prim)
         {
@@ -277,7 +472,7 @@ namespace GlbMerger
             return kept;
         }
 
-        private static void AnalyzePrimitive(MeshPrimitive prim, SimplifyOptions options, PrimitiveResult result)
+        private static void AnalyzePrimitive(MeshPrimitive prim, SimplifyOptions options, HashSet<int>? selection, PrimitiveResult result)
         {
             if (prim.DrawPrimitiveType != PrimitiveType.TRIANGLES)
             {
@@ -308,7 +503,20 @@ namespace GlbMerger
             result.TrianglesAfter = tris.Length;
             if (tris.Length < 3) return;
 
-            var simplified = MeshoptSimplifier.Run(tris, positions, normals, uvs, joints, weights, options, result);
+            // Inverted, what arrived is the region to PROTECT, so what's eligible is everything else.
+            // Done here rather than in Analyze because it needs the triangle count, which costs a
+            // second walk of the index buffer up there and nothing at all down here.
+            if (selection != null && options.InvertSelection)
+            {
+                var eligible = new HashSet<int>();
+                for (int t = 0; t < tris.Length; t++)
+                    if (!selection.Contains(t)) eligible.Add(t);
+                selection = eligible;
+            }
+
+            if (selection != null && selection.Count == 0) return;   // painted, but nothing in it - nothing to do
+
+            var simplified = MeshoptSimplifier.Run(tris, positions, normals, uvs, joints, weights, options, selection, result);
             if (simplified == null) return;
 
             result.TrianglesAfter = simplified.Length / 3;
@@ -341,14 +549,31 @@ namespace GlbMerger
         {
             public static int[]? Run(Tri[] tris, IList<Vector3> positions, IList<Vector3>? normals,
                 IList<Vector2>? uvs, IList<Vector4>? joints, IList<Vector4>? weights,
-                SimplifyOptions options, PrimitiveResult result)
+                SimplifyOptions options, HashSet<int>? selection, PrimitiveResult result)
             {
                 if (!MeshoptNative.IsAvailable)
                 {
                     result.SkippedReason = "meshoptimizer native library unavailable";
                     return null;
                 }
-                if (tris.Length < 4) return null;
+
+                // A painted selection restricts which triangles meshopt is even allowed to see -
+                // everything else is carried through byte-for-byte below (see the concat at the
+                // bottom) and none of its vertices are eligible to move (see BuildLockMask), so the
+                // simplified region can never pull away from the untouched region and open a gap.
+                Tri[] simplifyTris = tris;
+                Tri[] passthroughTris = Array.Empty<Tri>();
+                if (selection != null)
+                {
+                    var selected = new List<Tri>(selection.Count);
+                    var unselected = new List<Tri>(tris.Length - selection.Count);
+                    for (int i = 0; i < tris.Length; i++)
+                        (selection.Contains(i) ? selected : unselected).Add(tris[i]);
+                    simplifyTris = selected.ToArray();
+                    passthroughTris = unselected.ToArray();
+                }
+
+                if (simplifyTris.Length < 4) return null;
 
                 var weld = BuildWeld(positions, uvs, joints, weights, options);
                 int weldedCount = weld.Duplicates.Count;
@@ -374,10 +599,10 @@ namespace GlbMerger
                     weldedAttributes[w * 5 + 4] = uv.Y;
                 }
 
-                var weldedIndices = new uint[tris.Length * 3];
-                for (int i = 0; i < tris.Length; i++)
+                var weldedIndices = new uint[simplifyTris.Length * 3];
+                for (int i = 0; i < simplifyTris.Length; i++)
                     for (int c = 0; c < 3; c++)
-                        weldedIndices[i * 3 + c] = (uint)weld.Of[tris[i][c]];
+                        weldedIndices[i * 3 + c] = (uint)weld.Of[simplifyTris[i][c]];
 
                 var attributeWeights = new[]
                 {
@@ -385,9 +610,9 @@ namespace GlbMerger
                     options.UvWeight, options.UvWeight,
                 };
 
-                var locks = BuildLockMask(tris, weld, joints, weights, options);
+                var locks = BuildLockMask(simplifyTris, weld, joints, weights, options, passthroughTris);
 
-                int targetTriangles = Math.Max(1, (int)MathF.Round(tris.Length * Math.Clamp(options.TargetRatio, 0.01f, 1f)));
+                int targetTriangles = Math.Max(1, (int)MathF.Round(simplifyTris.Length * Math.Clamp(options.TargetRatio, 0.01f, 1f)));
                 var destination = new uint[weldedIndices.Length];
                 float resultError;
                 nuint produced;
@@ -416,12 +641,25 @@ namespace GlbMerger
                 int producedIndices = (int)produced;
                 if (producedIndices < 3 || producedIndices >= weldedIndices.Length) return null;
 
-                var output = MapBackToOriginals(destination, producedIndices, weld, positions, normals);
-                if (output == null) return null;
+                var simplified = MapBackToOriginals(destination, producedIndices, weld, positions, normals);
+                if (simplified == null) return null;
 
-                if (options.OptimizeVertexOrder) OptimizeOrder(output, positions.Count);
+                if (options.OptimizeVertexOrder) OptimizeOrder(simplified, positions.Count);
 
                 result.SimplifyError = resultError;
+
+                if (passthroughTris.Length == 0) return simplified;
+
+                // Untouched triangles ride along unchanged, exactly as they were before the
+                // selection was carved out.
+                var output = new int[simplified.Length + passthroughTris.Length * 3];
+                Array.Copy(simplified, output, simplified.Length);
+                for (int i = 0; i < passthroughTris.Length; i++)
+                {
+                    output[simplified.Length + i * 3 + 0] = passthroughTris[i].A;
+                    output[simplified.Length + i * 3 + 1] = passthroughTris[i].B;
+                    output[simplified.Length + i * 3 + 2] = passthroughTris[i].C;
+                }
                 return output;
             }
 
@@ -465,13 +703,27 @@ namespace GlbMerger
 
             // Pins the welded vertices whose skin weights differ from their neighbourhood by more
             // than the tolerance, so the same slider that governs the planar pass governs how much
-            // deformation meshopt is allowed to disturb.
+            // deformation meshopt is allowed to disturb. Also pins every welded vertex touched by a
+            // passthrough (unselected) triangle - those triangles are never handed to meshopt, so
+            // any vertex they reference must not move or they'd be left pointing at a position that
+            // no longer lines up, opening a gap at the selection's boundary.
             private static byte[] BuildLockMask(Tri[] tris, Weld weld, IList<Vector4>? joints,
-                IList<Vector4>? weights, SimplifyOptions options)
+                IList<Vector4>? weights, SimplifyOptions options, Tri[] passthroughTris)
             {
-                if (joints == null || weights == null || options.SkinTolerance >= 1f) return Array.Empty<byte>();
-
                 int weldedCount = weld.Duplicates.Count;
+
+                byte[]? selectionLocks = null;
+                if (passthroughTris.Length > 0)
+                {
+                    selectionLocks = new byte[weldedCount];
+                    foreach (var t in passthroughTris)
+                        for (int c = 0; c < 3; c++)
+                            selectionLocks[weld.Of[t[c]]] = 1;
+                }
+
+                if (joints == null || weights == null || options.SkinTolerance >= 1f)
+                    return selectionLocks ?? Array.Empty<byte>();
+
                 var neighbours = new List<int>[weldedCount];
                 for (int i = 0; i < weldedCount; i++) neighbours[i] = new List<int>();
 
@@ -509,6 +761,10 @@ namespace GlbMerger
                         if (MathF.Abs(mine - theirs) > tolerance) { locks[w] = 1; break; }
                     }
                 }
+
+                if (selectionLocks != null)
+                    for (int w = 0; w < weldedCount; w++)
+                        if (selectionLocks[w] != 0) locks[w] = 1;
 
                 return locks;
             }

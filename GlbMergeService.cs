@@ -72,9 +72,9 @@ namespace GlbMerger
             var model1 = structuralModel;
             var model2 = otherModel;
 
-            var materialsByName1 = ToMaterialLookup(ExtractMaterials(model1, "G1").Where(m => allowedMats1.Contains(m.Name)));
+            var materialsByName1 = ToMaterialLookup(ExtractMaterials(model1).Where(m => allowedMats1.Contains(m.Name)));
             var materialsByName2 = model2 != null
-                ? ToMaterialLookup(ExtractMaterials(model2, "G2").Where(m => allowedMats2.Contains(m.Name)))
+                ? ToMaterialLookup(ExtractMaterials(model2).Where(m => allowedMats2.Contains(m.Name)))
                 : new Dictionary<string, MaterialBuilder>();
 
             // Rename only the output MaterialBuilder's own name - the dictionary keys (used just
@@ -337,11 +337,11 @@ namespace GlbMerger
         // for the "First" material feature.
         private static bool NodeReferencesMaterial(Node node, IReadOnlyDictionary<string, Node> otherNodesByName, string materialOriginalName)
         {
-            if (node.Mesh != null && node.Mesh.Primitives.Any(p => p.Material?.Name == materialOriginalName))
+            if (node.Mesh != null && node.Mesh.Primitives.Any(p => MaterialKeyOrNull(p.Material) == materialOriginalName))
                 return true;
 
             if (node.Name != null && otherNodesByName.TryGetValue(node.Name, out var otherNode) && otherNode.Mesh != null
-                && otherNode.Mesh.Primitives.Any(p => p.Material?.Name == materialOriginalName))
+                && otherNode.Mesh.Primitives.Any(p => MaterialKeyOrNull(p.Material) == materialOriginalName))
                 return true;
 
             return false;
@@ -384,11 +384,11 @@ namespace GlbMerger
                 // model) onto every primitive.
                 var variants = new List<(MaterialBuilder material, string? originalName)>();
 
-                var structuralMatName = prim.Material?.Name;
+                var structuralMatName = MaterialKeyOrNull(prim.Material);
                 if (structuralMatName != null && structuralMats.TryGetValue(structuralMatName, out var structuralMb))
                     variants.Add((structuralMb, structuralMatName));
 
-                var otherMatName = otherPrim?.Material?.Name;
+                var otherMatName = MaterialKeyOrNull(otherPrim?.Material);
                 if (otherMatName != null && otherMats.TryGetValue(otherMatName, out var otherMb))
                     variants.Add((otherMb, otherMatName));
 
@@ -1103,14 +1103,26 @@ namespace GlbMerger
                 k => new Vector3(k.Value.X, k.Value.Y + offset, k.Value.Z));
         }
 
-        private static List<MaterialBuilder> ExtractMaterials(ModelRoot model, string suffix)
+        // The single source of truth for "what do we call this material". glTF material names are
+        // optional (Meshy/pygltflib exports leave them off entirely), so anything that identifies a
+        // material by name has to agree on the same synthesized fallback - the info panel that
+        // lists materials for the user to tick, the extraction that keys the lookup dictionary, and
+        // the primitive-to-material matching during emission. When these disagreed, an unnamed
+        // material could never match the user's selection, every primitive fell through to
+        // Default_Opaque, and the merged model silently lost all of its textures.
+        public static string MaterialKey(Material mat) => mat.Name ?? $"Material_{mat.LogicalIndex}";
+
+        // Null-tolerant overload: a primitive with no material at all has no key to match on.
+        private static string? MaterialKeyOrNull(Material? mat) => mat == null ? null : MaterialKey(mat);
+
+        private static List<MaterialBuilder> ExtractMaterials(ModelRoot model)
         {
             var result = new List<MaterialBuilder>();
 
             foreach (var mat in model.LogicalMaterials)
             {
                 // We keep the original clean material name so selection mapping works exactly
-                var matName = mat.Name ?? $"Material_{suffix}_{mat.LogicalIndex}";
+                var matName = MaterialKey(mat);
                 var mb = new MaterialBuilder(matName);
 
                 mb.WithAlpha(mat.Alpha switch

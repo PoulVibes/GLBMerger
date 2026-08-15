@@ -479,7 +479,10 @@ namespace GlbMerger
                     if (found.HasValue && found.Value.Texture != null)
                         channels.Add(ch);
                 }
-                var matName = mat.Name ?? $"Material_{mat.LogicalIndex}";
+                // Shared with the merge service on purpose - the string put in this grid is what
+                // comes back as the user's selection, and it has to be the exact same key the merge
+                // matches against. See GlbMergeService.MaterialKey.
+                var matName = GlbMergeService.MaterialKey(mat);
                 grdMaterials.Rows.Add(true, matName, string.Join(", ", channels), matName, false);
             }
 
