@@ -189,8 +189,9 @@ namespace GlbMerger
             // preview file for its 3D view, so there's nothing here to keep in sync either.
             btnEditModel.Click += (s, e) => {
                 if (latestMergedModel == null) return;
-                using var editor = new ModelEditorForm(latestMergedModel, _settings.DarkMode);
+                using var editor = new ModelEditorForm(latestMergedModel, _settings.DarkMode, _settings);
                 editor.ShowDialog(this);
+                _settings.Save();
                 lblStatus.Text = "Model editor closed - use Save to write the result out.";
             };
 

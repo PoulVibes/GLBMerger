@@ -38,15 +38,17 @@ namespace GlbMerger
 
         private readonly ModelRoot _model;
         private readonly bool _darkMode;
+        private readonly AppSettings _settings;
 
         private ComboBox _modeDropdown = null!;
         private Panel _host = null!;
         private Control? _currentEditor;
 
-        public ModelEditorForm(ModelRoot model, bool darkMode = false)
+        public ModelEditorForm(ModelRoot model, bool darkMode = false, AppSettings? settings = null)
         {
             _model = model;
             _darkMode = darkMode;
+            _settings = settings ?? new AppSettings();
 
             Text = "Model Editor";
             Width = 1060;
@@ -137,7 +139,8 @@ namespace GlbMerger
                     EditorMode.JointOrientation => new JointOrientationEditor(_model, _darkMode),
                     EditorMode.BallAnchor => new BallAnchorEditor(_model, _darkMode),
                     EditorMode.StiffArm => new StiffArmPoseEditor(_model, _darkMode),
-                    EditorMode.AnimationTrim => new AnimationTrimEditor(_model, _darkMode),
+                    EditorMode.AnimationTrim => new AnimationTrimEditor(_model, _darkMode,
+                        _settings.AnimationTrimPlaybackSpeed, speed => _settings.AnimationTrimPlaybackSpeed = speed),
                     EditorMode.OptimizeGeometry => new GeometryOptimizerEditor(_model, _darkMode),
                     EditorMode.ModelAdjuster => new ModelAdjusterEditor(_model, _darkMode),
                     _ => throw new ArgumentOutOfRangeException(nameof(mode)),

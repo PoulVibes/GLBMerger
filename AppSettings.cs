@@ -15,6 +15,7 @@ namespace GlbMerger
         public double Panel1PrimarySplitFraction { get; set; } = 0.25;
         public double Panel1SecondarySplitFraction { get; set; } = 0.4667;
         public double Panel2PrimarySplitFraction { get; set; } = 0.45;
+        public double AnimationTrimPlaybackSpeed { get; set; } = 1.0;
 
         private static string SettingsPath => Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "GlbMerger", "settings.json");
