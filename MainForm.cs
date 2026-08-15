@@ -639,8 +639,36 @@ namespace GlbMerger
 
             try
             {
-                latestMergedModel.SaveGLB(dlg.FileName);
-                lblStatus.Text = $"Saved: {Path.GetFileName(dlg.FileName)}";
+                var toSave = latestMergedModel;
+
+                // Optimizing rewrites indices only, so a model that has been through the geometry
+                // optimizer carries the vertices its triangles stopped referencing plus a dead index
+                // buffer per pass. Both are only reclaimable by rebuilding, which produces a new
+                // ModelRoot - fine here, because this saves a copy and leaves the session's model
+                // alone, but it's a real change to the file, so it's offered rather than assumed.
+                var estimate = GeometryOptimizer.EstimateCleanup(latestMergedModel);
+                if (estimate.HasWaste)
+                {
+                    var choice = MessageBox.Show(
+                        DescribeCleanup(estimate),
+                        "Clean up unused geometry?",
+                        MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+
+                    if (choice == DialogResult.Cancel) return;
+                    if (choice == DialogResult.Yes)
+                    {
+                        var cleaned = BuildCleanedCopyChecked(latestMergedModel);
+                        if (cleaned == null) return;
+                        toSave = cleaned;
+                    }
+                }
+
+                Cursor = Cursors.WaitCursor;
+                try { toSave.SaveGLB(dlg.FileName); }
+                finally { Cursor = Cursors.Default; }
+
+                long written = new FileInfo(dlg.FileName).Length;
+                lblStatus.Text = $"Saved: {Path.GetFileName(dlg.FileName)} ({FormatBytes(written)})";
             }
             catch (Exception ex)
             {
@@ -648,5 +676,64 @@ namespace GlbMerger
                 MessageBox.Show(ex.ToString(), "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
+
+        private static string DescribeCleanup(GeometryOptimizer.CleanupEstimate estimate)
+        {
+            var lines = new List<string>();
+
+            if (estimate.UnusedVertices > 0)
+            {
+                lines.Add($"{estimate.UnusedVertices:N0} of {estimate.TotalVertices:N0} vertices are no longer "
+                    + $"referenced by any triangle ({FormatBytes(estimate.UnusedVertexBytes)}).");
+            }
+            if (estimate.OrphanedBufferViews > 0)
+            {
+                lines.Add($"{estimate.OrphanedBufferViews} buffer(s) left behind by earlier optimizer passes "
+                    + $"are still in the file ({FormatBytes(estimate.OrphanedBytes)}).");
+            }
+
+            lines.Add("");
+            lines.Add($"Cleaning up rebuilds the model and reclaims about {FormatBytes(estimate.ReclaimableBytes)}. "
+                + "It changes only what gets written to disk - the model open in this session is left as it is.");
+            lines.Add("");
+            lines.Add("Clean up before saving?");
+
+            return string.Join(Environment.NewLine, lines);
+        }
+
+        // The rebuild re-emits the scene rather than editing it, so it is checked against the
+        // original before anything is written - the BallAnchor/StiffArm markers are empty nodes and
+        // are the likeliest thing to be dropped. Returns null when the save should be abandoned.
+        private ModelRoot? BuildCleanedCopyChecked(ModelRoot model)
+        {
+            ModelRoot cleaned;
+            Cursor = Cursors.WaitCursor;
+            try { cleaned = GeometryOptimizer.BuildCleanedCopy(model); }
+            finally { Cursor = Cursors.Default; }
+
+            string? losses = GeometryOptimizer.DescribeLosses(model, cleaned);
+            if (losses == null) return cleaned;
+
+            var proceed = MessageBox.Show(
+                "The rebuild did not carry everything across:" + Environment.NewLine + Environment.NewLine
+                + losses + Environment.NewLine + Environment.NewLine
+                + "Save the original model uncleaned instead? (No saves the cleaned model anyway.)",
+                "Cleanup would lose data",
+                MessageBoxButtons.YesNoCancel, MessageBoxIcon.Warning);
+
+            return proceed switch
+            {
+                DialogResult.Yes => model,
+                DialogResult.No => cleaned,
+                _ => null,
+            };
+        }
+
+        private static string FormatBytes(long bytes) => bytes switch
+        {
+            >= 1L << 20 => $"{bytes / (double)(1L << 20):N1} MB",
+            >= 1L << 10 => $"{bytes / (double)(1L << 10):N1} KB",
+            _ => $"{bytes:N0} bytes",
+        };
     }
 }
