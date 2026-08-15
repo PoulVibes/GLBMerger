@@ -14,6 +14,15 @@ namespace GlbMerger
 {
     public static class GlbMergeService
     {
+        // The single source of truth for naming an unnamed material, used everywhere a material
+        // is identified by name: the UI's Include-selection list (GlbInfoPanel), material
+        // extraction, and primitive-to-material matching below. glTF material names are optional,
+        // and AI-exported models (e.g. Meshy AI) frequently omit them entirely - if any of these
+        // three sites ever generates a different fallback string than the others, the material
+        // silently fails to match and every primitive using it falls back to plain white.
+        public static string GetEffectiveMaterialName(Material mat) =>
+            mat.Name ?? $"Material_{mat.LogicalIndex}";
+
         // Builds and returns the merged model without saving it anywhere - callers decide when
         // and where to persist it (letting "process" and "save" be separate UI actions).
         public static ModelRoot MergeTargeted(
