@@ -60,8 +60,13 @@ namespace GlbMerger
         private readonly ModelRoot _model;
 
         private ComboBox _targetDropdown = null!;
-        private TrackBar _sliderLength = null!, _sliderThickness = null!, _sliderSize = null!, _sliderGroupSize = null!;
-        private Label _lblLength = null!, _lblThickness = null!, _lblSize = null!, _lblGroupSize = null!;
+        private TrackBar _sliderLength = null!, _sliderThickness = null!, _sliderGroupSize = null!;
+        private Label _lblLength = null!, _lblThickness = null!, _lblGroupSize = null!;
+        // Index 0/1/2 = X/Y/Z, so the three rows are built and read in one loop rather than as
+        // three near-identical copies.
+        private readonly TrackBar[] _sliderSize = new TrackBar[3];
+        private readonly Label[] _lblSize = new Label[3];
+        private CheckBox _chkUniformSize = null!;
         private Label _lblTargetInfo = null!, _lblMirrorInfo = null!, _lblStatus = null!;
         private CheckBox _chkMirror = null!, _chkShowBones = null!;
         private ComboBox _animDropdown = null!;
@@ -107,8 +112,30 @@ namespace GlbMerger
         // has no finger bones they have nothing to measure against, while size only needs the one
         // joint. Scaling about the JOINT rather than the geometry's centre is what keeps the hand
         // attached to the wrist while it grows.
-        private readonly Dictionary<string, int> _pendingSize = new(StringComparer.Ordinal);
-        private readonly Dictionary<string, int> _appliedSize = new(StringComparer.Ordinal);
+        // Per-axis, not one number, because the two directional adjustments above are both
+        // radially symmetric and neither can change one direction on its own: thickness scales
+        // everything perpendicular to the bone at once (on a foot, wider AND taller together), and
+        // it needs a child joint for its axis, which a tip toe does not have. Splitting size into
+        // X/Y/Z is what makes "widen the feet without lengthening them" expressible at all.
+        //
+        // Axes are the model's own, matching the Y-up / Z-forward / X-lateral convention the rest
+        // of this app's rig handling assumes, so X really is width on these rigs.
+        private readonly record struct ScalePercent(int X, int Y, int Z)
+        {
+            public static readonly ScalePercent Default = new(DefaultPercent, DefaultPercent, DefaultPercent);
+            public bool IsDefault => Equals(Default);
+            public Vector3 Factor => new(X / 100f, Y / 100f, Z / 100f);
+            public int this[int axis] => axis == 0 ? X : axis == 1 ? Y : Z;
+            public ScalePercent With(int axis, int value) => axis switch
+            {
+                0 => this with { X = value },
+                1 => this with { Y = value },
+                _ => this with { Z = value },
+            };
+        }
+
+        private readonly Dictionary<string, ScalePercent> _pendingSize = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, ScalePercent> _appliedSize = new(StringComparer.Ordinal);
 
         // Whole-branch size, keyed by the chain's ROOT bone: everything from that joint down
         // scaled as one unit - the arm growing out of the shoulder rather than each bone swelling
@@ -449,22 +476,34 @@ namespace GlbMerger
             thicknessHost.Controls.Add(btnFatter);
             lengthGroup.Controls.Add(thicknessHost);
 
-            _lblSize = new Label { Text = SizeLabel(DefaultPercent), AutoSize = true, Margin = new Padding(3, 4, 3, 0) };
-            lengthGroup.Controls.Add(_lblSize);
-
-            _sliderSize = new TrackBar
+            // Ticked by default so the common "make this bigger" case stays a single drag; unticked
+            // is what lets one direction move on its own.
+            _chkUniformSize = new CheckBox
             {
-                Width = 300, Height = 45, Minimum = MinPercent, Maximum = MaxPercent, Value = DefaultPercent,
-                TickFrequency = 25, Margin = new Padding(3, 0, 3, 4),
+                Text = "Size: keep X/Y/Z together", AutoSize = true, Checked = true, Margin = new Padding(3, 6, 3, 2),
             };
-            _sliderSize.ValueChanged += (s, e) => OnSizeChanged();
-            var (btnSmaller, btnBigger) = SliderNudge.Attach(_sliderSize);
+            lengthGroup.Controls.Add(_chkUniformSize);
 
-            var sizeHost = new Panel { Width = 306, Height = 45, Margin = new Padding(3, 0, 3, 4) };
-            sizeHost.Controls.Add(btnSmaller);
-            sizeHost.Controls.Add(_sliderSize);
-            sizeHost.Controls.Add(btnBigger);
-            lengthGroup.Controls.Add(sizeHost);
+            for (int axis = 0; axis < 3; axis++)
+            {
+                int a = axis;
+                _lblSize[a] = new Label { Text = SizeLabel(a, DefaultPercent), AutoSize = true, Margin = new Padding(3, 0, 3, 0) };
+                lengthGroup.Controls.Add(_lblSize[a]);
+
+                _sliderSize[a] = new TrackBar
+                {
+                    Width = 300, Height = 45, Minimum = MinPercent, Maximum = MaxPercent, Value = DefaultPercent,
+                    TickFrequency = 25, Margin = new Padding(3, 0, 3, 4),
+                };
+                _sliderSize[a].ValueChanged += (s, e) => OnSizeChanged(a);
+                var (btnSmaller, btnBigger) = SliderNudge.Attach(_sliderSize[a]);
+
+                var sizeHost = new Panel { Width = 306, Height = 45, Margin = new Padding(3, 0, 3, 4) };
+                sizeHost.Controls.Add(btnSmaller);
+                sizeHost.Controls.Add(_sliderSize[a]);
+                sizeHost.Controls.Add(btnBigger);
+                lengthGroup.Controls.Add(sizeHost);
+            }
 
             _lblGroupSize = new Label { Text = GroupSizeLabel(DefaultPercent), AutoSize = true, Margin = new Padding(3, 4, 3, 0) };
             lengthGroup.Controls.Add(_lblGroupSize);
@@ -572,7 +611,9 @@ namespace GlbMerger
                 // No skin at all - nothing here can do anything.
                 _sliderLength.Enabled = false;
                 _sliderThickness.Enabled = false;
-                _sliderSize.Enabled = false;
+                foreach (var slider in _sliderSize) slider.Enabled = false;
+                _sliderGroupSize.Enabled = false;
+                _chkUniformSize.Enabled = false;
                 _chkMirror.Enabled = false;
                 _chkShowBones.Enabled = false;
                 _btnApply.Enabled = false;
@@ -597,12 +638,13 @@ namespace GlbMerger
 
         private static string LengthLabel(int percent) => $"Length (along the bone): {percent}%";
         private static string ThicknessLabel(int percent) => $"Thickness (around the bone): {percent}%";
-        private static string SizeLabel(int percent) => $"Size, per bone: {percent}%";
+        private static readonly string[] AxisNames = { "X (width)", "Y (height)", "Z (depth)" };
+        private static string SizeLabel(int axis, int percent) => $"Size {AxisNames[axis]}: {percent}%";
         private static string GroupSizeLabel(int percent) => $"Size, whole branch: {percent}%";
 
         private int PercentOf(string bone) => _pendingPercent.TryGetValue(bone, out var v) ? v : DefaultPercent;
         private int ThicknessOf(string bone) => _pendingThickness.TryGetValue(bone, out var v) ? v : DefaultPercent;
-        private int SizeOf(string bone) => _pendingSize.TryGetValue(bone, out var v) ? v : DefaultPercent;
+        private ScalePercent SizeOf(string bone) => _pendingSize.TryGetValue(bone, out var v) ? v : ScalePercent.Default;
         private int GroupSizeOf(string bone) => _pendingGroupSize.TryGetValue(bone, out var v) ? v : DefaultPercent;
 
         // Length needs no group term: branch size rides on the root's node scale, which multiplies
@@ -629,12 +671,12 @@ namespace GlbMerger
         // matched some of them) has no single percentage to show. The slider falls back to 100 and
         // the info label says so, rather than silently showing one member's value as if it spoke
         // for all of them.
-        private static bool IsMixed(Target target, Func<string, int> valueOf) =>
+        private static bool IsMixed<T>(Target target, Func<string, T> valueOf) =>
             target.Bones.Select(valueOf).Distinct().Count() > 1;
 
         private int PercentOf(Target target) => IsMixed(target, PercentOf) ? DefaultPercent : PercentOf(target.Bones[0]);
         private int ThicknessOf(Target target) => IsMixed(target, ThicknessOf) ? DefaultPercent : ThicknessOf(target.Bones[0]);
-        private int SizeOf(Target target) => IsMixed(target, SizeOf) ? DefaultPercent : SizeOf(target.Bones[0]);
+        private ScalePercent SizeOf(Target target) => IsMixed(target, SizeOf) ? ScalePercent.Default : SizeOf(target.Bones[0]);
         // Branch size lives on the root bone alone, so unlike the others there is no per-member
         // spread and nothing to be "mixed".
         private int GroupSizeOf(Target target) => GroupSizeOf(target.Bones[0]);
@@ -679,36 +721,46 @@ namespace GlbMerger
 
             int percent = PercentOf(target);
             int thickness = ThicknessOf(target);
-            int size = SizeOf(target);
+            var size = SizeOf(target);
             int groupSize = GroupSizeOf(target);
 
             // Which of the four this selection can actually do. A tip bone - a wrist with no
             // finger joints, a head with nothing above it - supports only size, and saying so on
-            // the disabled slider beats leaving one that moves and changes nothing. Whole-group
-            // size needs a group: for a single bone it would be the same pivot as per-bone size.
+            // the disabled slider beats leaving one that moves and changes nothing.
+            //
+            // Branch size is offered for a lone bone as well as a group, because the two size
+            // sliders differ in SCOPE, not just pivot: per-bone size moves only the geometry
+            // weighted to that one bone, while branch size takes its descendants with it. Those
+            // coincide only for a tip bone - which is why a leaf hand was fine with per-bone size
+            // but a foot was not, its toes being left behind at their original size.
             bool canLength = target.Bones.Any(HasLength);
             bool canThickness = _skinnedPrimitives.Count > 0 && target.Bones.Any(HasAxis);
             bool canSize = _skinnedPrimitives.Count > 0;
-            bool canGroupSize = canSize && target.IsGroup;
+            bool canGroupSize = canSize && HasLength(target.Bones[0]);
 
             _suppressEvents = true;
             _sliderLength.Value = Math.Clamp(percent, MinPercent, MaxPercent);
             _sliderThickness.Value = Math.Clamp(thickness, MinPercent, MaxPercent);
-            _sliderSize.Value = Math.Clamp(size, MinPercent, MaxPercent);
+            for (int axis = 0; axis < 3; axis++)
+                _sliderSize[axis].Value = Math.Clamp(size[axis], MinPercent, MaxPercent);
             _sliderGroupSize.Value = Math.Clamp(groupSize, MinPercent, MaxPercent);
             _suppressEvents = false;
 
             _sliderLength.Enabled = canLength;
             _sliderThickness.Enabled = canThickness;
-            _sliderSize.Enabled = canSize;
+            for (int axis = 0; axis < 3; axis++) _sliderSize[axis].Enabled = canSize;
+            _chkUniformSize.Enabled = canSize;
             _sliderGroupSize.Enabled = canGroupSize;
 
             _lblLength.Text = canLength ? LengthLabel(percent) : "Length: n/a (no child joint to move)";
             _lblThickness.Text = canThickness ? ThicknessLabel(thickness) : "Thickness: n/a (no child joint to measure around)";
-            _lblSize.Text = canSize ? SizeLabel(size) : "Size: unavailable (no skinned mesh vertices found)";
+            for (int axis = 0; axis < 3; axis++)
+                _lblSize[axis].Text = canSize
+                    ? SizeLabel(axis, size[axis])
+                    : $"Size {AxisNames[axis]}: unavailable (no skinned mesh vertices found)";
             _lblGroupSize.Text = canGroupSize
                 ? GroupSizeLabel(groupSize) + $" (from {target.Bones[0]} down)"
-                : "Size, whole branch: n/a (select a group)";
+                : "Size, whole branch: n/a (nothing below this bone — use Size, per bone)";
 
             var (original, adjusted) = LengthOf(target);
             if (target.IsGroup)
@@ -766,27 +818,36 @@ namespace GlbMerger
             PushThicknessToPreview();
         }
 
-        private void OnSizeChanged()
+        private void OnSizeChanged(int axis)
         {
             if (_suppressEvents) return;
             var target = SelectedTarget;
             if (target == null) return;
 
-            int percent = _sliderSize.Value;
-            foreach (var bone in BonesFor(target)) _pendingSize[bone] = percent;
+            int percent = _sliderSize[axis].Value;
+            foreach (var bone in BonesFor(target))
+            {
+                // Uniform drives all three from whichever slider moved, so the ordinary
+                // "make this bigger" case is still a single drag.
+                _pendingSize[bone] = _chkUniformSize.Checked
+                    ? new ScalePercent(percent, percent, percent)
+                    : SizeOf(bone).With(axis, percent);
+            }
 
             RefreshUiFromState();
             PushSizeToPreview();
         }
 
         // The whole branch scaled about its root joint, recorded on that root alone - the scale
-        // propagates to the rest by itself. The mirrored chain scales about the mirror of the root,
-        // so a mirrored arm grows from its own shoulder rather than the other side's.
+        // propagates to the rest by itself. For a group that root is the head of the chain; for a
+        // single bone it is that bone, which is how a foot carries its toes. The mirrored branch
+        // scales about the mirror of the root, so a mirrored arm grows from its own shoulder
+        // rather than the other side's.
         private void OnGroupSizeChanged()
         {
             if (_suppressEvents) return;
             var target = SelectedTarget;
-            if (target == null || !target.IsGroup) return;
+            if (target == null) return;
 
             int percent = _sliderGroupSize.Value;
             string root = target.Bones[0];
@@ -879,7 +940,7 @@ namespace GlbMerger
 
             int unapplied = UnappliedLengths()
                 .Union(Unapplied(_pendingThickness, _appliedThickness), StringComparer.Ordinal)
-                .Union(Unapplied(_pendingSize, _appliedSize), StringComparer.Ordinal)
+                .Union(UnappliedSizes(), StringComparer.Ordinal)
                 .Union(Unapplied(_pendingGroupSize, _appliedGroupSize), StringComparer.Ordinal)
                 .Count();
 
@@ -891,15 +952,21 @@ namespace GlbMerger
         // Bones whose dialled-in value differs from what is baked. Both directions matter: a bone
         // present in `applied` but dropped from `pending` (reset while its change was already
         // written) is just as unapplied as a freshly moved slider.
-        private static IEnumerable<string> Unapplied(Dictionary<string, int> pending, Dictionary<string, int> applied)
+        private static IEnumerable<string> Unapplied<T>(
+            Dictionary<string, T> pending, Dictionary<string, T> applied, T unset)
         {
             foreach (var bone in pending.Keys.Concat(applied.Keys).Distinct(StringComparer.Ordinal))
             {
-                int want = pending.TryGetValue(bone, out var p) ? p : DefaultPercent;
-                int have = applied.TryGetValue(bone, out var a) ? a : DefaultPercent;
-                if (want != have) yield return bone;
+                T want = pending.TryGetValue(bone, out var p) ? p : unset;
+                T have = applied.TryGetValue(bone, out var a) ? a : unset;
+                if (!EqualityComparer<T>.Default.Equals(want, have)) yield return bone;
             }
         }
+
+        private static IEnumerable<string> Unapplied(Dictionary<string, int> pending, Dictionary<string, int> applied) =>
+            Unapplied(pending, applied, DefaultPercent);
+
+        private IEnumerable<string> UnappliedSizes() => Unapplied(_pendingSize, _appliedSize, ScalePercent.Default);
 
         // Length's own version of the above: what gets compared is the COMBINED factor, since a
         // bone can be out of date because its own length slider moved or because the group scale
@@ -1015,12 +1082,12 @@ namespace GlbMerger
         private int ApplyThickness()
         {
             if (!Unapplied(_pendingThickness, _appliedThickness).Any() &&
-                !Unapplied(_pendingSize, _appliedSize).Any()) return 0;
+                !UnappliedSizes().Any()) return 0;
 
             foreach (var prim in _skinnedPrimitives)
             {
                 var factors = new float[prim.NameByJoint.Length];
-                var sizeFactors = new float[prim.NameByJoint.Length];
+                var sizeFactors = new Vector3[prim.NameByJoint.Length];
                 for (int i = 0; i < factors.Length; i++)
                 {
                     var name = prim.NameByJoint[i];
@@ -1028,8 +1095,8 @@ namespace GlbMerger
                         ? percent / 100f
                         : 1f;
                     sizeFactors[i] = name != null && _pendingSize.TryGetValue(name, out var sizePercent)
-                        ? sizePercent / 100f
-                        : 1f;
+                        ? sizePercent.Factor
+                        : Vector3.One;
                 }
 
                 var originalPositions = OriginalVertexData(prim.Positions);
@@ -1050,6 +1117,8 @@ namespace GlbMerger
                     float effectiveScale = 1f;
                     BoneAxis? dominantAxis = null;
                     float dominantContribution = 0f;
+                    // Per-axis counterpart of effectiveScale, for the non-uniform size correction.
+                    var effectiveSize = Vector3.One;
 
                     for (int k = 0; k < 4; k++)
                     {
@@ -1059,11 +1128,16 @@ namespace GlbMerger
                         int jointIndex = (int)Component(jointIndices, k);
                         if (jointIndex < 0 || jointIndex >= factors.Length) continue;
 
-                        // Size first: a uniform push straight out from the joint's own origin,
-                        // needing no axis at all. This is the one that works on a tip bone.
-                        float sizeFactor = sizeFactors[jointIndex];
-                        if (sizeFactor != 1f)
-                            displacement += weight * (sizeFactor - 1f) * (source - prim.OriginByJoint[jointIndex]);
+                        // Size first: a push straight out from the joint's own origin, per axis and
+                        // needing no bone direction at all. This is the one that works on a tip
+                        // bone, and the only one that can move a single direction - X alone widens
+                        // a foot without lengthening it.
+                        var sizeFactor = sizeFactors[jointIndex];
+                        if (sizeFactor != Vector3.One)
+                        {
+                            displacement += weight * ((source - prim.OriginByJoint[jointIndex]) * (sizeFactor - Vector3.One));
+                            effectiveSize += weight * (sizeFactor - Vector3.One);
+                        }
 
                         float factor = factors[jointIndex];
                         if (factor == 1f) continue;
@@ -1093,9 +1167,15 @@ namespace GlbMerger
                     positions[v] = source + displacement;
 
                     if (normals == null || originalNormals == null) continue;
-                    normals[v] = dominantAxis == null || effectiveScale < 1e-4f
+
+                    var normal = dominantAxis == null || effectiveScale < 1e-4f
                         ? originalNormals[v]
                         : ScaleNormal(originalNormals[v], dominantAxis.Direction, effectiveScale);
+                    // A NON-uniform size does tilt normals (a uniform one does not - see
+                    // ScaleNormal), and the correction is the inverse-transpose of a diagonal
+                    // scale, i.e. dividing each component by that axis's factor. Applied after the
+                    // thickness tilt because the two displacements were applied in that order.
+                    normals[v] = effectiveSize == Vector3.One ? normal : ScaleNormalPerAxis(normal, effectiveSize);
                 }
 
                 // The accessor caches the min/max it was built with, and saving validates the
@@ -1166,6 +1246,19 @@ namespace GlbMerger
 
             _originalScaleKeys[key] = keys;
             return keys;
+        }
+
+        private static Vector3 ScaleNormalPerAxis(Vector3 normal, Vector3 scale)
+        {
+            // Guarded because a near-zero axis factor would blow the component up to infinity; the
+            // sliders cannot reach zero, but the weighted blend that produces `scale` can in
+            // principle land there when opposing adjustments cancel.
+            var safe = new Vector3(
+                MathF.Abs(scale.X) < 1e-4f ? 1f : scale.X,
+                MathF.Abs(scale.Y) < 1e-4f ? 1f : scale.Y,
+                MathF.Abs(scale.Z) < 1e-4f ? 1f : scale.Z);
+            var scaled = normal / safe;
+            return scaled.LengthSquared() > 1e-12f ? Vector3.Normalize(scaled) : normal;
         }
 
         private static float Component(Vector4 v, int index) => index switch
@@ -1314,8 +1407,12 @@ namespace GlbMerger
         {
             if (!_viewerReady) return;
 
-            var factors = new Dictionary<string, float>(StringComparer.Ordinal);
-            foreach (var (bone, percent) in _pendingSize) factors[bone] = percent / 100f;
+            var factors = new Dictionary<string, float[]>(StringComparer.Ordinal);
+            foreach (var (bone, percent) in _pendingSize)
+            {
+                var f = percent.Factor;
+                factors[bone] = new[] { f.X, f.Y, f.Z };
+            }
 
             CallJs("setSizeFactors", factors);
         }
@@ -1617,15 +1714,18 @@ namespace GlbMerger
 
                                 // Bone-name keys resolved to this skeleton's own joint indices.
                                 var factors = new Float32Array(entry.axes.length);
-                                var sizes = new Float32Array(entry.axes.length);
+                                // [x,y,z] per bone - size is per-axis so one direction can move on
+                                // its own, which is the only way to widen a foot without
+                                // lengthening it.
+                                var sizes = [];
                                 var anyChange = false;
                                 for (var b = 0; b < factors.length; b++) {
                                     var name = entry.boneNames[b];
                                     var f = (name && thicknessFactors[name] !== undefined) ? thicknessFactors[name] : 1;
-                                    var s = (name && sizeFactors[name] !== undefined) ? sizeFactors[name] : 1;
+                                    var s = (name && sizeFactors[name] !== undefined) ? sizeFactors[name] : null;
                                     factors[b] = f;
-                                    sizes[b] = s;
-                                    if (f !== 1 || s !== 1) anyChange = true;
+                                    sizes.push(s);
+                                    if (f !== 1 || (s && (s[0] !== 1 || s[1] !== 1 || s[2] !== 1))) anyChange = true;
                                 }
 
                                 var geo = entry.mesh.geometry;
@@ -1636,6 +1736,7 @@ namespace GlbMerger
                                 for (var v = 0; v < op.length / 3; v++) {
                                     var px = op[v * 3], py = op[v * 3 + 1], pz = op[v * 3 + 2];
                                     var dx = 0, dy = 0, dz = 0, effective = 1;
+                                    var esx = 1, esy = 1, esz = 1;
                                     var bestAxis = null, bestContribution = 0;
 
                                     if (anyChange) {
@@ -1648,12 +1749,14 @@ namespace GlbMerger
                                             // Size: straight out from the joint origin, no axis
                                             // needed - the one that works on a tip bone.
                                             var sizeFactor = sizes[ji];
-                                            if (sizeFactor !== 1) {
+                                            if (sizeFactor) {
                                                 var o = entry.origins[ji];
-                                                var sw2 = weight * (sizeFactor - 1);
-                                                dx += sw2 * (px - o[0]);
-                                                dy += sw2 * (py - o[1]);
-                                                dz += sw2 * (pz - o[2]);
+                                                dx += weight * (px - o[0]) * (sizeFactor[0] - 1);
+                                                dy += weight * (py - o[1]) * (sizeFactor[1] - 1);
+                                                dz += weight * (pz - o[2]) * (sizeFactor[2] - 1);
+                                                esx += weight * (sizeFactor[0] - 1);
+                                                esy += weight * (sizeFactor[1] - 1);
+                                                esz += weight * (sizeFactor[2] - 1);
                                             }
 
                                             var factor = factors[ji];
@@ -1677,18 +1780,23 @@ namespace GlbMerger
                                     pos.setXYZ(v, px + dx, py + dy, pz + dz);
 
                                     if (!nrm || !on) continue;
-                                    if (!bestAxis || effective < 1e-4) {
-                                        nrm.setXYZ(v, on[v * 3], on[v * 3 + 1], on[v * 3 + 2]);
-                                    } else {
-                                        var nx = on[v * 3], ny = on[v * 3 + 1], nz = on[v * 3 + 2];
-                                        var na = nx * bestAxis[3] + ny * bestAxis[4] + nz * bestAxis[5];
+                                    var sx = on[v * 3], sy = on[v * 3 + 1], sz = on[v * 3 + 2];
+                                    if (bestAxis && effective >= 1e-4) {
+                                        var na = sx * bestAxis[3] + sy * bestAxis[4] + sz * bestAxis[5];
                                         var ax = na * bestAxis[3], ay = na * bestAxis[4], az = na * bestAxis[5];
-                                        var sx = ax + (nx - ax) / effective;
-                                        var sy = ay + (ny - ay) / effective;
-                                        var sz = az + (nz - az) / effective;
-                                        var len = Math.sqrt(sx * sx + sy * sy + sz * sz) || 1;
-                                        nrm.setXYZ(v, sx / len, sy / len, sz / len);
+                                        sx = ax + (sx - ax) / effective;
+                                        sy = ay + (sy - ay) / effective;
+                                        sz = az + (sz - az) / effective;
                                     }
+                                    // Inverse-transpose of the per-axis size, matching
+                                    // ScaleNormalPerAxis on the C# side.
+                                    if (esx !== 1 || esy !== 1 || esz !== 1) {
+                                        sx /= (Math.abs(esx) < 1e-4 ? 1 : esx);
+                                        sy /= (Math.abs(esy) < 1e-4 ? 1 : esy);
+                                        sz /= (Math.abs(esz) < 1e-4 ? 1 : esz);
+                                    }
+                                    var len = Math.sqrt(sx * sx + sy * sy + sz * sz) || 1;
+                                    nrm.setXYZ(v, sx / len, sy / len, sz / len);
                                 }
 
                                 pos.needsUpdate = true;
