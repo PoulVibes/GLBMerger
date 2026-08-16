@@ -33,6 +33,12 @@ namespace GlbMerger
             Dictionary<string, float>? yRotationAnims1 = null, Dictionary<string, float>? yRotationAnims2 = null,
             Dictionary<string, float>? yOffsetAnims1 = null, Dictionary<string, float>? yOffsetAnims2 = null,
             Dictionary<string, string>? matRenameMap1 = null, Dictionary<string, string>? matRenameMap2 = null,
+            // Which of a material's channels (BaseColor/MetallicRoughness/Normal/Occlusion/
+            // Emissive) to actually pull into the output, keyed by that material's *original*
+            // source name - a material absent from the dictionary, or entirely, contributes all
+            // of its channels (same "absent means default" convention as the other per-item
+            // dictionaries above). See KnownMaterialChannelNames.
+            Dictionary<string, HashSet<string>>? matChannels1 = null, Dictionary<string, HashSet<string>>? matChannels2 = null,
             string? firstMatName1 = null, string? firstMatName2 = null,
             string? firstAnimName1 = null, string? firstAnimName2 = null,
             // Frame range to keep for a given clip name, as [Start, End] keyframe indices into
@@ -81,16 +87,59 @@ namespace GlbMerger
             var model1 = structuralModel;
             var model2 = otherModel;
 
-            var materialsByName1 = ToMaterialLookup(ExtractMaterials(model1).Where(m => allowedMats1.Contains(m.Name)));
-            var materialsByName2 = model2 != null
-                ? ToMaterialLookup(ExtractMaterials(model2).Where(m => allowedMats2.Contains(m.Name)))
-                : new Dictionary<string, MaterialBuilder>();
+            // Raw, still-unbuilt selected materials, keyed by their *original* source name (the
+            // key EmitNodeGeometry matches primitives against) - kept as raw SharpGLTF Materials
+            // rather than MaterialBuilders here so a same-output-name collision between the two
+            // models (below) can pull channels from both sources into one combined builder.
+            var rawMats1 = model1.LogicalMaterials
+                .Where(m => allowedMats1.Contains(MaterialKey(m)))
+                .GroupBy(MaterialKey).ToDictionary(g => g.Key, g => g.First());
+            var rawMats2 = model2 != null
+                ? model2.LogicalMaterials
+                    .Where(m => allowedMats2.Contains(MaterialKey(m)))
+                    .GroupBy(MaterialKey).ToDictionary(g => g.Key, g => g.First())
+                : new Dictionary<string, Material>();
 
-            // Rename only the output MaterialBuilder's own name - the dictionary keys (used just
-            // below and in EmitNodeGeometry to match a primitive's *original* source material name)
-            // must stay untouched, or primitive-to-material matching breaks.
-            ApplyMaterialRenames(materialsByName1, matRenameMap1);
-            ApplyMaterialRenames(materialsByName2, matRenameMap2);
+            string FinalName(Dictionary<string, string>? renameMap, string original) =>
+                renameMap != null && renameMap.TryGetValue(original, out var renamed) && !string.IsNullOrWhiteSpace(renamed)
+                    ? renamed : original;
+
+            HashSet<string> SelectedChannels(Dictionary<string, HashSet<string>>? channelMap, string original) =>
+                channelMap != null && channelMap.TryGetValue(original, out var chs)
+                    ? chs : new HashSet<string>(KnownMaterialChannelNames);
+
+            var materialsByName1 = new Dictionary<string, MaterialBuilder>();
+            var materialsByName2 = new Dictionary<string, MaterialBuilder>();
+
+            // Materials sharing the same *output* name across the two models (e.g. renamed to the
+            // same "Merged As" name) get combined into a single MaterialBuilder that carries the
+            // union of whichever channels were selected on each side, instead of the two models'
+            // materials being emitted as separate stacked geometry variants. Model 1 takes
+            // priority on a channel selected by both sides.
+            foreach (var (origName1, mat1) in rawMats1)
+            {
+                var finalName = FinalName(matRenameMap1, origName1);
+                var collidingOrigName2 = rawMats2.Keys.FirstOrDefault(o2 => FinalName(matRenameMap2, o2) == finalName);
+
+                if (collidingOrigName2 != null)
+                {
+                    var combined = BuildCombinedMaterial(finalName,
+                        (mat1, SelectedChannels(matChannels1, origName1)),
+                        (rawMats2[collidingOrigName2], SelectedChannels(matChannels2, collidingOrigName2)));
+                    materialsByName1[origName1] = combined;
+                    materialsByName2[collidingOrigName2] = combined;
+                }
+                else
+                {
+                    materialsByName1[origName1] = BuildMaterial(finalName, mat1, SelectedChannels(matChannels1, origName1));
+                }
+            }
+
+            foreach (var (origName2, mat2) in rawMats2)
+            {
+                if (materialsByName2.ContainsKey(origName2)) continue; // already combined above
+                materialsByName2[origName2] = BuildMaterial(FinalName(matRenameMap2, origName2), mat2, SelectedChannels(matChannels2, origName2));
+            }
 
             var structuralMats = materialsByName1;
             var otherMats = materialsByName2;
@@ -335,18 +384,6 @@ namespace GlbMerger
             return trimmed;
         }
 
-        private static Dictionary<string, MaterialBuilder> ToMaterialLookup(IEnumerable<MaterialBuilder> materials) =>
-            materials.GroupBy(m => m.Name).ToDictionary(g => g.Key, g => g.First());
-
-        private static void ApplyMaterialRenames(Dictionary<string, MaterialBuilder> materialsByName, Dictionary<string, string>? renameMap)
-        {
-            if (renameMap == null) return;
-
-            foreach (var (originalName, material) in materialsByName)
-                if (renameMap.TryGetValue(originalName, out var renamed))
-                    material.Name = renamed;
-        }
-
         private static NodeBuilder BuildNodeTree(Node srcNode, Dictionary<Node, NodeBuilder> map)
         {
             var nb = new NodeBuilder(srcNode.Name ?? $"node_{srcNode.LogicalIndex}");
@@ -432,6 +469,11 @@ namespace GlbMerger
                     else
                         continue; // neither source's texture for this part was selected
                 }
+
+                // Both slots can point at the very same MaterialBuilder instance when their
+                // materials were combined above (same output name after renaming) - collapse back
+                // to one variant so that case doesn't emit the same geometry twice.
+                variants = variants.GroupBy(v => v.material).Select(g => g.First()).ToList();
 
                 // Whichever material the user marked "First" gets its primitive built before the
                 // others here, so SharpGLTF registers (and therefore indexes) that MaterialBuilder
@@ -1148,41 +1190,76 @@ namespace GlbMerger
         // Null-tolerant overload: a primitive with no material at all has no key to match on.
         private static string? MaterialKeyOrNull(Material? mat) => mat == null ? null : MaterialKey(mat);
 
-        private static List<MaterialBuilder> ExtractMaterials(ModelRoot model)
+        // The channel names shown/checked in the UI's material grid (GlbInfoPanel) and matched
+        // against here - a single source of truth so the two never drift apart the way
+        // MaterialKey's fallback naming used to.
+        public static readonly string[] KnownMaterialChannelNames =
+            { "BaseColor", "MetallicRoughness", "Normal", "Occlusion", "Emissive" };
+
+        private static readonly Dictionary<string, (KnownChannel Known, KnownProperty[] ScalarProps)> ChannelInfo = new()
         {
-            var result = new List<MaterialBuilder>();
+            ["BaseColor"] = (KnownChannel.BaseColor, new[] { KnownProperty.RGBA }),
+            ["MetallicRoughness"] = (KnownChannel.MetallicRoughness, new[] { KnownProperty.MetallicFactor, KnownProperty.RoughnessFactor }),
+            ["Normal"] = (KnownChannel.Normal, new[] { KnownProperty.NormalScale }),
+            ["Occlusion"] = (KnownChannel.Occlusion, new[] { KnownProperty.OcclusionStrength }),
+            ["Emissive"] = (KnownChannel.Emissive, new[] { KnownProperty.RGB }),
+        };
 
-            foreach (var mat in model.LogicalMaterials)
-            {
-                // We keep the original clean material name so selection mapping works exactly
-                var matName = MaterialKey(mat);
-                var mb = new MaterialBuilder(matName);
+        // Builds an output material from a single source, carrying over only the channels the
+        // user selected for it.
+        private static MaterialBuilder BuildMaterial(string outputName, Material src, HashSet<string> selectedChannels)
+        {
+            var mb = new MaterialBuilder(outputName);
+            ApplyBaseProperties(src, mb);
 
-                mb.WithAlpha(mat.Alpha switch
-                {
-                    SchemaAlphaMode.BLEND => SharpGLTF.Materials.AlphaMode.BLEND,
-                    SchemaAlphaMode.MASK => SharpGLTF.Materials.AlphaMode.MASK,
-                    _ => SharpGLTF.Materials.AlphaMode.OPAQUE
-                }, mat.AlphaCutoff);
+            foreach (var channelName in KnownMaterialChannelNames)
+                if (selectedChannels.Contains(channelName))
+                    ApplyChannel(src, mb, channelName, ChannelInfo[channelName].Known, ChannelInfo[channelName].ScalarProps);
 
-                mb.WithDoubleSide(mat.DoubleSided);
-
-                ApplyChannel(mat, mb, "BaseColor", KnownChannel.BaseColor, KnownProperty.RGBA);
-                ApplyChannel(mat, mb, "MetallicRoughness", KnownChannel.MetallicRoughness, KnownProperty.MetallicFactor, KnownProperty.RoughnessFactor);
-                ApplyChannel(mat, mb, "Normal", KnownChannel.Normal, KnownProperty.NormalScale);
-                ApplyChannel(mat, mb, "Occlusion", KnownChannel.Occlusion, KnownProperty.OcclusionStrength);
-                ApplyChannel(mat, mb, "Emissive", KnownChannel.Emissive, KnownProperty.RGB);
-
-                result.Add(mb);
-            }
-
-            return result;
+            return mb;
         }
 
-        private static void ApplyChannel(Material mat, MaterialBuilder mb, string channelName, KnownChannel known, params KnownProperty[] scalarProps)
+        // Builds one output material out of several sources that ended up sharing the same output
+        // name (e.g. renamed to the same "Merged As" name in both models) - each source
+        // contributes whichever of its own selected channels haven't already been claimed by an
+        // earlier (higher-priority) source, so a channel picked on both sides is taken from
+        // whichever source comes first in sourcesInPriorityOrder rather than being blended.
+        private static MaterialBuilder BuildCombinedMaterial(string outputName, params (Material Source, HashSet<string> SelectedChannels)[] sourcesInPriorityOrder)
+        {
+            var mb = new MaterialBuilder(outputName);
+            ApplyBaseProperties(sourcesInPriorityOrder[0].Source, mb);
+
+            var applied = new HashSet<string>();
+            foreach (var (source, selected) in sourcesInPriorityOrder)
+                foreach (var channelName in KnownMaterialChannelNames)
+                {
+                    if (applied.Contains(channelName) || !selected.Contains(channelName)) continue;
+                    if (ApplyChannel(source, mb, channelName, ChannelInfo[channelName].Known, ChannelInfo[channelName].ScalarProps))
+                        applied.Add(channelName);
+                }
+
+            return mb;
+        }
+
+        private static void ApplyBaseProperties(Material src, MaterialBuilder mb)
+        {
+            mb.WithAlpha(src.Alpha switch
+            {
+                SchemaAlphaMode.BLEND => SharpGLTF.Materials.AlphaMode.BLEND,
+                SchemaAlphaMode.MASK => SharpGLTF.Materials.AlphaMode.MASK,
+                _ => SharpGLTF.Materials.AlphaMode.OPAQUE
+            }, src.AlphaCutoff);
+
+            mb.WithDoubleSide(src.DoubleSided);
+        }
+
+        // Returns whether it actually wrote anything to mb, so BuildCombinedMaterial can tell a
+        // channel that's selected-but-genuinely-absent-on-this-source apart from one it applied,
+        // and let a lower-priority source fill it in instead.
+        private static bool ApplyChannel(Material mat, MaterialBuilder mb, string channelName, KnownChannel known, params KnownProperty[] scalarProps)
         {
             var ch = mat.FindChannel(channelName);
-            if (!ch.HasValue) return;
+            if (!ch.HasValue) return false;
 
             bool hasTexture = false;
             var tex = ch.Value.Texture;
@@ -1201,17 +1278,21 @@ namespace GlbMerger
             // glTF; writing them without an attached texture emits a dangling TextureInfo that
             // fails validation on save.
             bool factorRequiresTexture = known == KnownChannel.Normal || known == KnownChannel.Occlusion;
-            if (factorRequiresTexture && !hasTexture) return;
+            if (factorRequiresTexture && !hasTexture) return false;
 
+            bool appliedAny = hasTexture;
             foreach (var prop in scalarProps)
             {
                 try
                 {
                     var v = ch.Value.GetFactor(prop.ToString());
                     mb.UseChannel(known).Parameters[prop] = v;
+                    appliedAny = true;
                 }
                 catch { /* property not present on this channel */ }
             }
+
+            return appliedAny;
         }
     }
 }

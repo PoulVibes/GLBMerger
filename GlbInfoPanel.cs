@@ -84,15 +84,23 @@ namespace GlbMerger
                 AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
                 BackgroundColor = SystemColors.Window,
             };
-            grdMaterials.Columns.Add(new DataGridViewCheckBoxColumn { Name = "Include", HeaderText = "Include", FillWeight = 20 });
-            grdMaterials.Columns.Add(new DataGridViewTextBoxColumn { Name = "Name", HeaderText = "Material", ReadOnly = true, FillWeight = 30 });
-            grdMaterials.Columns.Add(new DataGridViewTextBoxColumn { Name = "Channels", HeaderText = "Channels", ReadOnly = true, FillWeight = 25 });
+            grdMaterials.Columns.Add(new DataGridViewCheckBoxColumn { Name = "Include", HeaderText = "Include", FillWeight = 15 });
+            grdMaterials.Columns.Add(new DataGridViewTextBoxColumn { Name = "Name", HeaderText = "Material", ReadOnly = true, FillWeight = 22 });
+            // One checkbox per known channel (see GlbMergeService.KnownMaterialChannelNames) - lets
+            // the user merge only some of a material's channels instead of all-or-nothing. Checked
+            // by default for whichever channels this material actually has; a channel it doesn't
+            // have gets its cell disabled (ChannelColumnName below) so it can't be turned on.
+            foreach (var channelName in GlbMergeService.KnownMaterialChannelNames)
+                grdMaterials.Columns.Add(new DataGridViewCheckBoxColumn
+                {
+                    Name = ChannelColumnName(channelName), HeaderText = ChannelHeaderText(channelName), FillWeight = 10
+                });
             // Editable output name: lets the user rename how a material appears in the merged
             // file, without touching the source model - selection matching still keys off "Name".
-            grdMaterials.Columns.Add(new DataGridViewTextBoxColumn { Name = "MergedAs", HeaderText = "Merged As", FillWeight = 25 });
+            grdMaterials.Columns.Add(new DataGridViewTextBoxColumn { Name = "MergedAs", HeaderText = "Merged As", FillWeight = 20 });
             // Marks which material should be written first into the output's material list (some
             // engines/tools default to index 0) - only one row can be marked at a time.
-            grdMaterials.Columns.Add(new DataGridViewCheckBoxColumn { Name = "First", HeaderText = "First", FillWeight = 15 });
+            grdMaterials.Columns.Add(new DataGridViewCheckBoxColumn { Name = "First", HeaderText = "First", FillWeight = 13 });
             grdMaterials.CurrentCellDirtyStateChanged += (s, e) =>
             {
                 if (grdMaterials.IsCurrentCellDirty)
@@ -100,7 +108,8 @@ namespace GlbMerger
             };
             grdMaterials.CellValueChanged += (s, e) => EnforceSingleFirst(grdMaterials, e);
             grdMaterials.ColumnHeaderMouseClick += (s, e) => ToggleAllInColumn(
-                grdMaterials, e.ColumnIndex, new HashSet<string> { "Include" });
+                grdMaterials, e.ColumnIndex,
+                new HashSet<string>(new[] { "Include" }.Concat(GlbMergeService.KnownMaterialChannelNames.Select(ChannelColumnName))));
 
             lblAnim = MakeLabel("Animation Clips (Check to Inject)");
 
@@ -472,18 +481,28 @@ namespace GlbMerger
 
             foreach (var mat in model.LogicalMaterials)
             {
-                var channels = new List<string>();
-                foreach (var ch in new[] { "BaseColor", "Normal", "Emissive", "Occlusion", "MetallicRoughness" })
-                {
-                    var found = mat.FindChannel(ch);
-                    if (found.HasValue && found.Value.Texture != null)
-                        channels.Add(ch);
-                }
                 // Shared with the merge service on purpose - the string put in this grid is what
                 // comes back as the user's selection, and it has to be the exact same key the merge
                 // matches against. See GlbMergeService.MaterialKey.
                 var matName = GlbMergeService.MaterialKey(mat);
-                grdMaterials.Rows.Add(true, matName, string.Join(", ", channels), matName, false);
+
+                var rowValues = new List<object> { true, matName };
+                var presence = new Dictionary<string, bool>();
+                foreach (var channelName in GlbMergeService.KnownMaterialChannelNames)
+                {
+                    var found = mat.FindChannel(channelName);
+                    bool present = found.HasValue && found.Value.Texture != null;
+                    presence[channelName] = present;
+                    rowValues.Add(present); // checked by default when the material actually has it
+                }
+                rowValues.Add(matName); // MergedAs
+                rowValues.Add(false); // First
+
+                int rowIndex = grdMaterials.Rows.Add(rowValues.ToArray());
+                var row = grdMaterials.Rows[rowIndex];
+                foreach (var channelName in GlbMergeService.KnownMaterialChannelNames)
+                    if (!presence[channelName])
+                        row.Cells[ChannelColumnName(channelName)].ReadOnly = true; // no such channel on this material - nothing to select
             }
 
             _glbAnimNames = model.LogicalAnimations.Select(a => a.Name ?? $"Anim_{a.LogicalIndex}").ToList();
@@ -641,6 +660,28 @@ namespace GlbMerger
                 var originalName = (string)row.Cells["Name"].Value!;
                 var mergedAs = row.Cells["MergedAs"].Value as string;
                 result[originalName] = string.IsNullOrWhiteSpace(mergedAs) ? originalName : mergedAs;
+            }
+            return result;
+        }
+
+        // Maps each included material's original name to the set of its channels the user left
+        // checked (BaseColor/MetallicRoughness/Normal/Occlusion/Emissive) - passed straight
+        // through to GlbMergeService.MergeTargeted's matChannels parameters. Only included rows
+        // are returned since unselected materials never reach the merge in the first place.
+        public Dictionary<string, HashSet<string>> GetSelectedChannelsByMaterial()
+        {
+            var result = new Dictionary<string, HashSet<string>>();
+            foreach (DataGridViewRow row in grdMaterials.Rows)
+            {
+                if (row.Cells["Include"].Value is not bool included || !included) continue;
+
+                var originalName = (string)row.Cells["Name"].Value!;
+                var channels = new HashSet<string>();
+                foreach (var channelName in GlbMergeService.KnownMaterialChannelNames)
+                    if (row.Cells[ChannelColumnName(channelName)].Value is bool v && v)
+                        channels.Add(channelName);
+
+                result[originalName] = channels;
             }
             return result;
         }
@@ -810,6 +851,18 @@ namespace GlbMerger
             }
             return result;
         }
+
+        // Grid column name / header for a known material channel's Include checkbox - kept as
+        // small helpers rather than inline string concatenation since both the column-setup code
+        // and every reader (LoadMaterialsFromGlb, GetSelectedChannelsByMaterial) need to agree on
+        // the exact same column name.
+        private static string ChannelColumnName(string channelName) => "Ch_" + channelName;
+
+        private static string ChannelHeaderText(string channelName) => channelName switch
+        {
+            "MetallicRoughness" => "Metal/Rough",
+            _ => channelName
+        };
 
         private static Label MakeLabel(string text) =>
             new Label { Text = text, AutoSize = true, Font = new Font(SystemFonts.DefaultFont, FontStyle.Bold), Margin = new Padding(0, 4, 0, 2) };

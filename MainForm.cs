@@ -434,6 +434,7 @@ namespace GlbMerger
                 var yOffsetAnims1 = panel1.GetYOffsetByAnimation();
                 var renameMap1 = panel1.GetAnimationRenameMap();
                 var matRenameMap1 = panel1.GetMaterialRenameMap();
+                var matChannels1 = panel1.GetSelectedChannelsByMaterial();
                 var geomRenameMap1 = panel1.GetGeometryRenameMap();
                 var firstMat1 = panel1.GetFirstMaterialName();
                 var firstAnim1 = panel1.GetFirstAnimationName();
@@ -449,6 +450,7 @@ namespace GlbMerger
                 var yOffsetAnims2 = loaded2 ? panel2.GetYOffsetByAnimation() : new Dictionary<string, float>();
                 var renameMap2 = loaded2 ? panel2.GetAnimationRenameMap() : new Dictionary<string, string>();
                 var matRenameMap2 = loaded2 ? panel2.GetMaterialRenameMap() : new Dictionary<string, string>();
+                var matChannels2 = loaded2 ? panel2.GetSelectedChannelsByMaterial() : new Dictionary<string, HashSet<string>>();
                 var firstMat2 = loaded2 ? panel2.GetFirstMaterialName() : null;
                 var firstAnim2 = loaded2 ? panel2.GetFirstAnimationName() : null;
                 var frameTrim2 = loaded2 ? panel2.GetFrameTrimByAnimation() : new Dictionary<string, (int Start, int End)>();
@@ -460,6 +462,7 @@ namespace GlbMerger
                     groundFixAnims1, groundFixAnims2,
                     yRotationAnims1, yRotationAnims2, yOffsetAnims1, yOffsetAnims2,
                     matRenameMap1, matRenameMap2,
+                    matChannels1, matChannels2,
                     firstMat1, firstMat2, firstAnim1, firstAnim2,
                     frameTrim1, frameTrim2,
                     fixBoneLengthAnims1, fixBoneLengthAnims2,

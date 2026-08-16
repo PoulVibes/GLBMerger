@@ -22,6 +22,7 @@ namespace GlbMerger
             StiffArm,
             AnimationTrim,
             OptimizeGeometry,
+            ModelSmoother,
             ModelAdjuster,
             TextureEditor,
         }
@@ -34,6 +35,7 @@ namespace GlbMerger
             (EditorMode.StiffArm,         "Stiff Arm Poses"),
             (EditorMode.AnimationTrim,    "Animation Start / Stop (Trim)"),
             (EditorMode.OptimizeGeometry, "Optimize Geometry"),
+            (EditorMode.ModelSmoother,    "Model Smoother"),
             (EditorMode.ModelAdjuster,    "Model Adjuster"),
             (EditorMode.TextureEditor,    "Texture Editor"),
         };
@@ -144,6 +146,7 @@ namespace GlbMerger
                     EditorMode.AnimationTrim => new AnimationTrimEditor(_model, _darkMode,
                         _settings.AnimationTrimPlaybackSpeed, speed => _settings.AnimationTrimPlaybackSpeed = speed),
                     EditorMode.OptimizeGeometry => new GeometryOptimizerEditor(_model, _darkMode),
+                    EditorMode.ModelSmoother => new ModelSmootherEditor(_model, _darkMode),
                     EditorMode.ModelAdjuster => new ModelAdjusterEditor(_model, _darkMode),
                     EditorMode.TextureEditor => new TextureEditorEditor(_model, _darkMode),
                     _ => throw new ArgumentOutOfRangeException(nameof(mode)),
