@@ -289,7 +289,9 @@ namespace GlbMerger
 
         // --- geometry gathering / rasterization -------------------------------------------------
 
-        private readonly struct Tri3
+        // Internal rather than private: WatertightRepair reuses this UV-footprint rasterization to
+        // find unused space in the same atlas for texturing hole-cap triangles.
+        internal readonly struct Tri3
         {
             public readonly Vector3 P0, P1, P2;
             public readonly Vector2 Uv0, Uv1, Uv2; // already in pixel space
@@ -309,7 +311,7 @@ namespace GlbMerger
         // are gathered - unpainted geometry is invisible to the rest of the pipeline entirely, not
         // merely excluded from being "line", which is what keeps a fill source from ever being
         // pulled from outside the painted patch.
-        private static List<Tri3> GatherTriangles(ModelRoot model, int imageIndex, int width, int height,
+        internal static List<Tri3> GatherTriangles(ModelRoot model, int imageIndex, int width, int height,
             Dictionary<(int MeshIndex, int PrimitiveIndex), HashSet<int>>? selection)
         {
             bool hasSelection = selection != null && selection.Values.Any(s => s.Count > 0);
@@ -366,7 +368,7 @@ namespace GlbMerger
         }
 
         // Fills positions/covered/texelSize for every texel inside some triangle's UV footprint.
-        private static void RasterizeTriangles(List<Tri3> tris, int width, int height,
+        internal static void RasterizeTriangles(List<Tri3> tris, int width, int height,
             Vector3[] positions, bool[] covered, float[] texelSize)
         {
             foreach (var t in tris)
@@ -562,7 +564,7 @@ namespace GlbMerger
 
         // --- bitmap plumbing ---------------------------------------------------------------------
 
-        private static Bitmap LoadBitmap(byte[] bytes)
+        internal static Bitmap LoadBitmap(byte[] bytes)
         {
             using var ms = new MemoryStream(bytes);
             using var raw = new Bitmap(ms);
@@ -570,7 +572,7 @@ namespace GlbMerger
         }
 
         // BGRA byte order per pixel, matching Format32bppArgb's in-memory layout.
-        private static byte[] ReadPixels(Bitmap bmp)
+        internal static byte[] ReadPixels(Bitmap bmp)
         {
             var rect = new Rectangle(0, 0, bmp.Width, bmp.Height);
             var data = bmp.LockBits(rect, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
@@ -592,7 +594,7 @@ namespace GlbMerger
             finally { bmp.UnlockBits(data); }
         }
 
-        private static Bitmap WritePixels(byte[] pixels, int width, int height)
+        internal static Bitmap WritePixels(byte[] pixels, int width, int height)
         {
             var bmp = new Bitmap(width, height, PixelFormat.Format32bppArgb);
             var rect = new Rectangle(0, 0, width, height);
@@ -616,7 +618,7 @@ namespace GlbMerger
 
         // Always re-encoded as PNG regardless of the source format, so a re-run never compounds
         // JPEG block artifacts along the very edges this is trying to clean up.
-        private static byte[] EncodePng(Bitmap bmp)
+        internal static byte[] EncodePng(Bitmap bmp)
         {
             using var ms = new MemoryStream();
             bmp.Save(ms, ImageFormat.Png);

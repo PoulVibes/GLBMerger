@@ -25,6 +25,7 @@ namespace GlbMerger
             ModelSmoother,
             ModelAdjuster,
             TextureEditor,
+            RigidRegion,
         }
 
         // Dropdown order and labels, indexed by EditorMode.
@@ -38,6 +39,7 @@ namespace GlbMerger
             (EditorMode.ModelSmoother,    "Model Smoother"),
             (EditorMode.ModelAdjuster,    "Model Adjuster"),
             (EditorMode.TextureEditor,    "Texture Editor"),
+            (EditorMode.RigidRegion,      "Rigid Region (Prevent Skew)"),
         };
 
         private readonly ModelRoot _model;
@@ -149,6 +151,7 @@ namespace GlbMerger
                     EditorMode.ModelSmoother => new ModelSmootherEditor(_model, _darkMode),
                     EditorMode.ModelAdjuster => new ModelAdjusterEditor(_model, _darkMode),
                     EditorMode.TextureEditor => new TextureEditorEditor(_model, _darkMode),
+                    EditorMode.RigidRegion => new RigidRegionEditor(_model, _darkMode),
                     _ => throw new ArgumentOutOfRangeException(nameof(mode)),
                 };
 

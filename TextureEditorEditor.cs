@@ -48,6 +48,9 @@ namespace GlbMerger
 
         private List<TextureLineThinner.AlbedoTarget> _targets = new();
 
+        private NumericUpDown _numIslandPadding = null!;
+        private Button _btnPreviewPad = null!, _btnApplyPad = null!, _btnApplyPadAll = null!;
+
         // Original bytes for whichever images Apply has touched this session, so Revert can put
         // them back - the model is shared with every other editor mode, same pattern as
         // GeometryOptimizerEditor's _originalIndices.
@@ -243,6 +246,35 @@ namespace GlbMerger
             _btnRevert.Click += (s, e) => RevertSelected();
             flow.Controls.Add(_btnRevert);
 
+            flow.Controls.Add(new Label
+            {
+                Text = "Pad UV Islands",
+                AutoSize = true,
+                Margin = new Padding(3, 8, 3, 4),
+            });
+
+            flow.Controls.Add(HelpText(
+                "Extends each island's own edge color into the unused gutter around it. Up close " +
+                "this changes nothing visible - but from a distance, mip-mapped sampling blends a " +
+                "wider patch of texels, and an unpadded gutter lets that blend pull in an unrelated " +
+                "island's color across the seam, which is what reads as a faint color fringe at " +
+                "range. Applies to every material channel bound to this image, not just base color."));
+
+            var paddingRow = LabeledNumeric("Padding (texels):", out _numIslandPadding, 0, 64, 16, 0);
+            flow.Controls.Add(paddingRow);
+
+            _btnPreviewPad = MakeButton("Preview Padding");
+            _btnPreviewPad.Click += async (s, e) => await RunPaddingAsync(apply: false);
+            flow.Controls.Add(_btnPreviewPad);
+
+            _btnApplyPad = MakeButton("Apply Padding to This Texture");
+            _btnApplyPad.Click += async (s, e) => await RunPaddingAsync(apply: true);
+            flow.Controls.Add(_btnApplyPad);
+
+            _btnApplyPadAll = MakeButton("Apply Padding to All Textures");
+            _btnApplyPadAll.Click += async (s, e) => await RunPaddingAllAsync();
+            flow.Controls.Add(_btnApplyPadAll);
+
             _lblStatus = new Label
             {
                 AutoSize = true, MaximumSize = new Size(300, 0),
@@ -368,6 +400,10 @@ namespace GlbMerger
             _btnPreview.Enabled = enabled;
             _btnApply.Enabled = enabled;
             _btnApplyAll.Enabled = enabled;
+            _numIslandPadding.Enabled = enabled;
+            _btnPreviewPad.Enabled = enabled;
+            _btnApplyPad.Enabled = enabled;
+            _btnApplyPadAll.Enabled = enabled;
         }
 
         private TextureLineThinner.Options CurrentOptions(
@@ -601,8 +637,105 @@ namespace GlbMerger
             _btnPreview.Enabled = !busy;
             _btnApply.Enabled = !busy;
             _btnApplyAll.Enabled = !busy;
+            _btnPreviewPad.Enabled = !busy;
+            _btnApplyPad.Enabled = !busy;
+            _btnApplyPadAll.Enabled = !busy;
             Cursor = busy ? Cursors.WaitCursor : Cursors.Default;
             if (status != null) _lblStatus.Text = status;
+        }
+
+        private async Task RunPaddingAsync(bool apply)
+        {
+            int imageIndex = SelectedImageIndex;
+            if (imageIndex < 0) return;
+
+            SetBusy(true, apply ? "Applying padding..." : "Processing padding preview...");
+
+            var options = new UvIslandPadding.Options { PaddingTexels = (int)_numIslandPadding.Value };
+
+            UvIslandPadding.Report report;
+            byte[] pngBytes;
+            try
+            {
+                (report, pngBytes) = await Task.Run(() => UvIslandPadding.Process(_model, imageIndex, options));
+            }
+            catch (Exception ex)
+            {
+                SetBusy(false, null);
+                MessageBox.Show(this, $"UV island padding failed: {ex.Message}",
+                    "Pad UV Islands", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            if (IsDisposed) return;
+
+            _picAfter.Image?.Dispose();
+            _picAfter.Image = LoadImageSafe(pngBytes);
+            _lastPreviewBytes = pngBytes;
+            _lastPreviewImageIndex = imageIndex;
+            UpdateAfterViewer(imageIndex, pngBytes);
+
+            if (!apply)
+            {
+                SetBusy(false, $"{report.TexelsPadded:N0} gutter texel(s) padded around " +
+                    $"{report.TexelsCovered:N0} mapped texels. Preview only - nothing changed yet.");
+                return;
+            }
+
+            if (!_originalContent.ContainsKey(imageIndex))
+                _originalContent[imageIndex] = UvIslandPadding.SnapshotContent(_model, imageIndex);
+
+            UvIslandPadding.Apply(_model, imageIndex, pngBytes);
+            _btnRevert.Enabled = true;
+            RefreshBeforeViewer();
+
+            SetBusy(false, $"Applied: {report.TexelsPadded:N0} gutter texel(s) padded. " +
+                "Included the next time you save the merge.");
+        }
+
+        private async Task RunPaddingAllAsync()
+        {
+            if (_targets.Count == 0) return;
+
+            SetBusy(true, $"Applying padding to {_targets.Count} texture(s)...");
+
+            var options = new UvIslandPadding.Options { PaddingTexels = (int)_numIslandPadding.Value };
+            int totalPadded = 0;
+
+            try
+            {
+                foreach (var target in _targets)
+                {
+                    var (report, pngBytes) = await Task.Run(() => UvIslandPadding.Process(_model, target.ImageIndex, options));
+                    if (IsDisposed) return;
+
+                    if (!_originalContent.ContainsKey(target.ImageIndex))
+                        _originalContent[target.ImageIndex] = UvIslandPadding.SnapshotContent(_model, target.ImageIndex);
+
+                    UvIslandPadding.Apply(_model, target.ImageIndex, pngBytes);
+                    totalPadded += report.TexelsPadded;
+
+                    if (target.ImageIndex == SelectedImageIndex)
+                    {
+                        _picAfter.Image?.Dispose();
+                        _picAfter.Image = LoadImageSafe(pngBytes);
+                        _lastPreviewBytes = pngBytes;
+                        _lastPreviewImageIndex = target.ImageIndex;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                SetBusy(false, null);
+                MessageBox.Show(this, $"UV island padding failed: {ex.Message}",
+                    "Pad UV Islands", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            _btnRevert.Enabled = _originalContent.ContainsKey(SelectedImageIndex);
+            RefreshBeforeViewer();
+            SetBusy(false, $"Applied to {_targets.Count} texture(s): {totalPadded:N0} gutter texels padded in total. " +
+                "Included the next time you save the merge.");
         }
 
         // --- 3D quadrant / paint tool ------------------------------------------------------------

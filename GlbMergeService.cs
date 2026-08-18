@@ -251,6 +251,15 @@ namespace GlbMerger
                 targetHipsBindRotation = tgtHipsRot;
             }
 
+            // Read off the rig rather than hard-coded (it used to be a fixed
+            // Spine02/LeftUpLeg/RightUpLeg list) - a rig naming its spine root anything else
+            // silently skipped the cancellation ApplyHipRotationCorrection depends on.
+            var targetHipsChildNames = targetHipsNode?.VisualChildren
+                .Select(c => c.Name)
+                .Where(n => !string.IsNullOrEmpty(n))
+                .Select(n => n!)
+                .ToArray() ?? Array.Empty<string>();
+
             Quaternion? sourceHipsBindRotation = null;
             if (model2 != null && otherNodesByName.TryGetValue("Hips", out var srcHipsNode))
             {
@@ -282,6 +291,7 @@ namespace GlbMerger
                     ApplyHipRotationCorrection(
                         nativeClips2,
                         sourceHipsBindRotation.Value, targetHipsBindRotation.Value,
+                        targetHipsChildNames,
                         new HashSet<string>(fixHipRotationAnims2 ?? new List<string>()));
                 clips2.AddRange(nativeClips2);
             }
@@ -729,12 +739,24 @@ namespace GlbMerger
         // repeated every frame) and re-anchors it onto the target's own bone length/resting
         // position, the same technique RetargetFbxClips already uses for Hips' root motion.
         // Deliberately rotation-only-untouched: this only ever writes Translation, never Rotation.
+        //
+        // The re-anchored delta is also SCALED by the ratio between the two rigs' leg lengths.
+        // Hips is the one bone whose translation channel is real motion rather than a static bone
+        // length, and copying that motion over at 1:1 while every limb below it gets rebuilt at
+        // the target's proportions is self-inconsistent: on a rig with legs 86% as long, the
+        // pelvis still travelled the source's full distance, so the legs could no longer reach
+        // far enough to cancel it and the planted foot slid across the ground by the leftover
+        // 14%. Scaling the pelvis' travel by the same factor the limbs were scaled by keeps the
+        // clip internally consistent - a shorter character shifts its weight a proportionally
+        // shorter distance, and the foot it is standing on stays put.
         private static void ApplyBoneLengthCorrection(
             List<AnimationClipData> clips,
             IReadOnlyDictionary<string, Vector3> sourceBindTranslationsByName,
             IReadOnlyDictionary<string, Vector3> targetBindTranslationsByName,
             HashSet<string> enabledClipNames)
         {
+            var motionScale = RigScaleRatio(sourceBindTranslationsByName, targetBindTranslationsByName);
+
             foreach (var clip in clips)
             {
                 if (!enabledClipNames.Contains(clip.Name)) continue;
@@ -747,79 +769,123 @@ namespace GlbMerger
 
                     ch.Translation = ch.Translation.ToDictionary(
                         k => k.Key,
-                        k => tgtBindPos + (k.Value - srcBindPos));
+                        k => tgtBindPos + motionScale * (k.Value - srcBindPos));
                 }
             }
         }
 
-        // Direct children of Hips whose own rotation needs to counter-rotate by the Hips
-        // correction's inverse - see ApplyHipRotationCorrection's own comment for why.
-        private static readonly string[] HipsChildBonesNeedingInverseCorrection = { "Spine02", "LeftUpLeg", "RightUpLeg" };
+        // How much smaller/larger the target rig is than the source, measured down the leg chain
+        // (hip attachment + thigh + shin) - the chain that actually determines how far a foot can
+        // stay planted while the pelvis moves, which is what this ratio is used to keep honest.
+        // Averaged over both legs, and falling back to standing hip height, then to 1 (no
+        // rescale) if a rig doesn't use these joint names at all.
+        private static float RigScaleRatio(
+            IReadOnlyDictionary<string, Vector3> sourceBindTranslationsByName,
+            IReadOnlyDictionary<string, Vector3> targetBindTranslationsByName)
+        {
+            float ChainLength(IReadOnlyDictionary<string, Vector3> binds)
+            {
+                float total = 0f;
+                int counted = 0;
+                foreach (var (upLeg, leg, foot) in LegChains)
+                {
+                    if (!binds.TryGetValue(upLeg, out var u) || !binds.TryGetValue(leg, out var l) || !binds.TryGetValue(foot, out var f))
+                        continue;
+                    total += u.Length() + l.Length() + f.Length();
+                    counted++;
+                }
+                if (counted > 0) return total / counted;
+                return binds.TryGetValue("Hips", out var hips) ? MathF.Abs(hips.Y) : 0f;
+            }
 
-        // Corrects the Hips joint's rotation with a fixed bind-pose delta (targetBind *
-        // inverse(sourceBind), pre-multiplied onto the raw rotation - same pattern as
-        // RetargetFbxClips' own root correction). Deliberately narrow: this app previously tried
-        // applying an equivalent correction to every joint (and later a more sophisticated
-        // world-space chain solve), and both made limb rotations worse, not better - copied raw,
-        // legs and arms already land close to the target rig's own convention. Hips is the
-        // exception: as the root, its own bind-rotation mismatch between two independently
-        // authored rigs (a coordinate-convention/lean difference, not a "different stance" the
-        // way a leg's can be) propagates into how the whole spine/leg attachment reads.
+            var source = ChainLength(sourceBindTranslationsByName);
+            var target = ChainLength(targetBindTranslationsByName);
+            return source > 1e-4f && target > 1e-4f ? target / source : 1f;
+        }
+
+        // Corrects the Hips joint's rotation so the pelvis deforms on the target rig exactly the
+        // way it does on the source rig. Deliberately narrow: this app previously tried applying
+        // an equivalent correction to every joint (and later a more sophisticated world-space
+        // chain solve), and both made limb rotations worse, not better - copied raw, legs and
+        // arms already land close to the target rig's own convention. Hips is the exception: as
+        // the root, its own bind-rotation mismatch between two independently authored rigs (a
+        // coordinate-convention/lean difference, not a "different stance" the way a leg's can be)
+        // propagates into how the whole spine/leg attachment reads.
         //
-        // Because delta pre-multiplies Hips' own rotation, it also pre-multiplies (i.e.
-        // propagates unchanged into) the WORLD rotation of every direct child of Hips - Spine02
-        // and both UpLegs - since a child's world rotation is parentWorld * childLocal, and
-        // parentWorld just picked up an extra `delta` on its left. Their own raw local rotation
-        // was authored assuming Hips' *uncorrected* rotation, so left alone they inherit that
-        // same delta a second time, which is what threw the feet and torso off after fixing Hips
-        // alone. Pre-multiplying their own rotation by delta's inverse cancels that inherited
-        // rotation back out, restoring their world orientation to what it was before Hips was
-        // corrected - only these three bones, since only they're Hips' immediate children.
+        // The correction is POST-multiplied: hipsRaw * (inverse(sourceBind) * targetBind). That
+        // reads as "strip the source rig's bind pose back out of the animated rotation, leaving
+        // the clip's own delta-from-rest, then re-apply that delta on top of the target rig's
+        // bind pose" - which is what retargeting one rig's pose onto another actually means, and
+        // it makes the pelvis's skinning transform match the source's identically on every frame.
         //
-        // Also neutralizes Hips' own YAW drift (facing direction turning over the course of the
-        // clip) once corrected, locking it to the target's own resting facing direction while
-        // leaving the corrected rotation's lean/sway (everything else about it) animating
-        // normally - a swing-twist split around world Y, same technique as Lock In Place's
-        // translation lock but for rotation. This used to live in Lock In Place itself, gated on
-        // that checkbox, but Lock In Place needs to keep working unmodified for same-rig (no
-        // retargeting) copies, where there's no cross-rig yaw mismatch to correct in the first
-        // place - it belongs here, tied to the correction that's actually responsible for it, so
-        // it only ever runs alongside the rest of this correction.
+        // It used to be PRE-multiplied instead (targetBind * inverse(sourceBind) * hipsRaw). Both
+        // forms agree exactly at the bind pose, which is why that was easy to miss, but off the
+        // bind pose the pre-multiplied form applies the bind difference in the wrong frame and
+        // the error grows with how far Hips has rotated: small on an idle, ~130 degrees at the
+        // extremes of a tackle.
+        //
+        // Correcting Hips alone drags its whole subtree along with it: a child's world transform
+        // is parentWorld * childLocal, so every direct child of Hips (the spine root and both
+        // UpLegs) inherits the correction on top of its own raw local rotation, which was
+        // authored against Hips' *uncorrected* rotation. Each of those children therefore gets
+        // the correction's exact inverse folded into its own local rotation, so the whole body
+        // below Hips keeps the world orientation an uncorrected copy would have given it. Because
+        // the correction is a constant applied on Hips' right, its inverse is the same constant
+        // applied on the children's left, and the two cancel exactly on every frame. (The old
+        // pre-multiplied form had no such exact cancellation available: the constant
+        // inverse(delta) it used left a residual that scaled with Hips' rotation, so the legs and
+        // torso swung *with* the hips - the feet slid along under the pelvis and the model
+        // appeared to pivot around its hips instead of staying planted on the ground.)
+        //
+        // Only the children's ROTATION is cancelled, never their translation, even though that
+        // translation is a bone offset expressed in Hips' local frame and so does get swung
+        // around by the correction. That swing is wanted: Fix Bone Length has already replaced
+        // those offsets with the *target* rig's own bind offsets, which are authored in the
+        // target's Hips frame - the very frame the corrected Hips now supplies. Left uncorrected,
+        // Hips holds the source rig's frame and the target's hip/spine attachment offsets get
+        // read in the wrong basis, which planted the two legs at different heights and floated
+        // the model off the ground. The two corrections are only geometrically consistent with
+        // each other when both are on.
+        //
+        // This used to additionally pin Hips' YAW to the target's resting facing direction every
+        // frame (a swing-twist split around world Y), to mop up the facing drift the correction
+        // appeared to introduce. That drift was really the leaked residual described above, and
+        // the pin was a bigger cause of the pivot-around-the-hips problem in its own right:
+        // replacing the clip's own per-frame yaw with a constant turns the whole body under a
+        // pelvis held at a fixed facing, so planted feet get swept around the hip joint. With the
+        // cancellation exact, no yaw reaches the body from this correction and there is nothing
+        // left for a yaw lock to mop up. Lock In Place (which pins translation, not rotation) and
+        // the manual Y Rotation control are unaffected.
         private static void ApplyHipRotationCorrection(
             List<AnimationClipData> clips,
             Quaternion sourceHipsBindRotation,
             Quaternion targetHipsBindRotation,
+            IReadOnlyCollection<string> hipsChildBoneNames,
             HashSet<string> enabledClipNames)
         {
-            var delta = Quaternion.Normalize(Quaternion.Multiply(targetHipsBindRotation, Quaternion.Inverse(sourceHipsBindRotation)));
-            var inverseDelta = Quaternion.Normalize(Quaternion.Inverse(delta));
-            var targetYaw = DecomposeTwist(targetHipsBindRotation, Vector3.UnitY);
+            var bindDelta = Quaternion.Normalize(Quaternion.Multiply(
+                Quaternion.Inverse(sourceHipsBindRotation), targetHipsBindRotation));
+            var inverseBindDelta = Quaternion.Normalize(Quaternion.Inverse(bindDelta));
 
             foreach (var clip in clips)
             {
                 if (!enabledClipNames.Contains(clip.Name)) continue;
 
                 var hipsChannel = clip.NodeChannels.FirstOrDefault(c => c.NodeName == "Hips");
-                if (hipsChannel?.Rotation != null)
-                {
-                    hipsChannel.Rotation = hipsChannel.Rotation.ToDictionary(
-                        k => k.Key,
-                        k =>
-                        {
-                            var corrected = Quaternion.Normalize(Quaternion.Multiply(delta, k.Value));
-                            var swing = DecomposeSwing(corrected, Vector3.UnitY);
-                            return Quaternion.Normalize(Quaternion.Multiply(swing, targetYaw));
-                        });
-                }
+                if (hipsChannel?.Rotation == null) continue;
 
-                foreach (var childBoneName in HipsChildBonesNeedingInverseCorrection)
+                hipsChannel.Rotation = hipsChannel.Rotation.ToDictionary(
+                    k => k.Key,
+                    k => Quaternion.Normalize(Quaternion.Multiply(k.Value, bindDelta)));
+
+                foreach (var childBoneName in hipsChildBoneNames)
                 {
                     var childChannel = clip.NodeChannels.FirstOrDefault(c => c.NodeName == childBoneName);
                     if (childChannel?.Rotation == null) continue;
 
                     childChannel.Rotation = childChannel.Rotation.ToDictionary(
                         k => k.Key,
-                        k => Quaternion.Normalize(Quaternion.Multiply(inverseDelta, k.Value)));
+                        k => Quaternion.Normalize(Quaternion.Multiply(inverseBindDelta, k.Value)));
                 }
             }
         }
@@ -1115,23 +1181,6 @@ namespace GlbMerger
                 k => k.Key,
                 k => new Vector3(k.Value.X, k.Value.Y - deltaY, k.Value.Z));
         }
-
-        // Standard swing-twist split: the component of `q` that's a pure rotation about unit axis
-        // `axis` (twist), found by projecting q's vector part onto that axis, and everything else
-        // (swing - q with that twist divided back out). Used by Lock In Place to isolate Hips'
-        // yaw (twist about world Y) from its lean/sway (swing) so only the yaw gets locked.
-        private static Quaternion DecomposeTwist(Quaternion q, Vector3 axis)
-        {
-            var qv = new Vector3(q.X, q.Y, q.Z);
-            var proj = Vector3.Dot(qv, axis) * axis;
-            var twist = new Quaternion(proj.X, proj.Y, proj.Z, q.W);
-            // Degenerates to a near-zero quaternion when q's rotation angle is at/near 180 degrees
-            // around an axis perpendicular to `axis` - falls back to no twist rather than NaN.
-            return twist.LengthSquared() < 1e-12f ? Quaternion.Identity : Quaternion.Normalize(twist);
-        }
-
-        private static Quaternion DecomposeSwing(Quaternion q, Vector3 axis) =>
-            Quaternion.Normalize(Quaternion.Multiply(q, Quaternion.Inverse(DecomposeTwist(q, axis))));
 
         // Manually turns the whole clip around the world Y axis: the root's horizontal (X/Z)
         // path rotates around its own starting position (so the clip doesn't also drift away from

@@ -67,6 +67,14 @@ namespace GlbMerger
         // every other editor mode and nothing else keeps a copy of the original geometry.
         private List<int[]>? _originalIndices;
 
+        private Button _btnAnalyzeWatertight = null!, _btnApplyWatertight = null!, _btnRevertWatertight = null!;
+
+        // Kept separate from _originalIndices: filling a hole appends vertices, which a plain
+        // index-buffer snapshot can't undo, so this carries full vertex accessor contents for
+        // whatever primitives a fill actually touched. Each button pair here manages its own
+        // single-level revert, same as every other editor mode.
+        private WatertightRepair.Snapshot? _watertightSnapshot;
+
         public GeometryOptimizerEditor(ModelRoot model, bool darkMode = false)
         {
             _model = model;
@@ -235,6 +243,39 @@ namespace GlbMerger
                 "Optimizing rewrites triangles only, so vertices the result no longer references - " +
                 "and the index buffer each pass replaces - stay in the model, and it can grow rather " +
                 "than shrink. Saving offers to rebuild and drop both."));
+
+            flow.Controls.Add(new Label
+            {
+                Text = "Make Watertight",
+                AutoSize = true,
+                Margin = new Padding(3, 8, 3, 4),
+            });
+
+            flow.Controls.Add(HelpText(
+                "Finds open holes - boundary edges with no triangle on the other side - and caps " +
+                "each one with a new triangle fan. Boundaries shared between two parts of this " +
+                "mesh (a material or UV seam) are recognized and left alone, not capped. A hole " +
+                "that's meant to stay open, like a mouth interior, will get capped too since there's " +
+                "no way to tell intent from geometry alone - revert if that happens."));
+
+            flow.Controls.Add(HelpText(
+                "When the material has a texture, caps look for an unused, blank-looking patch of " +
+                "it and sample the fill from there, so the cap reads as a plain, unremarkable " +
+                "surface instead of a smear across unrelated texture. Where no such patch exists, " +
+                "the cap falls back to blending the hole's own edge colors."));
+
+            _btnAnalyzeWatertight = MakeButton("Analyze Holes (dry run)");
+            _btnAnalyzeWatertight.Click += async (s, e) => await RunWatertightAsync(apply: false);
+            flow.Controls.Add(_btnAnalyzeWatertight);
+
+            _btnApplyWatertight = MakeButton("Fill Holes");
+            _btnApplyWatertight.Click += async (s, e) => await RunWatertightAsync(apply: true);
+            flow.Controls.Add(_btnApplyWatertight);
+
+            _btnRevertWatertight = MakeButton("Revert Watertight Fill");
+            _btnRevertWatertight.Enabled = false;
+            _btnRevertWatertight.Click += (s, e) => RevertWatertight();
+            flow.Controls.Add(_btnRevertWatertight);
 
             _chkWireframe = new CheckBox { Text = "Wireframe preview", AutoSize = true, Margin = new Padding(3, 8, 3, 0) };
             _chkWireframe.CheckedChanged += (s, e) => PushWireframe();
@@ -432,6 +473,68 @@ namespace GlbMerger
             ReloadPreview();
         }
 
+        private async Task RunWatertightAsync(bool apply)
+        {
+            SetBusy(true, apply ? "Filling holes..." : "Analyzing holes...");
+
+            WatertightRepair.Report report;
+            try
+            {
+                report = await Task.Run(() => WatertightRepair.Analyze(_model));
+            }
+            catch (Exception ex)
+            {
+                SetBusy(false, null);
+                MessageBox.Show(this, $"Hole analysis failed: {ex.Message}",
+                    "Optimize Geometry", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            if (IsDisposed) return;
+
+            if (!report.HasChanges)
+            {
+                SetBusy(false, report.HolesFound == 0 && report.UnresolvedEdges == 0
+                    ? "No open holes found - this model is already watertight."
+                    : $"Found {report.UnresolvedEdges} boundary edge(s) that couldn't be resolved into simple loops - nothing else to fill.");
+                return;
+            }
+
+            string summary = $"Found {report.HolesFound:N0} hole(s): {report.TrianglesAdded:N0} triangle(s) and " +
+                $"{report.VerticesAdded:N0} vertex/vertices would be added." +
+                (report.PrimitivesUsingTexturePatch > 0
+                    ? $" {report.PrimitivesUsingTexturePatch} mesh part(s) will texture their cap from a found blank spot in the atlas."
+                    : "") +
+                (report.UnresolvedEdges > 0 ? $" {report.UnresolvedEdges} boundary edge(s) left unresolved." : "");
+
+            if (!apply)
+            {
+                SetBusy(false, summary + " Nothing changed yet.");
+                return;
+            }
+
+            _watertightSnapshot ??= WatertightRepair.TakeSnapshot(report, _model);
+            WatertightRepair.Apply(report, _model);
+            _btnRevertWatertight.Enabled = true;
+
+            SetBusy(false, summary + " Included the next time you save the merge.");
+            ShowBaseline();
+            ReloadPreview();
+        }
+
+        private void RevertWatertight()
+        {
+            if (_watertightSnapshot == null) return;
+
+            WatertightRepair.Restore(_model, _watertightSnapshot);
+            _watertightSnapshot = null;
+            _btnRevertWatertight.Enabled = false;
+
+            ShowBaseline();
+            _lblStatus.Text = "Watertight fill reverted to the original merge result.";
+            ReloadPreview();
+        }
+
         private void FillGrid(GeometryOptimizer.Report report)
         {
             _grid.Rows.Clear();
@@ -458,6 +561,8 @@ namespace GlbMerger
         {
             _btnAnalyze.Enabled = !busy;
             _btnApply.Enabled = !busy;
+            _btnAnalyzeWatertight.Enabled = !busy;
+            _btnApplyWatertight.Enabled = !busy;
             Cursor = busy ? Cursors.WaitCursor : Cursors.Default;
             if (status != null) _lblStatus.Text = status;
         }
