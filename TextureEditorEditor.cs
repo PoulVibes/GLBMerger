@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Globalization;
@@ -50,6 +50,9 @@ namespace GlbMerger
 
         private NumericUpDown _numIslandPadding = null!;
         private Button _btnPreviewPad = null!, _btnApplyPad = null!, _btnApplyPadAll = null!;
+
+        private NumericUpDown _numOverdrawThreshold = null!;
+        private Button _btnOptimizeLayout = null!;
 
         // Original bytes for whichever images Apply has touched this session, so Revert can put
         // them back - the model is shared with every other editor mode, same pattern as
@@ -275,6 +278,41 @@ namespace GlbMerger
             _btnApplyPadAll.Click += async (s, e) => await RunPaddingAllAsync();
             flow.Controls.Add(_btnApplyPadAll);
 
+            flow.Controls.Add(new Label
+            {
+                Text = "Optimize Asset Layout (meshoptimizer)",
+                AutoSize = true,
+                Margin = new Padding(3, 8, 3, 4),
+            });
+
+            flow.Controls.Add(HelpText(
+                "Reorders triangles and vertex records into the order the GPU reads them, without " +
+                "changing a single pixel or vertex position. Two of the three passes pay off in " +
+                "texturing specifically: front-to-back triangle clustering lets early-Z throw away " +
+                "hidden fragments before their texture fetches are paid for, and reordering vertex " +
+                "records puts each triangle's UVs next to the ones sampled beside it instead of " +
+                "scattered across the buffer. Unlike the two tools above, this works on the whole " +
+                "model at once rather than the selected texture."));
+
+            var overdrawRow = LabeledNumeric("Overdraw threshold:", out _numOverdrawThreshold, 1.0m, 3.0m, 1.05m, 2);
+            _numOverdrawThreshold.Increment = 0.01m;   // LabeledNumeric's 0.5 step overshoots the useful 1.00-1.20 range
+            flow.Controls.Add(overdrawRow);
+            flow.Controls.Add(HelpText(
+                "How much vertex-cache efficiency the front-to-back pass may trade away to get " +
+                "there. 1.00 forbids the trade entirely; 1.05 allows 5% and is the usual choice. " +
+                "The trade is only taken where it pays: overdraw is measured before and after, and " +
+                "a mesh with little overdraw to begin with - anything convex and single-layered - " +
+                "keeps its cache ordering instead."));
+
+            _btnOptimizeLayout = MakeButton("Optimize Layout for Whole Model");
+            _btnOptimizeLayout.Click += async (s, e) => await RunLayoutOptimizeAsync();
+            flow.Controls.Add(_btnOptimizeLayout);
+
+            flow.Controls.Add(HelpText(
+                "There is no Revert for this one - it rewrites geometry for every mesh in the " +
+                "model, so re-merge if you want it undone. It is a pure reordering, so the render " +
+                "is unchanged either way."));
+
             _lblStatus = new Label
             {
                 AutoSize = true, MaximumSize = new Size(300, 0),
@@ -404,6 +442,11 @@ namespace GlbMerger
             _btnPreviewPad.Enabled = enabled;
             _btnApplyPad.Enabled = enabled;
             _btnApplyPadAll.Enabled = enabled;
+
+            // Deliberately not gated on `enabled`: that flag tracks whether the model has any
+            // albedo texture to edit, and layout optimization works on geometry regardless.
+            _numOverdrawThreshold.Enabled = MeshoptNative.IsAvailable;
+            _btnOptimizeLayout.Enabled = MeshoptNative.IsAvailable;
         }
 
         private TextureLineThinner.Options CurrentOptions(
@@ -640,6 +683,7 @@ namespace GlbMerger
             _btnPreviewPad.Enabled = !busy;
             _btnApplyPad.Enabled = !busy;
             _btnApplyPadAll.Enabled = !busy;
+            _btnOptimizeLayout.Enabled = !busy && MeshoptNative.IsAvailable;
             Cursor = busy ? Cursors.WaitCursor : Cursors.Default;
             if (status != null) _lblStatus.Text = status;
         }
@@ -736,6 +780,92 @@ namespace GlbMerger
             RefreshBeforeViewer();
             SetBusy(false, $"Applied to {_targets.Count} texture(s): {totalPadded:N0} gutter texels padded in total. " +
                 "Included the next time you save the merge.");
+        }
+
+        // Whole-model, one shot, no undo - see MeshLayoutOptimizer for what the three passes do
+        // and why BLEND materials only get two of them.
+        private async Task RunLayoutOptimizeAsync()
+        {
+            if (!MeshoptNative.IsAvailable)
+            {
+                MessageBox.Show(this,
+                    "The meshoptimizer native library could not be loaded, so layout optimization " +
+                    "is unavailable.",
+                    "Optimize Asset Layout", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            var confirm = MessageBox.Show(this,
+                "Reorder triangles and vertex records across every mesh in the model?" +
+                Environment.NewLine + Environment.NewLine +
+                "This does not change how the model looks, but there is no Revert for it - the " +
+                "other tools in this editor keep a per-texture original, and this one rewrites " +
+                "geometry model-wide.",
+                "Optimize Asset Layout", MessageBoxButtons.OKCancel, MessageBoxIcon.Question);
+            if (confirm != DialogResult.OK) return;
+
+            SetBusy(true, "Optimizing asset layout...");
+
+            var options = new MeshLayoutOptimizer.Options
+            {
+                OverdrawThreshold = (float)_numOverdrawThreshold.Value,
+            };
+
+            MeshLayoutOptimizer.Report report;
+            try
+            {
+                report = await Task.Run(() => MeshLayoutOptimizer.Optimize(_model, options));
+            }
+            catch (Exception ex)
+            {
+                SetBusy(false, null);
+                MessageBox.Show(this, $"Layout optimization failed: {ex.Message}",
+                    "Optimize Asset Layout", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            if (IsDisposed) return;
+
+            if (!report.ChangedAnything)
+            {
+                SetBusy(false, "Nothing to optimize - no triangle primitive in this model qualified.");
+                return;
+            }
+
+            // Both panes show the same committed model again: the geometry under every texture just
+            // moved, and no uncommitted texture preview survives that.
+            _lastPreviewBytes = null;
+            _lastPreviewImageIndex = -1;
+            RefreshBeforeViewer();
+            ResetAfterViewerToBefore();
+
+            // Both metrics, always: the two passes pull ACMR in opposite directions, so a bare
+            // before/after on it alone makes a correct trade read as a regression.
+            var summary = $"Optimized {report.PrimitivesOptimized:N0} primitive(s): " +
+                $"{report.TrianglesReordered:N0} triangles, {report.VerticesReordered:N0} vertices reordered." +
+                Environment.NewLine +
+                $"Vertex cache (ACMR, lower is better): {report.AcmrBefore:0.000} -> {report.AcmrAfter:0.000}" +
+                Environment.NewLine +
+                $"Overdraw (lower is better): {report.OverdrawBefore:0.000} -> {report.OverdrawAfter:0.000}";
+
+            if (report.AcmrAfter > report.AcmrAfterCache + 0.0005)
+                summary += Environment.NewLine +
+                    $"Cache alone reached {report.AcmrAfterCache:0.000}; the front-to-back pass gave " +
+                    $"{report.AcmrAfter - report.AcmrAfterCache:0.000} of that back to cut overdraw.";
+
+            if (report.OverdrawPassRejected > 0)
+                summary += Environment.NewLine +
+                    $"{report.OverdrawPassRejected:N0} primitive(s) had too little overdraw for the " +
+                    "front-to-back pass to be worth its cache cost, so the cache ordering was kept.";
+
+            if (report.VerticesDropped > 0)
+                summary += $" {report.VerticesDropped:N0} unreferenced vertex/vertices dropped.";
+            if (report.PrimitivesKeptInDrawOrder > 0)
+                summary += $" {report.PrimitivesKeptInDrawOrder:N0} blended primitive(s) kept in draw order.";
+            if (report.PrimitivesSkipped > 0)
+                summary += $" {report.PrimitivesSkipped:N0} primitive(s) skipped.";
+
+            SetBusy(false, summary + " Included the next time you save the merge.");
         }
 
         // --- 3D quadrant / paint tool ------------------------------------------------------------

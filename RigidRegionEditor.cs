@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Globalization;
@@ -43,6 +43,8 @@ namespace GlbMerger
         private TrackBar _sliderBrush = null!;
         private Label _lblBrush = null!, _lblSelection = null!, _lblStatus = null!;
         private Button _btnClearSelection = null!, _btnApply = null!, _btnRevert = null!;
+        private Button _btnRemoveRigidity = null!, _btnColorize = null!;
+        private CheckBox _chkWireframe = null!;
         private NumericUpDown _numFeatherRings = null!;
         private ComboBox _animDropdown = null!;
         private CheckBox _chkPlaying = null!;
@@ -62,6 +64,13 @@ namespace GlbMerger
         private string _currentPaintFileName = "";
         private bool _viewerReady;
         private bool _hasSkins;
+        private bool _rigidityColors;
+
+        // The Paint pane's hit-test copy is loaded once and kept - but the rigidity colouring is
+        // computed from that copy's skin weights, which an Apply/Remove/Revert has just made out
+        // of date. Nothing else over there reads them, so the re-read is deferred until the
+        // colouring is actually on screen rather than paid for on every edit.
+        private bool _paintGeometryStale;
 
         public RigidRegionEditor(ModelRoot model, bool darkMode = false)
         {
@@ -137,6 +146,23 @@ namespace GlbMerger
             flow.Controls.Add(_lblBrush);
             flow.Controls.Add(_sliderBrush);
 
+            _chkWireframe = new CheckBox { Text = "Wireframe", AutoSize = true, Margin = new Padding(3, 0, 3, 2) };
+            _chkWireframe.CheckedChanged += (s, e) => PushWireframe();
+            flow.Controls.Add(_chkWireframe);
+            flow.Controls.Add(HelpText(
+                "Draws the triangle edges over the Paint view - useful for seeing how dense the " +
+                "mesh actually is under the brush, and how far a feather ring of a given width " +
+                "will really reach."));
+
+            _btnColorize = MakeButton("Colorize by Rigidity");
+            _btnColorize.Click += (s, e) => ToggleRigidityColors();
+            flow.Controls.Add(_btnColorize);
+            flow.Controls.Add(HelpText(
+                "Shades the Paint view by how rigidly each vertex is already bound: green where a " +
+                "single bone owns it outright (nothing painted there can shear), through yellow, " +
+                "to red where the weight is split evenly across four bones - the areas most likely " +
+                "to skew, and the ones worth painting. Regions you Apply turn green."));
+
             _btnClearSelection = MakeButton("Clear Selection");
             _btnClearSelection.Click += (s, e) => ClearSelection();
             flow.Controls.Add(_btnClearSelection);
@@ -161,6 +187,17 @@ namespace GlbMerger
             _btnApply = MakeButton("Apply");
             _btnApply.Click += async (s, e) => await ApplyAsync();
             flow.Controls.Add(_btnApply);
+
+            _btnRemoveRigidity = MakeButton("Remove Rigidity from Painted Faces");
+            _btnRemoveRigidity.Enabled = false;
+            _btnRemoveRigidity.Click += async (s, e) => await RemovePaintedRigidityAsync();
+            flow.Controls.Add(_btnRemoveRigidity);
+            flow.Controls.Add(HelpText(
+                "Un-pins just the faces painted right now, putting their original skin weights " +
+                "back and leaving the rest of what you applied alone - paint over the part that " +
+                "got pinned too far and take only that back. Feather width applies here too: the " +
+                "painted core goes fully back to original and the rings ease into whatever pinning " +
+                "survives around them, so the cut doesn't leave a crease."));
 
             _btnRevert = MakeButton("Revert All Rigid Regions");
             _btnRevert.Enabled = false;
@@ -276,6 +313,7 @@ namespace GlbMerger
             _boneDropdown.Enabled = enabled;
             _chkPaintMode.Enabled = enabled;
             _sliderBrush.Enabled = enabled;
+            _btnColorize.Enabled = enabled;
             _btnClearSelection.Enabled = enabled;
             _numFeatherRings.Enabled = enabled;
             _btnApply.Enabled = enabled;
@@ -353,6 +391,43 @@ namespace GlbMerger
             return (new Vector4(j[0], j[1], j[2], j[3]), new Vector4(w[0], w[1], w[2], w[3]));
         }
 
+        // Blends a vertex's CURRENT skin weights back toward the originals it had before any
+        // Apply touched it, by factor t (1 = fully original, 0 = leave the pinning as it is).
+        // Joint INDICES can't be interpolated, so the two sets are merged in weight space
+        // instead: each side contributes its share, entries naming the same joint are summed,
+        // and the four heaviest survive - the same drop-the-smallest-and-renormalize rule
+        // ComputeRigidBlend uses to fit back into glTF's four slots.
+        private static (Vector4 Joints, Vector4 Weights) BlendTowardOriginal(
+            Vector4 curJoints, Vector4 curWeights, Vector4 origJoints, Vector4 origWeights, float t)
+        {
+            var merged = new Dictionary<int, float>();
+            void Add(Vector4 j, Vector4 w, float scale)
+            {
+                void One(float joint, float weight)
+                {
+                    if (weight <= 0f) return;
+                    int idx = (int)joint;
+                    merged[idx] = merged.TryGetValue(idx, out var existing) ? existing + weight * scale : weight * scale;
+                }
+                One(j.X, w.X); One(j.Y, w.Y); One(j.Z, w.Z); One(j.W, w.W);
+            }
+            Add(origJoints, origWeights, t);
+            Add(curJoints, curWeights, 1f - t);
+
+            var top = merged.OrderByDescending(kv => kv.Value).Take(4).ToList();
+            float sum = top.Sum(kv => kv.Value);
+            if (top.Count == 0 || sum < 1e-6f) return (origJoints, origWeights);
+
+            var j2 = new float[4];
+            var w2 = new float[4];
+            for (int i = 0; i < top.Count; i++)
+            {
+                j2[i] = top[i].Key;
+                w2[i] = top[i].Value / sum;
+            }
+            return (new Vector4(j2[0], j2[1], j2[2], j2[3]), new Vector4(w2[0], w2[1], w2[2], w2[3]));
+        }
+
         private Skin? FindSkinForMesh(SharpGLTF.Schema2.Mesh mesh)
         {
             foreach (var node in _model.LogicalNodes)
@@ -396,14 +471,52 @@ namespace GlbMerger
                 touchedVerts += ApplyRigidRegionToMesh(mesh, meshIdx, selection, chosenJoint, maxRings, ref skippedPrims);
             }
 
-            _btnRevert.Enabled = _originalSkin.Count > 0;
-            RefreshPreviewViewer();
+            RefreshAfterSkinEdit();
 
             _lblStatus.Text = touchedVerts > 0
                 ? $"Applied: {touchedVerts:N0} vertex weight(s) pinned to '{boneName}'" +
                   (skippedPrims > 0 ? $" ({skippedPrims} painted primitive(s) skipped - no matching skin/bone)." : ".") +
                   " Included the next time you save."
                 : "Nothing applied - the painted primitive(s) have no skin, or that bone isn't part of it.";
+        }
+
+        // The local counterpart to Revert All: instead of unwinding every region this session
+        // has pinned, it takes back only what is under the paint right now, so an Apply that
+        // reached further than it should can be trimmed rather than redone from scratch.
+        private async Task RemovePaintedRigidityAsync()
+        {
+            if (!_hasSkins) return;
+            if (_originalSkin.Count == 0)
+            {
+                _lblStatus.Text = "Nothing to remove - no region has been pinned in this session.";
+                return;
+            }
+
+            var selection = await ReadSelectionAsync();
+            if (IsDisposed) return;
+            if (selection == null || selection.Count == 0)
+            {
+                _lblStatus.Text = "Nothing painted - paint over the faces you want un-pinned first.";
+                return;
+            }
+
+            int maxRings = (int)_numFeatherRings.Value;
+            int restoredVerts = 0, skippedPrims = 0;
+
+            foreach (int meshIdx in selection.Keys.Select(k => k.MeshIndex).Distinct())
+            {
+                if (meshIdx < 0 || meshIdx >= _model.LogicalMeshes.Count) { skippedPrims++; continue; }
+                restoredVerts += RemoveRigidityFromMesh(
+                    _model.LogicalMeshes[meshIdx], meshIdx, selection, maxRings, ref skippedPrims);
+            }
+
+            RefreshAfterSkinEdit();
+
+            _lblStatus.Text = restoredVerts > 0
+                ? $"Removed: {restoredVerts:N0} vertex weight(s) restored to their original values" +
+                  (skippedPrims > 0 ? $" ({skippedPrims} painted primitive(s) skipped - no skin data)." : ".") +
+                  " Included the next time you save."
+                : "Nothing removed - the painted faces were never pinned in this session.";
         }
 
         // A jersey-number-style paint almost always sits on its own UV island, which means the
@@ -418,10 +531,10 @@ namespace GlbMerger
         // vertex" before running the ring BFS is what lets the feather actually cross the seam -
         // both copies of a seam vertex always land in the same ring, get the same blend factor,
         // and so stay coincident as the bone moves instead of tearing apart.
-        private int ApplyRigidRegionToMesh(
+        private PaintedRegion? BuildPaintedRegion(
             SharpGLTF.Schema2.Mesh mesh, int meshIdx,
             Dictionary<(int MeshIndex, int PrimitiveIndex), HashSet<int>> selection,
-            int chosenJoint, int maxRings, ref int skippedPrims)
+            int maxRings)
         {
             var prims = new List<(int PrimIndex, Accessor Joints, Accessor Weights,
                 IList<Vector3> Positions, List<(int A, int B, int C)> Triangles)>();
@@ -433,12 +546,12 @@ namespace GlbMerger
                 if (!prim.VertexAccessors.TryGetValue("POSITION", out var pAcc)) continue;
                 prims.Add((primIdx, jAcc, wAcc, pAcc.AsVector3Array(), prim.GetTriangleIndices().ToList()));
             }
-            if (prims.Count == 0) { skippedPrims++; return 0; }
+            if (prims.Count == 0) return null;
 
             var offsets = new int[prims.Count];
             int total = 0;
             for (int i = 0; i < prims.Count; i++) { offsets[i] = total; total += prims[i].Positions.Count; }
-            if (total == 0) return 0;
+            if (total == 0) return null;
 
             var dsu = new DisjointSet(total);
 
@@ -526,17 +639,47 @@ namespace GlbMerger
                 frontier = next;
             }
 
-            int touched = 0;
-            for (int i = 0; i < prims.Count; i++)
+            return new PaintedRegion(prims, offsets, dsu, level);
+        }
+
+        // The painted patch resolved against one mesh: the primitives that carry skin data, the
+        // running offsets that let (primitive, vertex) be addressed as one flat index space, the
+        // union-find that bridged the UV seams, and the ring level every logical vertex the paint
+        // reached ended up on. Both Apply and Remove walk exactly this - they differ only in what
+        // they write into the weights once a vertex's feather factor is in hand.
+        private sealed record PaintedRegion(
+            List<(int PrimIndex, Accessor Joints, Accessor Weights,
+                IList<Vector3> Positions, List<(int A, int B, int C)> Triangles)> Prims,
+            int[] Offsets,
+            DisjointSet Dsu,
+            Dictionary<int, int> Level)
+        {
+            // 1 at the painted core, tapering across the feather rings, 0 for anything the paint
+            // never reached (which callers skip entirely).
+            public float FeatherAt(int primSlot, int vertex, int maxRings)
             {
-                var (primIdx, jointsAcc, weightsAcc, positions, _) = prims[i];
+                int root = Dsu.Find(Offsets[primSlot] + vertex);
+                return Level.TryGetValue(root, out int lvl) ? FeatherFactor(lvl, maxRings) : 0f;
+            }
+        }
+
+        private int ApplyRigidRegionToMesh(
+            SharpGLTF.Schema2.Mesh mesh, int meshIdx,
+            Dictionary<(int MeshIndex, int PrimitiveIndex), HashSet<int>> selection,
+            int chosenJoint, int maxRings, ref int skippedPrims)
+        {
+            var region = BuildPaintedRegion(mesh, meshIdx, selection, maxRings);
+            if (region == null) { skippedPrims++; return 0; }
+
+            int touched = 0;
+            for (int i = 0; i < region.Prims.Count; i++)
+            {
+                var (_, jointsAcc, weightsAcc, positions, _) = region.Prims[i];
                 IList<Vector4>? joints = null, weights = null;
 
                 for (int v = 0; v < positions.Count; v++)
                 {
-                    int root = dsu.Find(offsets[i] + v);
-                    if (!level.TryGetValue(root, out var lvl)) continue;
-                    float f = FeatherFactor(lvl, maxRings);
+                    float f = region.FeatherAt(i, v, maxRings);
                     if (f <= 0f) continue;
 
                     joints ??= jointsAcc.AsVector4Array();
@@ -546,6 +689,47 @@ namespace GlbMerger
                         _originalSkin[jointsAcc] = (weightsAcc, joints.ToArray(), weights.ToArray());
 
                     var (nj, nw) = ComputeRigidBlend(joints[v], weights[v], chosenJoint, f);
+                    joints[v] = nj;
+                    weights[v] = nw;
+                    touched++;
+                }
+            }
+            return touched;
+        }
+
+        // Apply in reverse, over the same seam-bridged region and the same feather taper, writing
+        // the snapshot back instead of pinning: the painted core returns to exactly the weights it
+        // had before the first Apply, and the rings land part-way so the boundary between what was
+        // taken back and what is still pinned is as gradual as the boundary Apply itself makes.
+        // A primitive with no snapshot was never pinned here, so there is nothing to give back -
+        // it is left alone rather than counted as skipped.
+        private int RemoveRigidityFromMesh(
+            SharpGLTF.Schema2.Mesh mesh, int meshIdx,
+            Dictionary<(int MeshIndex, int PrimitiveIndex), HashSet<int>> selection,
+            int maxRings, ref int skippedPrims)
+        {
+            var region = BuildPaintedRegion(mesh, meshIdx, selection, maxRings);
+            if (region == null) { skippedPrims++; return 0; }
+
+            int touched = 0;
+            for (int i = 0; i < region.Prims.Count; i++)
+            {
+                var (_, jointsAcc, weightsAcc, positions, _) = region.Prims[i];
+                if (!_originalSkin.TryGetValue(jointsAcc, out var snapshot)) continue;
+
+                IList<Vector4>? joints = null, weights = null;
+
+                for (int v = 0; v < positions.Count; v++)
+                {
+                    if (v >= snapshot.OrigJoints.Length) break;
+                    float f = region.FeatherAt(i, v, maxRings);
+                    if (f <= 0f) continue;
+
+                    joints ??= jointsAcc.AsVector4Array();
+                    weights ??= weightsAcc.AsVector4Array();
+
+                    var (nj, nw) = BlendTowardOriginal(
+                        joints[v], weights[v], snapshot.OrigJoints[v], snapshot.OrigWeights[v], f);
                     joints[v] = nj;
                     weights[v] = nw;
                     touched++;
@@ -601,9 +785,8 @@ namespace GlbMerger
                 }
             }
             _originalSkin.Clear();
-            _btnRevert.Enabled = false;
 
-            RefreshPreviewViewer();
+            RefreshAfterSkinEdit();
             _lblStatus.Text = "Reverted - all painted regions are back to their original skin weights.";
         }
 
@@ -759,6 +942,8 @@ namespace GlbMerger
                     var paintMode = false;
                     var painting = false;
                     var brushFraction = 0.05;
+                    var wireframe = false;
+                    var rigidityColorsEnabled = false;
                     var brushRadius = 0.05;
                     var modelMaxDim = 1;
 
@@ -812,6 +997,115 @@ namespace GlbMerger
                             depthMaskGroup.add(maskMesh);
                         });
                     }
+
+                    // --- Wireframe -------------------------------------------------------------
+                    // Same approach as GeometryOptimizerEditor's wireframe toggle (see that file
+                    // for the fuller rationale): drawn from the same hit-test geometry everything
+                    // else here uses, and only built while switched on since WireframeGeometry
+                    // expands to six vertices per triangle.
+                    var wireframeMaterial = new THREE.LineBasicMaterial({
+                        color: 0x8ab4f8, transparent: true, opacity: 0.55, depthTest: true,
+                    });
+                    var wireframeGroup = new THREE.Group();
+                    overlayScene.add(wireframeGroup);
+
+                    function rebuildWireframe() {
+                        for (var i = wireframeGroup.children.length - 1; i >= 0; i--) {
+                            var old = wireframeGroup.children[i];
+                            wireframeGroup.remove(old);
+                            old.geometry.dispose();
+                        }
+                        if (!wireframe) return;
+                        paintableMeshes.forEach(function (meshInfo) {
+                            var lines = new THREE.LineSegments(
+                                new THREE.WireframeGeometry(meshInfo.object.geometry), wireframeMaterial);
+                            lines.matrixAutoUpdate = false;
+                            lines.matrix.copy(meshInfo.object.matrixWorld);
+                            wireframeGroup.add(lines);
+                        });
+                    }
+
+                    window.setWireframe = function (enabled) {
+                        wireframe = enabled;
+                        rebuildWireframe();
+                    };
+                    // --- end wireframe -----------------------------------------------------------
+
+                    // --- Rigidity colouring ------------------------------------------------------
+                    // Paints the hit-test copy green-to-red by how rigidly each vertex is already
+                    // bound, so it's obvious at a glance which areas are worth painting a region
+                    // over. The metric is the vertex's single heaviest skin weight: 1.0 means one
+                    // bone owns the vertex outright (already rigid - can't shear from blending,
+                    // whatever RigidRegionEditor's own Apply would also produce), 0.25 means it's
+                    // split evenly across all four slots (the worst case for shearing). Unskinned
+                    // geometry has no blending to shear from in the first place, so it's treated as
+                    // fully rigid (green) rather than left uncoloured.
+                    // Drawn as an opaque overlay pulled toward the camera with the same
+                    // polygonOffset trick the paint-selection highlight uses, rather than swapping
+                    // the real material - so turning it off needs no material bookkeeping on the
+                    // model itself.
+                    var rigidityColorMaterial = new THREE.MeshBasicMaterial({
+                        vertexColors: true, side: THREE.DoubleSide,
+                        polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1,
+                        skinning: true,
+                    });
+                    var rigidityColorGroup = new THREE.Group();
+                    rigidityColorGroup.visible = false;
+                    overlayScene.add(rigidityColorGroup);
+
+                    var RIGIDITY_RED = new THREE.Color(0xe04030);
+                    var RIGIDITY_YELLOW = new THREE.Color(0xe0c020);
+                    var RIGIDITY_GREEN = new THREE.Color(0x30c040);
+                    var _rigidityTmp = new THREE.Color();
+
+                    function rigidityColorFor(maxWeight) {
+                        var t = THREE.MathUtils.clamp((maxWeight - 0.25) / 0.75, 0, 1);
+                        return t < 0.5
+                            ? _rigidityTmp.copy(RIGIDITY_RED).lerp(RIGIDITY_YELLOW, t / 0.5)
+                            : _rigidityTmp.copy(RIGIDITY_YELLOW).lerp(RIGIDITY_GREEN, (t - 0.5) / 0.5);
+                    }
+
+                    function rebuildRigidityColors() {
+                        for (var i = rigidityColorGroup.children.length - 1; i >= 0; i--) {
+                            var old = rigidityColorGroup.children[i];
+                            rigidityColorGroup.remove(old);
+                            old.geometry.dispose();
+                        }
+                        if (!rigidityColorsEnabled) return;
+                        paintableMeshes.forEach(function (meshInfo) {
+                            var srcGeom = meshInfo.object.geometry;
+                            var vertexCount = srcGeom.attributes.position.count;
+                            var skinWeight = srcGeom.attributes.skinWeight;
+                            var colors = new Float32Array(vertexCount * 3);
+                            for (var v = 0; v < vertexCount; v++) {
+                                var maxWeight = 1;
+                                if (skinWeight) {
+                                    maxWeight = Math.max(
+                                        skinWeight.getX(v), skinWeight.getY(v),
+                                        skinWeight.getZ(v), skinWeight.getW(v));
+                                }
+                                var c = rigidityColorFor(maxWeight);
+                                colors[v * 3] = c.r; colors[v * 3 + 1] = c.g; colors[v * 3 + 2] = c.b;
+                            }
+                            var coloredGeom = new THREE.BufferGeometry();
+                            coloredGeom.setAttribute('position', srcGeom.attributes.position);
+                            coloredGeom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+                            if (meshInfo.object.isSkinnedMesh) {
+                                coloredGeom.setAttribute('skinIndex', srcGeom.attributes.skinIndex);
+                                coloredGeom.setAttribute('skinWeight', srcGeom.attributes.skinWeight);
+                            }
+                            coloredGeom.setIndex(srcGeom.index);
+                            var coloredMesh = makeSkinnedCopy(meshInfo.object, coloredGeom, rigidityColorMaterial);
+                            rigidityColorGroup.add(coloredMesh);
+                        });
+                    }
+
+                    window.setRigidityColors = function (enabled) {
+                        rigidityColorsEnabled = enabled;
+                        rebuildRigidityColors();
+                        rigidityColorGroup.visible = enabled;
+                    };
+                    // --- end rigidity colouring ---------------------------------------------------
 
                     var brushDecalMaterial = new THREE.ShaderMaterial({
                         uniforms: {
@@ -1176,6 +1470,8 @@ namespace GlbMerger
                             rebuildDepthMask();
                             rebuildBrushDecal();
                             rebuildOverlay();
+                            rebuildWireframe();
+                            rebuildRigidityColors();
 
                             var box = new THREE.Box3().setFromObject(gltf.scene);
                             var size = box.getSize(new THREE.Vector3());
@@ -1185,6 +1481,17 @@ namespace GlbMerger
                             console.error('Failed to load paint hit-test geometry: ' + (error && error.message ? error.message : error));
                         });
                     }
+
+                    // Called after .NET rewrites skin weights (Apply / Remove Rigidity / Revert)
+                    // and hands back a freshly written GLB - reloads just the hit-test copy this
+                    // paint tool (and the rigidity colouring) runs against. The visible <model-
+                    // viewer> pane is deliberately left alone: bind pose looks identical before and
+                    // after a skin-weight edit, so there is nothing there to refresh, and the
+                    // painted selection - recorded by triangle index, which a skin-weight edit
+                    // never changes - stays valid across the reload.
+                    window.reloadPaintGeometry = function (url) {
+                        loadHitTestGeometry(url);
+                    };
 
                     paintViewer.addEventListener('load', function (e) {
                         fixMaterials(e.target);
@@ -1257,6 +1564,36 @@ namespace GlbMerger
             PushSrc("setPreviewSrc", fileName);
         }
 
+        // Re-syncs both 3D panes after any skin-weight edit, and re-derives which of the two
+        // un-pinning buttons have anything left to act on.
+        private void RefreshAfterSkinEdit()
+        {
+            _btnRevert.Enabled = _originalSkin.Count > 0;
+            _btnRemoveRigidity.Enabled = _originalSkin.Count > 0;
+
+            _paintGeometryStale = true;
+            if (_rigidityColors) RefreshPaintGeometry();
+
+            RefreshPreviewViewer();
+        }
+
+        // Re-reads the Paint pane's hit-test copy from the model's current state. The pane's
+        // <model-viewer> deliberately keeps showing the GLB it loaded at startup (a skin-weight
+        // edit doesn't move the bind pose, so there is nothing new to see there) - it is the
+        // hit-test copy alone that has to catch up, because the rigidity colouring is computed
+        // from its JOINTS_0/WEIGHTS_0. Those two accessors are also the ONLY thing an edit here
+        // ever rewrites, so triangle indexing is untouched and the paint selection stays valid
+        // across the reload.
+        private void RefreshPaintGeometry()
+        {
+            if (!_viewerReady || _webView.CoreWebView2 == null) return;
+
+            _currentPaintFileName = WriteTaggedGlbFile(_model, ref _paintGlbPath);
+            _paintGeometryStale = false;
+            _ = _webView.CoreWebView2.ExecuteScriptAsync(
+                $"reloadPaintGeometry('https://appassets.local/{EscapeJs(_currentPaintFileName)}');");
+        }
+
         private void PushSrc(string jsFunction, string fileName)
         {
             if (!_viewerReady || _webView.CoreWebView2 == null) return;
@@ -1284,6 +1621,8 @@ namespace GlbMerger
                 _viewerReady = true;
                 PushPaintMode();
                 PushBrushRadius();
+                PushWireframe();
+                PushRigidityColors();
                 return;
             }
 
@@ -1312,6 +1651,30 @@ namespace GlbMerger
             float fraction = _sliderBrush.Value / 100f;
             _ = _webView.CoreWebView2.ExecuteScriptAsync(
                 $"setBrushRadius({fraction.ToString(CultureInfo.InvariantCulture)});");
+        }
+
+        private void PushWireframe()
+        {
+            if (!_viewerReady || _webView.CoreWebView2 == null) return;
+            _ = _webView.CoreWebView2.ExecuteScriptAsync($"setWireframe({(_chkWireframe.Checked ? "true" : "false")});");
+        }
+
+        private void ToggleRigidityColors()
+        {
+            _rigidityColors = !_rigidityColors;
+            _btnColorize.Text = _rigidityColors ? "Hide Rigidity Colors" : "Colorize by Rigidity";
+
+            // Switching it on is the first moment the colouring is worth paying for, so this is
+            // where a reload deferred by an earlier Apply/Remove/Revert is settled.
+            if (_rigidityColors && _paintGeometryStale) RefreshPaintGeometry();
+            PushRigidityColors();
+        }
+
+        private void PushRigidityColors()
+        {
+            if (!_viewerReady || _webView.CoreWebView2 == null) return;
+            _ = _webView.CoreWebView2.ExecuteScriptAsync(
+                $"setRigidityColors({(_rigidityColors ? "true" : "false")});");
         }
 
         private void PushAnimationState()

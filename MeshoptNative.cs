@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Runtime.InteropServices;
 
 namespace GlbMerger
@@ -57,6 +57,52 @@ namespace GlbMerger
         [DllImport(Library, EntryPoint = "meshopt_optimizeVertexCache", CallingConvention = CallingConvention.Cdecl)]
         public static extern unsafe void OptimizeVertexCache(
             uint* destination, uint* indices, nuint indexCount, nuint vertexCount);
+
+        /// <summary>
+        /// Reorders triangles so nearer-to-the-camera ones are drawn first, cutting how often a
+        /// fragment is shaded and then overwritten. Threshold caps how much vertex-cache efficiency
+        /// it is allowed to give back to do it - 1.05 means "up to 5% worse ACMR".
+        /// </summary>
+        [DllImport(Library, EntryPoint = "meshopt_optimizeOverdraw", CallingConvention = CallingConvention.Cdecl)]
+        public static extern unsafe void OptimizeOverdraw(
+            uint* destination, uint* indices, nuint indexCount,
+            float* vertexPositions, nuint vertexCount, nuint vertexPositionsStride, float threshold);
+
+        /// <summary>
+        /// Builds an old-index -> new-index table that puts vertex records in the order the index
+        /// buffer first reaches them. Returns the number of vertices that survive; unreferenced
+        /// vertices map to ~0u and are meant to be dropped.
+        /// </summary>
+        [DllImport(Library, EntryPoint = "meshopt_optimizeVertexFetchRemap", CallingConvention = CallingConvention.Cdecl)]
+        public static extern unsafe nuint OptimizeVertexFetchRemap(
+            uint* destination, uint* indices, nuint indexCount, nuint vertexCount);
+
+        [DllImport(Library, EntryPoint = "meshopt_remapIndexBuffer", CallingConvention = CallingConvention.Cdecl)]
+        public static extern unsafe void RemapIndexBuffer(
+            uint* destination, uint* indices, nuint indexCount, uint* remap);
+
+        /// <summary>
+        /// meshopt_OverdrawStatistics. Returned by value from the analyzer below - three 4-byte
+        /// fields, sequential and blittable, so the runtime marshals it without a custom layout.
+        /// </summary>
+        [StructLayout(LayoutKind.Sequential)]
+        public struct OverdrawStatistics
+        {
+            public uint PixelsCovered;
+            public uint PixelsShaded;
+            /// <summary>PixelsShaded / PixelsCovered. 1.0 = every covered pixel shaded exactly once.</summary>
+            public float Overdraw;
+        }
+
+        /// <summary>
+        /// Software-rasterizes the mesh from several directions to measure how many times an average
+        /// covered pixel gets shaded. This is what the overdraw pass spends vertex-cache efficiency
+        /// to reduce, so it is the other half of that trade.
+        /// </summary>
+        [DllImport(Library, EntryPoint = "meshopt_analyzeOverdraw", CallingConvention = CallingConvention.Cdecl)]
+        public static extern unsafe OverdrawStatistics AnalyzeOverdraw(
+            uint* indices, nuint indexCount,
+            float* vertexPositions, nuint vertexCount, nuint vertexPositionsStride);
 
         // Probes the native library once so a missing/incompatible meshoptimizer binary surfaces as
         // a clean "unavailable" in the UI rather than a DllNotFoundException from somewhere deep in
