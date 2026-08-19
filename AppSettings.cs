@@ -16,6 +16,7 @@ namespace GlbMerger
         public double Panel1SecondarySplitFraction { get; set; } = 0.4667;
         public double Panel2PrimarySplitFraction { get; set; } = 0.45;
         public double AnimationTrimPlaybackSpeed { get; set; } = 1.0;
+        public string AnimationLibraryDirectory { get; set; } = @"C:\Projects\FootballRoguelite\Graphics\Models\Players";
 
         private static string SettingsPath => Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "GlbMerger", "settings.json");

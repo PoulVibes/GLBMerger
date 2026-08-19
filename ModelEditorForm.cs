@@ -143,8 +143,8 @@ namespace GlbMerger
                 Control editor = mode switch
                 {
                     EditorMode.JointOrientation => new JointOrientationEditor(_model, _darkMode),
-                    EditorMode.BallAnchor => new BallAnchorEditor(_model, _darkMode),
-                    EditorMode.StiffArm => new StiffArmPoseEditor(_model, _darkMode),
+                    EditorMode.BallAnchor => new BallAnchorEditor(_model, _darkMode, _settings),
+                    EditorMode.StiffArm => new StiffArmPoseEditor(_model, _darkMode, _settings),
                     EditorMode.AnimationTrim => new AnimationTrimEditor(_model, _darkMode,
                         _settings.AnimationTrimPlaybackSpeed, speed => _settings.AnimationTrimPlaybackSpeed = speed),
                     EditorMode.OptimizeGeometry => new GeometryOptimizerEditor(_model, _darkMode),

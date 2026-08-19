@@ -32,4 +32,23 @@ namespace GlbMerger
         // ends up tilted relative to the target rig's convention.
         public Quaternion? RootTranslationCorrection { get; init; }
     }
+
+    // Bundles a library GLB's raw (uncorrected) animation clips together with the bind-pose data
+    // (per-bone bind translation, Hips bind rotation) needed to retarget them onto a different
+    // structural model later - the same correction ApplyBoneLengthCorrection/
+    // ApplyHipRotationCorrection already apply to slot 2's own dropped GLB, generalized to any
+    // number of extra "animation library" GLBs a user adds via the dropdown.
+    public sealed class GlbAnimationSource
+    {
+        public required List<AnimationClipData> Clips { get; init; }
+        public required Dictionary<string, Vector3> BindTranslationsByName { get; init; }
+        public Quaternion? HipsBindRotation { get; init; }
+
+        // Whatever loop/pause setting (and seconds-offset to resume at) this library GLB's own
+        // clips already carry in their glTF extras, keyed by each clip's *original* name (matching
+        // Clips[i].Name before the caller disambiguates it against already-loaded clips) - lets the
+        // "animation library" dropdown seed GlbInfoPanel's Loop checkbox/frame the same way a
+        // directly-dropped GLB does, instead of always resetting to the row default.
+        public Dictionary<string, (bool Loop, float LoopTime)>? LoopByClipName { get; init; }
+    }
 }

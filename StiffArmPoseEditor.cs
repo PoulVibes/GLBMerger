@@ -36,8 +36,10 @@ namespace GlbMerger
     public class StiffArmPoseEditor : UserControl
     {
         private readonly ModelRoot _model;
+        private readonly AppSettings _settings;
 
         private ComboBox _animDropdown = null!;
+        private ComboBox _libraryCombo = null!;
         private RadioButton _radioRight = null!, _radioLeft = null!;
         private RadioButton _radioForward = null!, _radioSide = null!, _radioDown = null!;
         private Label _lblStatus = null!, _lblBoneRight = null!, _lblBoneLeft = null!;
@@ -70,11 +72,12 @@ namespace GlbMerger
         private static readonly string[] PoseNames = { "Forward", "Side", "Down" };
         private static readonly string[] JointNames = { "Shoulder", "Elbow", "Wrist" };
 
-        public StiffArmPoseEditor(ModelRoot model, bool darkMode = false)
+        public StiffArmPoseEditor(ModelRoot model, bool darkMode = false, AppSettings? settings = null)
         {
             _model = model;
-            _rightWrist = FindHandNode(right: true);
-            _leftWrist = FindHandNode(right: false);
+            _settings = settings ?? new AppSettings();
+            _rightWrist = FindHandNode(_model, right: true);
+            _leftWrist = FindHandNode(_model, right: false);
             _rightElbow = _rightWrist?.VisualParent;
             _leftElbow = _leftWrist?.VisualParent;
             _rightShoulder = _rightElbow?.VisualParent;
@@ -94,11 +97,11 @@ namespace GlbMerger
 
         // Same alias-matching convention ModelRenderer::FindHandJoints uses,
         // so this resolves the exact bones the game will look under.
-        private Node? FindHandNode(bool right)
+        private static Node? FindHandNode(ModelRoot model, bool right)
         {
             Node? Search(string[] names)
             {
-                foreach (var n in _model.LogicalNodes)
+                foreach (var n in model.LogicalNodes)
                 {
                     if (string.IsNullOrEmpty(n.Name)) continue;
                     var lower = n.Name.ToLowerInvariant();
@@ -212,6 +215,33 @@ namespace GlbMerger
                 AutoSizeMode = AutoSizeMode.GrowAndShrink,
                 Margin = new Padding(0, 0, 0, 6),
             };
+
+            // Writes every hand/pose combination at once, rather than requiring 6 separate visits
+            // to "Save This Hand/Pose" below - sits at the very top since it's the button most
+            // people reach for once they're done tuning all 6 combinations.
+            var btnSaveAll = new Button { Text = "Save All Arm Poses", AutoSize = true, Margin = new Padding(3, 0, 3, 10) };
+            btnSaveAll.Click += (s, e) => SaveAll();
+            flow.Controls.Add(btnSaveAll);
+
+            flow.Controls.Add(new Label { Text = "Copy Settings From Library Model:", AutoSize = true, Margin = new Padding(3, 0, 3, 4) });
+            var libraryRow = MakeRow();
+            _libraryCombo = new ComboBox { Width = 190, Height = 26, DropDownStyle = ComboBoxStyle.DropDownList, Margin = new Padding(3, 3, 8, 10) };
+            RefreshLibraryCombo();
+            // Resets back to unselected after firing, so picking the same model again later
+            // (e.g. after tweaking, to re-pull its baseline) still raises SelectedIndexChanged.
+            _libraryCombo.SelectedIndexChanged += (s, e) =>
+            {
+                if (_libraryCombo.SelectedItem is LibraryDirectoryHelper.LibraryEntry entry)
+                {
+                    CopyFromLibraryModel(entry.Path);
+                    _libraryCombo.SelectedIndex = -1;
+                }
+            };
+            var btnChangeLibraryDir = new Button { Text = "Change Directory...", AutoSize = true, Margin = new Padding(3, 3, 3, 10) };
+            btnChangeLibraryDir.Click += (s, e) => ChangeLibraryDirectory();
+            libraryRow.Controls.Add(_libraryCombo);
+            libraryRow.Controls.Add(btnChangeLibraryDir);
+            flow.Controls.Add(libraryRow);
 
             // Each RadioButton set needs its OWN container - WinForms treats
             // every RadioButton added directly to the same parent as one
@@ -357,6 +387,86 @@ namespace GlbMerger
             _lblStatus.Text = "Copied from other arm (mirrored guess) — remember to Save.";
         }
 
+        private void RefreshLibraryCombo()
+        {
+            _libraryCombo.Items.Clear();
+            foreach (var file in LibraryDirectoryHelper.ListGlbFiles(_settings.AnimationLibraryDirectory))
+                _libraryCombo.Items.Add(new LibraryDirectoryHelper.LibraryEntry { Path = file });
+        }
+
+        private void ChangeLibraryDirectory()
+        {
+            using var dlg = new FolderBrowserDialog
+            {
+                SelectedPath = Directory.Exists(_settings.AnimationLibraryDirectory) ? _settings.AnimationLibraryDirectory : "",
+                Description = "Choose the folder containing animation library .glb files",
+            };
+            if (dlg.ShowDialog(this) != DialogResult.OK) return;
+
+            _settings.AnimationLibraryDirectory = dlg.SelectedPath;
+            _settings.Save();
+            RefreshLibraryCombo();
+        }
+
+        // Reads whatever stiff-arm markers a library GLB has saved (same marker node names this
+        // editor itself writes - see SaveCurrent) and copies them - all 2 sides x 3 poses it can
+        // find - into the CURRENT model's in-memory working state, exactly as if the user had
+        // hand-dialed those same values in here. Nothing is written to the current model until
+        // the user hits Save (per hand/pose, same as always) - this only seeds the sliders. A
+        // source model missing a particular marker just leaves that combination untouched rather
+        // than zeroing it out.
+        private void CopyFromLibraryModel(string glbPath)
+        {
+            ModelRoot source;
+            try
+            {
+                source = ModelRoot.Load(glbPath);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, $"Failed to load '{Path.GetFileName(glbPath)}':\n{ex.Message}", "Stiff Arm Poses",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            var srcRightWrist = FindHandNode(source, right: true);
+            var srcLeftWrist = FindHandNode(source, right: false);
+            var srcRightElbow = srcRightWrist?.VisualParent;
+            var srcLeftElbow = srcLeftWrist?.VisualParent;
+            var srcRightShoulder = srcRightElbow?.VisualParent;
+            var srcLeftShoulder = srcLeftElbow?.VisualParent;
+
+            bool any = false;
+            for (int side = 0; side < 2; side++)
+            {
+                bool right = side == 0;
+                var shoulder = right ? srcRightShoulder : srcLeftShoulder;
+                var elbow = right ? srcRightElbow : srcLeftElbow;
+                Node? ParentFor(int joint) => joint switch { 0 => shoulder?.VisualParent, 1 => shoulder, 2 => elbow, _ => null };
+
+                for (int pose = 0; pose < 3; pose++)
+                {
+                    for (int joint = 0; joint < 3; joint++)
+                    {
+                        var parent = ParentFor(joint);
+                        var marker = FindExistingMarker(parent, MarkerName(right, pose, joint));
+                        if (marker == null) continue;
+
+                        var deg = QuaternionToDegrees(marker.LocalTransform.GetDecomposed().Rotation);
+                        _deg[side, pose, joint] = new JointDeg { X = deg.X, Y = deg.Y, Z = deg.Z };
+                        any = true;
+                    }
+                }
+            }
+
+            RefreshUiFromState();
+            PushLockedSide();
+
+            _lblStatus.Text = any
+                ? $"Copied settings from {Path.GetFileName(glbPath)} — remember to Save."
+                : $"{Path.GetFileName(glbPath)} has no saved stiff-arm pose data to copy.";
+        }
+
         private static string AxisLabel(int axis) => axis == 0 ? "X Rotation" : axis == 1 ? "Y Rotation" : "Z Rotation";
 
         private (int Side, int Pose) CurrentSelection() =>
@@ -426,19 +536,16 @@ namespace GlbMerger
                 $"{Inv(wQ.X)},{Inv(wQ.Y)},{Inv(wQ.Z)},{Inv(wQ.W)});");
         }
 
-        private void SaveCurrent()
+        // Writes one hand/pose combination's 3 joint markers - the shared core both SaveCurrent
+        // (one combination, whichever is currently selected) and SaveAll (all 6) call. Returns
+        // false only when this hand's arm chain never resolved in the first place (see the
+        // constructor), meaning there's nowhere to anchor the markers under at all.
+        private bool SaveSidePose(bool right, int pose)
         {
-            var (side, pose) = CurrentSelection();
-            bool right = side == 0;
-
             var wrist = right ? _rightWrist : _leftWrist;
-            if (wrist == null)
-            {
-                MessageBox.Show(this, "No arm chain resolved for this hand — cannot save.", "Stiff Arm Poses",
-                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return;
-            }
+            if (wrist == null) return false;
 
+            int side = right ? 0 : 1;
             for (int joint = 0; joint < 3; joint++)
             {
                 var parent = MarkerParentFor(right, joint);
@@ -450,8 +557,46 @@ namespace GlbMerger
                 var d = _deg[side, pose, joint];
                 marker.WithLocalRotation(ComputeOffsetQuaternion(d.X, d.Y, d.Z));
             }
+            return true;
+        }
+
+        private void SaveCurrent()
+        {
+            var (side, pose) = CurrentSelection();
+            bool right = side == 0;
+
+            if (!SaveSidePose(right, pose))
+            {
+                MessageBox.Show(this, "No arm chain resolved for this hand — cannot save.", "Stiff Arm Poses",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
 
             _lblStatus.Text = $"Saved {(right ? "right" : "left")} {PoseNames[pose].ToLowerInvariant()} pose.";
+        }
+
+        // Writes every hand/pose combination (2 sides x 3 poses = 6) at once, using whatever
+        // values are currently held in _deg for each - including combinations the user never
+        // actually visited via the Hand/Pose radio buttons this session, since _deg is fully
+        // populated up front by LoadAllExisting (existing markers) or stays at its zeroed default
+        // otherwise. A side whose arm chain never resolved is skipped rather than failing the
+        // whole batch, since the other side may still be perfectly saveable.
+        private void SaveAll()
+        {
+            int saved = 0, total = 0;
+            for (int side = 0; side < 2; side++)
+            {
+                bool right = side == 0;
+                for (int pose = 0; pose < 3; pose++)
+                {
+                    total++;
+                    if (SaveSidePose(right, pose)) saved++;
+                }
+            }
+
+            _lblStatus.Text = saved > 0
+                ? $"Saved {saved} of {total} hand/pose combination(s)."
+                : "No arm chains resolved — nothing to save.";
         }
 
         private void ResetCurrent()

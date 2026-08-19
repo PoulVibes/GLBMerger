@@ -46,6 +46,10 @@ namespace GlbMerger
         private Label _lblStart = null!, _lblEnd = null!, _lblStatus = null!;
         private Button _btnPause = null!, _btnPlayRange = null!, _btnApplyTrim = null!;
         private Panel _trimPanel = null!;
+        private CheckBox _chkLoop = null!;
+        private NumericUpDown _numLoopFrame = null!;
+        private CheckBox _chkSmoothTransition = null!;
+        private NumericUpDown _numInterpolatedFrames = null!;
 
         // True only between the page reporting its model as loaded and the next reload - guards
         // every ExecuteScriptAsync, since the window.* helpers don't exist before then.
@@ -53,6 +57,7 @@ namespace GlbMerger
         private bool _paused;
         private bool _rangePlaying;
         private bool _suppressSliderEvents;
+        private bool _suppressLoopEvents;
 
         // Animation name -> the distinct keyframe times actually present across its channels.
         // That's the only frame numbering available (the source file stores no FPS), and it's the
@@ -66,6 +71,20 @@ namespace GlbMerger
         // best-effort as each new one is written.
         private int _previewVersion;
         private string? _previewPath;
+
+        // "Play Trimmed Range" previews the exact result Save would produce - including any
+        // Smooth Transition bridge frames - by building a throwaway clone (trimmed, loop-stamped,
+        // and bridged the same way ApplyTrim itself would), pointing the viewer at that instead of
+        // the live _model, and swapping back once range playback stops. Tracked separately from
+        // _previewPath/_previewVersion above so the two kinds of preview file never delete each
+        // other out from under the viewer.
+        private int _rangePreviewVersion;
+        private string? _rangePreviewPath;
+
+        // Set right before requesting a reload to the range-preview clone, consumed by
+        // OnWebMessageReceived's next 'ready' - tells it to kick off bridged-range playback
+        // instead of the normal PushViewerState() a reload usually means.
+        private (string Name, bool Loop, float LoopTime)? _pendingRangePreview;
 
         public AnimationTrimEditor(ModelRoot model, bool darkMode = false, double initialSpeed = 1.0, Action<double>? onSpeedChanged = null)
         {
@@ -150,11 +169,15 @@ namespace GlbMerger
             const int kSliderHeight = 45;
             const int kRowPitch = kLabelToSlider + kSliderHeight + 9;
             const int kHeaderHeight = 24;
+            const int kLoopRowHeight = 26;
             const int kButtonPitch = 34;
 
             int startRowTop = kHeaderHeight;
             int endRowTop = startRowTop + kRowPitch;
-            int buttonsTop = endRowTop + kRowPitch;
+            int loopRowTop = endRowTop + kRowPitch;
+            int smoothCheckTop = loopRowTop + kLoopRowHeight;
+            int smoothNumTop = smoothCheckTop + kLoopRowHeight;
+            int buttonsTop = smoothNumTop + kLoopRowHeight + 12;
 
             _trimPanel = new Panel { Width = 300, Height = buttonsTop + 2 * kButtonPitch + 6, Margin = new Padding(0) };
 
@@ -171,13 +194,33 @@ namespace GlbMerger
             var (btnMinusStart, btnPlusStart) = SliderNudge.Attach(_sliderStart);
             var (btnMinusEnd, btnPlusEnd) = SliderNudge.Attach(_sliderEnd);
 
+            // On-completion playback behavior for this clip in the target engine: checked loops
+            // back to the chosen frame (clamped to the trim range above) and keeps playing;
+            // unchecked pauses on the last frame. glTF has no native concept of this - it's stored
+            // as a private convention in the output animation's own "extras" (see
+            // GlbMergeService.SetAnimationLoop) for the engine to read at load time.
+            _chkLoop = new CheckBox { Text = "Loop back to frame:", Left = 3, Top = loopRowTop, AutoSize = true };
+            _chkLoop.CheckedChanged += (s, e) => OnLoopSettingChanged();
+            _numLoopFrame = new NumericUpDown { Left = 170, Top = loopRowTop - 2, Width = 60, Minimum = 0, Maximum = 0 };
+            _numLoopFrame.ValueChanged += (s, e) => OnLoopSettingChanged();
+
+            // Bridges the pop between the trimmed clip's last frame and the loop-back frame by
+            // generating extra in-between keyframes on Save that ease from one pose toward the
+            // other (see GlbMergeService.AddLoopSmoothingFrames) - only meaningful when actually
+            // looping, so it's tied to (and disabled alongside) the Loop checkbox above.
+            _chkSmoothTransition = new CheckBox { Text = "Smooth Transition", Left = 3, Top = smoothCheckTop, AutoSize = true };
+            _chkSmoothTransition.CheckedChanged += (s, e) => OnSmoothSettingChanged();
+            var lblInterpolatedFrames = new Label { Text = "New Interpolated Frames:", Left = 3, Top = smoothNumTop + 3, AutoSize = true };
+            _numInterpolatedFrames = new NumericUpDown { Left = 200, Top = smoothNumTop, Width = 60, Minimum = 0, Maximum = 60, Value = 5 };
+            _numInterpolatedFrames.ValueChanged += (s, e) => OnSmoothSettingChanged();
+
             // Loops playback between just the two handles, so this shows what the clip will look
             // like after Apply cuts everything outside that window - rather than the full
             // untrimmed clip the animation dropdown plays.
             _btnPlayRange = new Button { Text = "Play Trimmed Range", Left = 3, Top = buttonsTop, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowOnly, MinimumSize = new System.Drawing.Size(290, 0) };
             _btnPlayRange.Click += (s, e) => ToggleRangePreview();
 
-            _btnApplyTrim = new Button { Text = "Apply Trim to Merge", Left = 3, Top = buttonsTop + kButtonPitch, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowOnly, MinimumSize = new System.Drawing.Size(290, 0) };
+            _btnApplyTrim = new Button { Text = "Save Animation Adjustments", Left = 3, Top = buttonsTop + kButtonPitch, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowOnly, MinimumSize = new System.Drawing.Size(290, 0) };
             _btnApplyTrim.Click += (s, e) => ApplyTrim();
 
             _trimPanel.Controls.AddRange(new Control[]
@@ -185,6 +228,8 @@ namespace GlbMerger
                 lblTrimHeader,
                 _lblStart, _sliderStart, btnMinusStart, btnPlusStart,
                 _lblEnd, _sliderEnd, btnMinusEnd, btnPlusEnd,
+                _chkLoop, _numLoopFrame,
+                _chkSmoothTransition, lblInterpolatedFrames, _numInterpolatedFrames,
                 _btnPlayRange, _btnApplyTrim
             });
             flow.Controls.Add(_trimPanel);
@@ -283,6 +328,85 @@ namespace GlbMerger
             }
 
             UpdateTrimLabels();
+
+            // Preload whatever loop setting is already stamped on this clip (from an earlier
+            // session, or the main GUI's own Loop checkbox), converting its saved seconds-offset
+            // back to the nearest matching frame index in this clip's current numbering.
+            _suppressLoopEvents = true;
+            try
+            {
+                var name = CurrentAnimationName();
+                bool loop = false;
+                float loopTime = 0f;
+                if (name != null)
+                    (loop, loopTime) = GlbMergeService.GetAnimationLoop(_model, name);
+
+                _chkLoop.Checked = loop;
+                UpdateLoopFrameRange();
+                if (times.Length > 0)
+                {
+                    int nearestFrame = 0;
+                    float nearestDist = float.MaxValue;
+                    for (int i = 0; i < times.Length; i++)
+                    {
+                        float dist = Math.Abs(times[i] - loopTime);
+                        if (dist < nearestDist) { nearestDist = dist; nearestFrame = i; }
+                    }
+                    _numLoopFrame.Value = Math.Clamp(nearestFrame, (int)_numLoopFrame.Minimum, (int)_numLoopFrame.Maximum);
+                }
+            }
+            finally
+            {
+                _suppressLoopEvents = false;
+            }
+            _numLoopFrame.Enabled = trimmable && _chkLoop.Checked;
+
+            // Smoothing is a one-time bake action performed on Save (see ApplyTrim/
+            // GlbMergeService.AddLoopSmoothingFrames), not an ongoing setting - unlike Loop it
+            // never round-trips from the model's own extras, so it always starts back at
+            // unchecked on (re)selecting a clip, same as the trim sliders reset to the clip's full
+            // range rather than remembering the last trim.
+            _chkSmoothTransition.Checked = false;
+            _chkSmoothTransition.Enabled = trimmable && _chkLoop.Checked;
+            _numInterpolatedFrames.Enabled = false;
+        }
+
+        // Keeps the loop-back frame picker's range clamped to the current trim window [start,
+        // end] - looping back to a frame this Apply is about to cut away wouldn't mean anything
+        // once the clip is actually trimmed.
+        private void UpdateLoopFrameRange()
+        {
+            _numLoopFrame.Maximum = Math.Max(_sliderStart.Value, _sliderEnd.Value);
+            _numLoopFrame.Minimum = _sliderStart.Value;
+            if (_numLoopFrame.Value < _numLoopFrame.Minimum) _numLoopFrame.Value = _numLoopFrame.Minimum;
+            if (_numLoopFrame.Value > _numLoopFrame.Maximum) _numLoopFrame.Value = _numLoopFrame.Maximum;
+        }
+
+        private void OnLoopSettingChanged()
+        {
+            _numLoopFrame.Enabled = _trimPanel.Enabled && _chkLoop.Checked;
+
+            // Smoothing only means something when there's actually a loop to bridge into -
+            // turning Loop off takes the smoothing option off the table with it.
+            _chkSmoothTransition.Enabled = _trimPanel.Enabled && _chkLoop.Checked;
+            if (!_chkLoop.Checked) _chkSmoothTransition.Checked = false;
+            _numInterpolatedFrames.Enabled = _chkSmoothTransition.Enabled && _chkSmoothTransition.Checked;
+
+            if (_suppressLoopEvents) return;
+
+            // Scrubbing to the chosen loop-back frame, same reasoning as the trim sliders: seeing
+            // the actual pose is how the user judges whether it's the right frame to resume on.
+            StopRangePreview();
+            _paused = true;
+            _btnPause.Text = "Resume";
+            var times = CurrentFrameTimes();
+            int frame = (int)_numLoopFrame.Value;
+            if (_chkLoop.Checked && frame < times.Length) Exec($"seekTo({Inv(times[frame])});");
+        }
+
+        private void OnSmoothSettingChanged()
+        {
+            _numInterpolatedFrames.Enabled = _chkSmoothTransition.Enabled && _chkSmoothTransition.Checked;
         }
 
         private void OnTrimSliderChanged(bool movedStart)
@@ -306,6 +430,9 @@ namespace GlbMerger
             }
 
             UpdateTrimLabels();
+            _suppressLoopEvents = true;
+            try { UpdateLoopFrameRange(); }
+            finally { _suppressLoopEvents = false; }
 
             // Scrubbing to the handle just moved is the whole point of the sliders - it's how the
             // user sees which frame they're actually cutting at.
@@ -337,21 +464,79 @@ namespace GlbMerger
         {
             if (_rangePlaying)
             {
+                // StopRangePreview swaps the viewer back to the real model, which - like every
+                // other post-edit reload in this editor (see ApplyTrim) - comes back up playing
+                // rather than paused; PushViewerState is what actually settles _paused/_btnPause
+                // once that reload's 'ready' arrives, so there's nothing more to force here.
                 StopRangePreview();
-                _paused = true;
-                _btnPause.Text = "Resume";
-                Exec("setPaused(true);");
                 return;
             }
+
+            var name = CurrentAnimationName();
+            if (name == null) return;
 
             var times = CurrentFrameTimes();
             if (_sliderStart.Value >= times.Length || _sliderEnd.Value >= times.Length) return;
 
-            _rangePlaying = true;
-            _paused = false;
-            _btnPause.Text = "Pause";
-            _btnPlayRange.Text = "Stop Trimmed Range";
-            Exec($"playRange({Inv(times[_sliderStart.Value])}, {Inv(times[_sliderEnd.Value])});");
+            int startFrame = _sliderStart.Value, endFrame = _sliderEnd.Value;
+            bool loop = _chkLoop.Checked;
+            int loopFrame = Math.Clamp((int)_numLoopFrame.Value, startFrame, endFrame);
+            float loopTime = loop ? Math.Max(0f, times[loopFrame] - times[startFrame]) : 0f;
+            int smoothFrameCount = loop && _chkSmoothTransition.Checked ? (int)_numInterpolatedFrames.Value : 0;
+
+            try
+            {
+                // Builds exactly what Save would produce - trim, loop stamp, and any smoothing
+                // bridge frames - on a throwaway clone, so the preview (including the interpolated
+                // frames) matches the eventual saved clip without touching the real in-memory
+                // model until the user actually clicks Save.
+                string clonePath = Path.Combine(Path.GetTempPath(), $"glbmerger_trim_clonesrc_{Guid.NewGuid():N}.glb");
+                _model.SaveGLB(clonePath);
+                ModelRoot clone;
+                try { clone = ModelRoot.Load(clonePath); }
+                finally { try { File.Delete(clonePath); } catch (IOException) { } catch (UnauthorizedAccessException) { } }
+
+                GlbMergeService.TrimAnimation(clone, name, startFrame, endFrame);
+                GlbMergeService.SetAnimationLoop(clone, name, loop, loopTime);
+                if (smoothFrameCount > 0)
+                    GlbMergeService.AddLoopSmoothingFrames(clone, name, smoothFrameCount, loopTime);
+
+                string fileName = WriteRangePreviewFile(clone);
+
+                _rangePlaying = true;
+                _paused = false;
+                _btnPause.Text = "Pause";
+                _btnPlayRange.Text = "Stop Trimmed Range";
+
+                _pendingRangePreview = (name, loop, loopTime);
+                _viewerReady = false;
+                _ = _webView.CoreWebView2?.ExecuteScriptAsync($"reloadModel('https://appassets.local/{EscapeJs(fileName)}');");
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, $"Failed to build range preview: {ex.Message}",
+                    "Play Trimmed Range", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        // Dumps a throwaway clone model (built fresh by ToggleRangePreview for each preview) to
+        // its own versioned temp file, separate from _previewPath's normal/untrimmed preview so
+        // swapping into and back out of a range preview never deletes the file the other one
+        // still needs.
+        private string WriteRangePreviewFile(ModelRoot clone)
+        {
+            var previous = _rangePreviewPath;
+            _rangePreviewPath = Path.Combine(Path.GetTempPath(), $"glbmerger_trim_rangepreview_{_rangePreviewVersion++}.glb");
+            clone.SaveGLB(_rangePreviewPath);
+
+            if (previous != null)
+            {
+                try { File.Delete(previous); }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+            }
+
+            return Path.GetFileName(_rangePreviewPath);
         }
 
         private void StopRangePreview()
@@ -360,6 +545,12 @@ namespace GlbMerger
             _rangePlaying = false;
             _btnPlayRange.Text = "Play Trimmed Range";
             Exec("stopRange();");
+
+            // The viewer's currently showing the throwaway range-preview clone (see
+            // ToggleRangePreview) - every other control (sliders, seeking, normal whole-clip
+            // playback) operates against the real _model's own frame numbering, so swap the
+            // viewer back to it now that range playback is done.
+            ReloadPreview();
         }
 
         private void OnSpeedChanged()
@@ -387,14 +578,37 @@ namespace GlbMerger
 
             try
             {
-                GlbMergeService.TrimAnimation(_model, name, _sliderStart.Value, _sliderEnd.Value);
+                // Captured before TrimAnimation rebases the clip's keyframe times to start at 0,
+                // so the loop-back frame is converted to seconds-since-the-new-start using the
+                // same [startTime, endTime] window TrimAnimation itself crops and rebases against.
+                var timesBeforeTrim = CurrentFrameTimes();
+                int startFrame = _sliderStart.Value, endFrame = _sliderEnd.Value;
+                bool loop = _chkLoop.Checked;
+                float loopTime = 0f;
+                if (loop && timesBeforeTrim.Length > 0)
+                {
+                    int loopFrame = Math.Clamp((int)_numLoopFrame.Value, startFrame, endFrame);
+                    loopTime = Math.Max(0f, timesBeforeTrim[loopFrame] - timesBeforeTrim[startFrame]);
+                }
+
+                GlbMergeService.TrimAnimation(_model, name, startFrame, endFrame);
+                GlbMergeService.SetAnimationLoop(_model, name, loop, loopTime);
+
+                // Only meaningful once there's an actual loop-back point to bridge into - baked
+                // in after the trim/loop-time are both settled, using that same rebased loopTime,
+                // so the new keys land exactly where the clip's own post-trim timeline puts them.
+                int smoothFrameCount = loop && _chkSmoothTransition.Checked ? (int)_numInterpolatedFrames.Value : 0;
+                if (smoothFrameCount > 0)
+                    GlbMergeService.AddLoopSmoothingFrames(_model, name, smoothFrameCount, loopTime);
 
                 // Re-derived from the model, so trimming this clip again in the same session works
                 // from the post-trim frame numbering instead of stale pre-trim bounds.
                 _frameTimes = ComputeAnimFrameTimes(_model);
                 ConfigureTrimControls();
 
-                _lblStatus.Text = $"Trimmed '{name}' to {CurrentFrameTimes().Length} frame(s). " +
+                _lblStatus.Text = $"Trimmed '{name}' to {CurrentFrameTimes().Length} frame(s), " +
+                    (loop ? $"looping back to {loopTime.ToString("0.000", CultureInfo.InvariantCulture)}s. " : "pausing at the end. ") +
+                    (smoothFrameCount > 0 ? $"Added {smoothFrameCount} smoothing frame(s). " : "") +
                     "Included the next time you save the merge.";
 
                 ReloadPreview();
@@ -450,6 +664,7 @@ namespace GlbMerger
                     var viewer = document.querySelector('#viewer');
                     var loaded = false;
                     var rangeActive = false, rangeStart = 0, rangeEnd = 0, rangeRaf = null, rangeLastTs = null;
+                    var rangeLoop = false, rangeLoopTime = 0;
 
                     // model-viewer has no native playback-rate control, so both plain playback and
                     // range playback below drive viewer.currentTime by hand each frame instead of
@@ -541,23 +756,67 @@ namespace GlbMerger
                         if (rangeRaf !== null) { cancelAnimationFrame(rangeRaf); rangeRaf = null; }
                     }
 
+                    // Mirrors the engine-side state machine documented for the exported loop /
+                    // loopTime extras: reaching rangeEnd either wraps back to rangeLoopTime
+                    // (preserving overshoot, same as the real engine should) or holds at rangeEnd
+                    // and stops ticking, so this preview shows exactly what Loop vs Pause will
+                    // look like once the clip is actually saved/trimmed.
                     function rangeTick(ts) {
                         if (!rangeActive) return;
                         if (rangeLastTs === null) rangeLastTs = ts;
                         var dt = (ts - rangeLastTs) / 1000;
                         rangeLastTs = ts;
                         var t = viewer.currentTime + dt * currentSpeed;
-                        viewer.currentTime = (t < rangeStart || t >= rangeEnd) ? rangeStart : t;
+
+                        if (t >= rangeEnd) {
+                            if (rangeLoop) {
+                                var overshoot = t - rangeEnd;
+                                t = rangeLoopTime + overshoot;
+                                if (t >= rangeEnd) t = rangeLoopTime;
+                            } else {
+                                viewer.currentTime = rangeEnd;
+                                rangeActive = false;
+                                rangeLastTs = null;
+                                return;
+                            }
+                        } else if (t < rangeStart) {
+                            t = rangeStart;
+                        }
+
+                        viewer.currentTime = t;
                         rangeRaf = requestAnimationFrame(rangeTick);
                     }
 
-                    window.playRange = function (a, b) {
+                    window.playRange = function (a, b, loop, loopTime) {
                         if (!loaded) return;
                         stopRangeInternal();
                         stopPlayLoopInternal();
-                        rangeStart = a; rangeEnd = b; rangeActive = true;
+                        rangeStart = a; rangeEnd = b;
+                        rangeLoop = !!loop;
+                        rangeLoopTime = (typeof loopTime === 'number') ? loopTime : a;
+                        rangeActive = true;
                         viewer.currentTime = a;
                         viewer.pause();
+                        rangeRaf = requestAnimationFrame(rangeTick);
+                    };
+
+                    // Used by Play Trimmed Range: the model just loaded here IS a throwaway
+                    // clone already cropped (and, if Smooth Transition was on, bridged) to exactly
+                    // what Save would produce, so playing it start-to-finish with the same
+                    // loop/pause behavior as the real export is just playRange over the clone's
+                    // own full duration - no separate range window needed.
+                    window.playBridgedRangePreview = function (animName, loop, loopTime) {
+                        if (!loaded) return;
+                        stopRangeInternal();
+                        stopPlayLoopInternal();
+                        viewer.animationName = animName;
+                        viewer.pause();
+                        viewer.currentTime = 0;
+                        var duration = viewer.duration || 0;
+                        rangeStart = 0; rangeEnd = duration;
+                        rangeLoop = !!loop;
+                        rangeLoopTime = (typeof loopTime === 'number') ? loopTime : 0;
+                        rangeActive = true;
                         rangeRaf = requestAnimationFrame(rangeTick);
                     };
 
@@ -636,6 +895,19 @@ namespace GlbMerger
             if (action != "ready" || IsDisposed) return;
 
             _viewerReady = true;
+
+            // A range preview's reload is a special case: instead of the normal "resume whatever
+            // the panel currently says" push below, kick off bridged-range playback (loop/pause +
+            // any smoothing bridge) against the clone that just finished loading.
+            if (_pendingRangePreview is { } plan)
+            {
+                _pendingRangePreview = null;
+                PushMaterialIsolation();
+                Exec($"setPlaybackSpeed({Inv((float)_numSpeed.Value)});");
+                Exec($"playBridgedRangePreview('{EscapeJs(plan.Name)}', {(plan.Loop ? "true" : "false")}, {Inv(plan.LoopTime)});");
+                return;
+            }
+
             PushViewerState();
         }
 

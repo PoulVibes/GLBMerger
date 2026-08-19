@@ -43,8 +43,10 @@ namespace GlbMerger
     public class BallAnchorEditor : UserControl
     {
         private readonly ModelRoot _model;
+        private readonly AppSettings _settings;
 
         private ComboBox _animDropdown = null!;
+        private ComboBox _libraryCombo = null!;
         private RadioButton _radioRight = null!, _radioLeft = null!, _radioMerged = null!;
         private Panel _handEditPanel = null!;
         private NumericUpDown _numPosX = null!, _numPosY = null!, _numPosZ = null!;
@@ -124,11 +126,12 @@ namespace GlbMerger
         };
         private static readonly string[] JointNames = { "Shoulder", "Elbow", "Wrist" };
 
-        public BallAnchorEditor(ModelRoot model, bool darkMode = false)
+        public BallAnchorEditor(ModelRoot model, bool darkMode = false, AppSettings? settings = null)
         {
             _model = model;
-            _rightHand = FindHandNode(right: true);
-            _leftHand = FindHandNode(right: false);
+            _settings = settings ?? new AppSettings();
+            _rightHand = FindHandNode(_model, right: true);
+            _leftHand = FindHandNode(_model, right: false);
             _rightElbow = _rightHand?.VisualParent;
             _leftElbow = _leftHand?.VisualParent;
             _rightShoulder = _rightElbow?.VisualParent;
@@ -152,11 +155,11 @@ namespace GlbMerger
         // Same alias-matching convention ModelRenderer::FindHandJoints uses on
         // the C++ side, so this tool resolves the exact same bone the game
         // will look under for the anchor it saves here.
-        private Node? FindHandNode(bool right)
+        private static Node? FindHandNode(ModelRoot model, bool right)
         {
             Node? Search(string[] names)
             {
-                foreach (var n in _model.LogicalNodes)
+                foreach (var n in model.LogicalNodes)
                 {
                     if (string.IsNullOrEmpty(n.Name)) continue;
                     var lower = n.Name.ToLowerInvariant();
@@ -334,6 +337,34 @@ namespace GlbMerger
                 Padding = new Padding(12),
             };
 
+
+            // Writes both ball anchors and all 4 arm poses at once, rather than requiring 6
+            // separate visits across the "Save Anchor for This Hand" and "Save This Arm Pose"
+            // buttons below - sits at the very top since it's the button most people reach for
+            // once they're done tuning everything.
+            var btnSaveAll = new Button { Text = "Save All Ball Anchors && Arm Poses", AutoSize = true, Margin = new Padding(3, 0, 3, 10) };
+            btnSaveAll.Click += (s, e) => SaveAll();
+            flow.Controls.Add(btnSaveAll);
+
+            flow.Controls.Add(new Label { Text = "Copy Settings From Library Model:", AutoSize = true, Margin = new Padding(3, 0, 3, 4) });
+            var libraryRow = MakeRow();
+            _libraryCombo = new ComboBox { Width = 190, Height = 26, DropDownStyle = ComboBoxStyle.DropDownList, Margin = new Padding(3, 3, 8, 10) };
+            RefreshLibraryCombo();
+            // Resets back to unselected after firing, so picking the same model again later
+            // (e.g. after tweaking, to re-pull its baseline) still raises SelectedIndexChanged.
+            _libraryCombo.SelectedIndexChanged += (s, e) =>
+            {
+                if (_libraryCombo.SelectedItem is LibraryDirectoryHelper.LibraryEntry entry)
+                {
+                    CopyFromLibraryModel(entry.Path);
+                    _libraryCombo.SelectedIndex = -1;
+                }
+            };
+            var btnChangeLibraryDir = new Button { Text = "Change Directory...", AutoSize = true, Margin = new Padding(3, 3, 3, 10) };
+            btnChangeLibraryDir.Click += (s, e) => ChangeLibraryDirectory();
+            libraryRow.Controls.Add(_libraryCombo);
+            libraryRow.Controls.Add(btnChangeLibraryDir);
+            flow.Controls.Add(libraryRow);
 
             flow.Controls.Add(new Label { Text = "Preview:", AutoSize = true, Margin = new Padding(3, 0, 3, 4) });
             var modeRow = MakeRow();
@@ -681,16 +712,13 @@ namespace GlbMerger
                 $"{Inv(q.X)}, {Inv(q.Y)}, {Inv(q.Z)}, {Inv(q.W)});");
         }
 
-        private void SaveAnchor()
+        // Writes one hand's ball anchor - the shared core both SaveAnchor (whichever hand is
+        // currently selected) and SaveAll (both hands) call. Returns false only when this hand's
+        // bone never resolved in the first place, meaning there's nowhere to anchor it under.
+        private bool SaveAnchorFor(bool right)
         {
-            bool right = _radioRight.Checked;
             var hand = right ? _rightHand : _leftHand;
-            if (hand == null)
-            {
-                MessageBox.Show(this, "No bone resolved for this hand — cannot save.", "Ball Anchor",
-                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return;
-            }
+            if (hand == null) return false;
 
             var pos = right ? _rightPos : _leftPos;
             var rot = right ? _rightRotDeg : _leftRotDeg;
@@ -700,8 +728,45 @@ namespace GlbMerger
             anchor.Name = anchorName;
             anchor.WithLocalTranslation(new Vector3(pos.X, pos.Y, pos.Z));
             anchor.WithLocalRotation(ComputeOffsetQuaternion(rot.X, rot.Y, rot.Z));
+            return true;
+        }
 
-            _lblStatus.Text = $"Saved {(right ? "right" : "left")}-hand anchor under \"{hand.Name}\".";
+        private void SaveAnchor()
+        {
+            bool right = _radioRight.Checked;
+            if (!SaveAnchorFor(right))
+            {
+                MessageBox.Show(this, "No bone resolved for this hand — cannot save.", "Ball Anchor",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            var hand = right ? _rightHand : _leftHand;
+            _lblStatus.Text = $"Saved {(right ? "right" : "left")}-hand anchor under \"{hand!.Name}\".";
+        }
+
+        // Writes both ball anchors and all 4 arm-pose categories (rightCarry/leftCarry/rightMeet/
+        // leftMeet) at once, using whatever values are currently held rather than requiring a
+        // separate visit to each of the 6 individual Save buttons across both sections. Merged
+        // (category 2) is re-mirrored into category 3 first, same as every other place that
+        // touches it, so a batch save can never write a stale, out-of-sync left-Meet pose even if
+        // the user tweaked Merged's sliders without triggering OnArmSliderChanged's own mirror
+        // (e.g. right after CopyFromLibraryModel).
+        private void SaveAll()
+        {
+            MirrorMeetIntoLeft();
+
+            int anchorsSaved = 0;
+            if (SaveAnchorFor(right: true)) anchorsSaved++;
+            if (SaveAnchorFor(right: false)) anchorsSaved++;
+
+            int armsSaved = 0;
+            for (int category = 0; category < 4; category++)
+                if (SaveArmCategory(category)) armsSaved++;
+
+            string message = $"Saved {anchorsSaved} of 2 ball anchor(s) and {armsSaved} of 4 arm pose(s).";
+            _lblStatus.Text = message;
+            _lblArmStatus.Text = message;
         }
 
         // SharpGLTF has no direct "detach node" API, so this can't delete the
@@ -948,6 +1013,104 @@ namespace GlbMerger
             PushArmPose(2);
             PushArmPose(3);
             _lblArmStatus.Text = "Copied both arms from Carry (mirrored) — remember to Save.";
+        }
+
+        private void RefreshLibraryCombo()
+        {
+            _libraryCombo.Items.Clear();
+            foreach (var file in LibraryDirectoryHelper.ListGlbFiles(_settings.AnimationLibraryDirectory))
+                _libraryCombo.Items.Add(new LibraryDirectoryHelper.LibraryEntry { Path = file });
+        }
+
+        private void ChangeLibraryDirectory()
+        {
+            using var dlg = new FolderBrowserDialog
+            {
+                SelectedPath = Directory.Exists(_settings.AnimationLibraryDirectory) ? _settings.AnimationLibraryDirectory : "",
+                Description = "Choose the folder containing animation library .glb files",
+            };
+            if (dlg.ShowDialog(this) != DialogResult.OK) return;
+
+            _settings.AnimationLibraryDirectory = dlg.SelectedPath;
+            _settings.Save();
+            RefreshLibraryCombo();
+        }
+
+        // Reads whatever ball-anchor/arm-pose markers a library GLB has saved (same marker node
+        // names this editor itself writes - see SaveAnchor/SaveArmCategory) and copies them into
+        // the CURRENT model's in-memory working state, exactly as if the user had hand-dialed
+        // those same values in here. Nothing is written to the current model until the user hits
+        // Save (per hand/arm-pose, same as always) - this only seeds the sliders/fields. A source
+        // model missing a particular marker (e.g. it only ever had a right-hand anchor saved)
+        // just leaves that piece of state untouched rather than zeroing it out.
+        private void CopyFromLibraryModel(string glbPath)
+        {
+            ModelRoot source;
+            try
+            {
+                source = ModelRoot.Load(glbPath);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, $"Failed to load '{Path.GetFileName(glbPath)}':\n{ex.Message}", "Ball Anchor",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            var srcRightHand = FindHandNode(source, right: true);
+            var srcLeftHand = FindHandNode(source, right: false);
+            var srcRightElbow = srcRightHand?.VisualParent;
+            var srcLeftElbow = srcLeftHand?.VisualParent;
+            var srcRightShoulder = srcRightElbow?.VisualParent;
+            var srcLeftShoulder = srcLeftElbow?.VisualParent;
+
+            bool any = false;
+
+            void CopyAnchor(bool right)
+            {
+                var hand = right ? srcRightHand : srcLeftHand;
+                var anchor = FindExistingAnchor(hand);
+                if (anchor == null) return;
+
+                var t = anchor.LocalTransform.GetDecomposed();
+                var pos = (t.Translation.X, t.Translation.Y, t.Translation.Z);
+                var deg = QuaternionToDegrees(t.Rotation);
+                if (right) { _rightPos = pos; _rightRotDeg = deg; } else { _leftPos = pos; _leftRotDeg = deg; }
+                any = true;
+            }
+            CopyAnchor(right: true);
+            CopyAnchor(right: false);
+
+            for (int category = 0; category < 4; category++)
+            {
+                bool right = ArmCategories[category].Right;
+                var shoulder = right ? srcRightShoulder : srcLeftShoulder;
+                var elbow = right ? srcRightElbow : srcLeftElbow;
+                Node? ParentFor(int joint) => joint switch { 0 => shoulder?.VisualParent, 1 => shoulder, 2 => elbow, _ => null };
+
+                for (int joint = 0; joint < 3; joint++)
+                {
+                    var parent = ParentFor(joint);
+                    var marker = FindExistingChildByName(parent, ArmMarkerName(category, joint));
+                    if (marker == null) continue;
+
+                    var deg = QuaternionToDegrees(marker.LocalTransform.GetDecomposed().Rotation);
+                    _armDeg[category, joint] = new JointDeg { X = deg.X, Y = deg.Y, Z = deg.Z };
+                    any = true;
+                }
+            }
+            // Merged (category 2) is right-canonical - re-derive category 3 from whatever
+            // category 2 just got, same as every other place that touches it, so the two never
+            // fall out of sync even if the source model only had category 2 saved.
+            MirrorMeetIntoLeft();
+
+            RefreshUiFromState();
+            RefreshArmUiFromState();
+            PushAllArmPoses();
+
+            _lblStatus.Text = any
+                ? $"Copied settings from {Path.GetFileName(glbPath)} — remember to Save."
+                : $"{Path.GetFileName(glbPath)} has no saved ball anchor/arm pose data to copy.";
         }
 
         private void PopulateAnimationList()

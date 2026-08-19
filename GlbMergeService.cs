@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
+using System.Text.Json.Nodes;
 using SharpGLTF.Schema2;
 using SharpGLTF.Materials;
 using SharpGLTF.Scenes;
@@ -75,7 +76,31 @@ namespace GlbMerger
             // compounded every time an already-merged file was reloaded and merged again (each
             // pass stamped another suffix on top) - the user now names the output explicitly
             // instead.
-            Dictionary<string, string>? geomRenameMap1 = null)
+            Dictionary<string, string>? geomRenameMap1 = null,
+            // Clips whose *output* animation should loop once the engine reaches its last frame,
+            // versus pausing there - a custom-engine playback choice with no native glTF
+            // representation, so it's stamped onto the output animation's own "extras" (see the
+            // bottom of this method) for that engine to read at load time rather than being baked
+            // into the keyframe data itself.
+            List<string>? loopAnims1 = null,
+            List<string>? loopAnims2 = null,
+            // Which frame (in that clip's own pre-trim numbering - the same one GlbInfoPanel's
+            // Start/End Frame columns use) a looping clip should resume at, keyed by the clip's
+            // *original* name. Absent means resume at frame 0 (the clip's own start), same as
+            // before this option existed. Resolved to a rebased seconds-offset - clamped into
+            // whatever frame range frameTrimByName1/2 actually kept, the same way TrimAnimation
+            // rebases kept keyframes - before Process Merge trims the clip, so trimming never
+            // silently discards or shifts the loop point the user picked at load time.
+            Dictionary<string, int>? loopFrameByName1 = null,
+            Dictionary<string, int>? loopFrameByName2 = null,
+            // Any number of extra GLB files whose animations get folded into slot 2 on top of
+            // whatever it already carries (its own native clips, plus any supplemental FBX
+            // clips) - the "animation library" dropdown's source. Each one gets the same
+            // bone-length/hip-rotation correction slot 2's own native GLB clips do (using that
+            // library file's own bind pose, captured up front in GlbAnimationSource), rather than
+            // an FBX-style axis retarget, since these are ordinary glTF rigs sharing the same
+            // Y-up convention as the target - not FBX exports needing a coordinate-system fix.
+            List<GlbAnimationSource>? libraryAnims2 = null)
         {
             if (path1 == null)
                 throw new ArgumentException("Model 1 must be loaded - its geometry is always used as the merged output's structure.");
@@ -298,6 +323,33 @@ namespace GlbMerger
             foreach (var fbxSource in fbxAnims2 ?? Enumerable.Empty<FbxAnimationSource>())
                 clips2.AddRange(RetargetFbxClips(fbxSource, targetReferenceTranslationsByName));
 
+            // Cloned before correcting: a GlbAnimationSource is kept around across repeated
+            // "Process Merge" clicks (the user isn't expected to re-pick library files every
+            // time), but ApplyBoneLengthCorrection/ApplyHipRotationCorrection mutate a channel's
+            // Translation/Rotation dictionaries in place - correcting the stored original
+            // directly would compound the correction a little more on every subsequent merge.
+            foreach (var librarySource in libraryAnims2 ?? Enumerable.Empty<GlbAnimationSource>())
+            {
+                var clips = CloneClips(librarySource.Clips);
+                ApplyBoneLengthCorrection(
+                    clips,
+                    librarySource.BindTranslationsByName, targetReferenceTranslationsByName,
+                    new HashSet<string>(fixBoneLengthAnims2 ?? new List<string>()));
+                if (librarySource.HipsBindRotation.HasValue && targetHipsBindRotation.HasValue)
+                    ApplyHipRotationCorrection(
+                        clips,
+                        librarySource.HipsBindRotation.Value, targetHipsBindRotation.Value,
+                        targetHipsChildNames,
+                        new HashSet<string>(fixHipRotationAnims2 ?? new List<string>()));
+                clips2.AddRange(clips);
+            }
+
+            // Resolved from each clip's own pre-trim keyframe times before ApplyFrameTrim below
+            // crops and rebases them - otherwise the frame index the user picked would refer to a
+            // keyframe that either no longer exists post-trim, or has shifted to a different time.
+            var loopTimeByName1 = ComputeLoopTimes(clips1, loopFrameByName1, frameTrimByName1);
+            var loopTimeByName2 = ComputeLoopTimes(clips2, loopFrameByName2, frameTrimByName2);
+
             ApplyFrameTrim(clips1, frameTrimByName1);
             ApplyFrameTrim(clips2, frameTrimByName2);
 
@@ -318,7 +370,76 @@ namespace GlbMerger
             if (firstAnimName2 != null && firstAnimName1 == null) { ApplySlot2(); ApplySlot1(); }
             else { ApplySlot1(); ApplySlot2(); }
 
-            return outScene.ToGltf2();
+            var result = outScene.ToGltf2();
+            StampLoopExtras(result, loopAnims1, loopTimeByName1, animRenameMap1, loopAnims2, loopTimeByName2, animRenameMap2);
+            return result;
+        }
+
+        // Resolves each requested loop-back frame (in the clip's own pre-trim numbering) to a
+        // rebased seconds-offset - clamped into whatever [start, end] frameTrimByName actually
+        // kept, the same way TrimAnimation itself rebases kept keyframes - so a clip trimmed down
+        // after its loop frame was chosen still loops back to a valid, correctly-shifted point
+        // instead of one that's been cropped away or left pointing at the old, pre-trim time.
+        // Absent from loopFrameByName means "loop to frame 0" (the trimmed clip's own start),
+        // unchanged from before this option existed.
+        private static Dictionary<string, float> ComputeLoopTimes(
+            List<AnimationClipData> clips, Dictionary<string, int>? loopFrameByName,
+            Dictionary<string, (int Start, int End)>? frameTrimByName)
+        {
+            var result = new Dictionary<string, float>();
+            if (loopFrameByName == null || loopFrameByName.Count == 0) return result;
+
+            foreach (var clip in clips)
+            {
+                if (!loopFrameByName.TryGetValue(clip.Name, out var loopFrame)) continue;
+
+                var times = CollectFrameTimes(clip);
+                if (times.Count == 0) continue;
+
+                int startFrame = 0, endFrame = times.Count - 1;
+                if (frameTrimByName != null && frameTrimByName.TryGetValue(clip.Name, out var range))
+                {
+                    startFrame = Math.Clamp(range.Start, 0, times.Count - 1);
+                    endFrame = Math.Clamp(range.End, startFrame, times.Count - 1);
+                }
+
+                int clampedFrame = Math.Clamp(loopFrame, startFrame, endFrame);
+                result[clip.Name] = Math.Max(0f, times[clampedFrame] - times[startFrame]);
+            }
+            return result;
+        }
+
+        // Writes { "loop": true/false, "loopTime": seconds } into every output animation's own
+        // glTF "extras" object - glTF has no native loop-vs-pause concept (it's purely a runtime
+        // engine decision), so this is a private convention between this app and the target
+        // engine, which reads it back at load time to decide whether to hold on the last frame or
+        // seek back to loopTime and keep playing. Keyed by *output* name (after the user's "Merged
+        // As" rename) since that's the only name the engine will ever see.
+        private static void StampLoopExtras(
+            ModelRoot result,
+            List<string>? loopNames1, Dictionary<string, float> loopTimes1, Dictionary<string, string>? renameMap1,
+            List<string>? loopNames2, Dictionary<string, float> loopTimes2, Dictionary<string, string>? renameMap2)
+        {
+            var loopOutputNames = new HashSet<string>();
+            var loopOutputTimes = new Dictionary<string, float>();
+            void AddLoopNames(List<string>? loopNames, Dictionary<string, float> loopTimes, Dictionary<string, string>? renameMap)
+            {
+                foreach (var name in loopNames ?? Enumerable.Empty<string>())
+                {
+                    var outputName = renameMap != null && renameMap.TryGetValue(name, out var renamed) ? renamed : name;
+                    loopOutputNames.Add(outputName);
+                    if (loopTimes.TryGetValue(name, out var loopTime))
+                        loopOutputTimes[outputName] = loopTime;
+                }
+            }
+            AddLoopNames(loopNames1, loopTimes1, renameMap1);
+            AddLoopNames(loopNames2, loopTimes2, renameMap2);
+
+            foreach (var anim in result.LogicalAnimations)
+            {
+                var name = anim.Name ?? $"Anim_{anim.LogicalIndex}";
+                SetAnimationLoop(result, name, loopOutputNames.Contains(name), loopOutputTimes.GetValueOrDefault(name, 0f));
+            }
         }
 
         private static void MoveClipToFront(List<AnimationClipData> clips, string clipName)
@@ -344,6 +465,27 @@ namespace GlbMerger
         // "frame" numbering GlbInfoPanel's trim columns show and edit, computed the same way here
         // so the two always agree on what frame index N means for a given clip.
         public static int ComputeAnimationFrameCount(AnimationClipData clip) => CollectFrameTimes(clip).Count;
+
+        // Converts a stored loopTime (seconds, e.g. from GlbAnimationSource.LoopByClipName) back
+        // to the nearest matching frame index in this clip's own distinct keyframe times - the
+        // reverse of the frame-to-time resolution ComputeLoopTimes does at merge time. Used to seed
+        // GlbInfoPanel's Loop Frame column from a library GLB's own already-baked loop setting,
+        // the same way LoadMaterialsFromGlb does for a directly-dropped GLB (which can read times
+        // straight off its own ModelRoot instead).
+        public static int NearestLoopFrame(AnimationClipData clip, float loopTime)
+        {
+            var times = CollectFrameTimes(clip);
+            if (times.Count == 0) return 0;
+
+            int best = 0;
+            float bestDist = Math.Abs(times[0] - loopTime);
+            for (int i = 1; i < times.Count; i++)
+            {
+                float dist = Math.Abs(times[i] - loopTime);
+                if (dist < bestDist) { bestDist = dist; best = i; }
+            }
+            return best;
+        }
 
         // Crops `clip` in place down to just [startFrame, endFrame] (inclusive, by index into its
         // own distinct keyframe times), re-basing so the trimmed clip starts at time 0 - mirrors
@@ -947,6 +1089,76 @@ namespace GlbMerger
             return clips;
         }
 
+        // Extracts a standalone GLB's own animation clips together with the bind-pose data
+        // (per-bone bind translation, Hips bind rotation) needed to later retarget those clips
+        // onto a different structural model - the same inputs ApplyBoneLengthCorrection/
+        // ApplyHipRotationCorrection already use for slot 2's own dropped GLB, computed here for
+        // the "animation library" dropdown so any number of extra GLB files can each be captured
+        // once (at the moment the user picks it) and reused across repeated Process Merge clicks
+        // without re-reading the file.
+        public static GlbAnimationSource ExtractGlbAnimationSource(string path)
+        {
+            var model = ModelRoot.Load(path);
+            var clips = ExtractGlbAnimationClips(model);
+
+            var nodesByName = model.LogicalNodes
+                .Where(n => n.Name != null)
+                .GroupBy(n => n.Name!)
+                .ToDictionary(g => g.Key, g => g.First());
+
+            var bindTranslationsByName = new Dictionary<string, Vector3>();
+            foreach (var node in nodesByName.Values)
+            {
+                Matrix4x4.Decompose(node.LocalMatrix, out _, out _, out var bindTranslation);
+                bindTranslationsByName[node.Name!] = bindTranslation;
+            }
+
+            Quaternion? hipsBindRotation = null;
+            if (nodesByName.TryGetValue("Hips", out var hipsNode))
+            {
+                Matrix4x4.Decompose(hipsNode.LocalMatrix, out _, out var hipsRot, out _);
+                hipsBindRotation = hipsRot;
+            }
+
+            var loopByClipName = new Dictionary<string, (bool Loop, float LoopTime)>();
+            foreach (var clip in clips)
+                if (HasAnimationLoopExtras(model, clip.Name))
+                    loopByClipName[clip.Name] = GetAnimationLoop(model, clip.Name);
+
+            return new GlbAnimationSource
+            {
+                Clips = clips,
+                BindTranslationsByName = bindTranslationsByName,
+                HipsBindRotation = hipsBindRotation,
+                LoopByClipName = loopByClipName
+            };
+        }
+
+        // Deep-copies clips, including each channel's own keyframe dictionaries, so the
+        // in-place mutation ApplyBoneLengthCorrection/ApplyHipRotationCorrection perform on a
+        // channel's Translation/Rotation dictionaries never reaches the original clips stored in
+        // a GlbAnimationSource (see the comment where this is called, in MergeTargeted).
+        private static List<AnimationClipData> CloneClips(List<AnimationClipData> clips)
+        {
+            var result = new List<AnimationClipData>();
+            foreach (var clip in clips)
+            {
+                var cloned = new AnimationClipData { Name = clip.Name };
+                foreach (var ch in clip.NodeChannels)
+                {
+                    cloned.NodeChannels.Add(new NodeChannelData
+                    {
+                        NodeName = ch.NodeName,
+                        Translation = ch.Translation != null ? new Dictionary<float, Vector3>(ch.Translation) : null,
+                        Rotation = ch.Rotation != null ? new Dictionary<float, Quaternion>(ch.Rotation) : null,
+                        Scale = ch.Scale != null ? new Dictionary<float, Vector3>(ch.Scale) : null,
+                    });
+                }
+                result.Add(cloned);
+            }
+            return result;
+        }
+
         // Crops an existing animation in-place (on the already-loaded model) down to just the
         // frame range [startFrame, endFrame], re-basing so the trimmed clip starts at time 0 -
         // matching the correction pattern used by JointOrientationEditor (Node.WithXAnimation
@@ -995,6 +1207,156 @@ namespace GlbMerger
                 else if (ch.TargetNodePath == PropertyPath.scale)
                     node.WithScaleAnimation(animationName, TrimKeys(ch.GetScaleSampler().GetLinearKeys(), startTime, endTime));
             }
+        }
+
+        // Reads back whatever loop setting is currently stamped on this animation's own glTF
+        // extras (see SetAnimationLoop/StampLoopExtras) - (false, 0) if the clip has never had one
+        // set, or its extras aren't in the shape this app writes. loopTime is seconds into the
+        // (already-trimmed, so 0-based) clip to seek back to once playback reaches the end.
+        public static (bool Loop, float LoopTime) GetAnimationLoop(ModelRoot model, string animationName)
+        {
+            var anim = model.LogicalAnimations.FirstOrDefault(a => (a.Name ?? $"Anim_{a.LogicalIndex}") == animationName);
+            if (anim?.Extras is JsonObject obj)
+            {
+                bool loop = obj["loop"]?.GetValue<bool>() ?? false;
+                float loopTime = obj["loopTime"]?.GetValue<float>() ?? 0f;
+                return (loop, loopTime);
+            }
+            return (false, 0f);
+        }
+
+        // True only if this animation's own extras already carry this app's loop convention (a
+        // "loop" key) - distinguishes "explicitly saved as Pause" from "never had a loop setting
+        // saved at all", which GetAnimationLoop's own (false, 0) fallback can't tell apart on its
+        // own. Used only by callers seeding a *default* Loop checkbox from the source
+        // (GlbInfoPanel.LoadMaterialsFromGlb, ExtractGlbAnimationSource) - a clip with no saved
+        // loop data should fall back to this app's normal "Loop checked" default, not silently
+        // become "Loop unchecked" just because GetAnimationLoop had nothing to report.
+        public static bool HasAnimationLoopExtras(ModelRoot model, string animationName)
+        {
+            var anim = model.LogicalAnimations.FirstOrDefault(a => (a.Name ?? $"Anim_{a.LogicalIndex}") == animationName);
+            return anim?.Extras is JsonObject obj && obj["loop"] != null;
+        }
+
+        // Stamps { "loop": bool, "loopTime": seconds } onto this animation's own glTF extras - the
+        // per-clip engine playback convention described where this is called from (the Animation
+        // Trim editor's Loop checkbox/frame picker, and StampLoopExtras for the main GUI's simpler
+        // per-row Loop checkbox, which always passes loopTime 0 since a trimmed clip's own start is
+        // already frame 0). No native glTF field covers this - loop-vs-pause and where to resume
+        // are purely a runtime engine decision, so this is a private convention the target engine
+        // reads back at load time.
+        public static void SetAnimationLoop(ModelRoot model, string animationName, bool loop, float loopTime)
+        {
+            var anim = model.LogicalAnimations.FirstOrDefault(a => (a.Name ?? $"Anim_{a.LogicalIndex}") == animationName)
+                ?? throw new InvalidOperationException($"Animation '{animationName}' not found.");
+            anim.Extras = new JsonObject { ["loop"] = loop, ["loopTime"] = loopTime };
+        }
+
+        // Appends `frameCount` new keyframes after this (already-trimmed) clip's own last frame,
+        // for every channel of every animated node, blending each channel's end-of-clip value
+        // toward its value at `loopTime` (translation/scale lerp, rotation slerp) - so playing
+        // through this "bridge" segment before wrapping back to loopTime eases into the loop point
+        // instead of popping straight from the last frame's pose to the loop frame's. A no-op if
+        // frameCount is 0 or the clip doesn't have at least two distinct keyframe times to work
+        // from (nothing to bridge). New keys are spaced using this clip's own average existing
+        // keyframe interval, so the bridge's pacing matches the rest of the clip rather than
+        // guessing at an FPS the source file never stored.
+        public static void AddLoopSmoothingFrames(ModelRoot model, string animationName, int frameCount, float loopTime)
+        {
+            if (frameCount <= 0) return;
+
+            var anim = model.LogicalAnimations.FirstOrDefault(a => (a.Name ?? $"Anim_{a.LogicalIndex}") == animationName)
+                ?? throw new InvalidOperationException($"Animation '{animationName}' not found.");
+
+            var channels = anim.Channels.ToList();
+            if (channels.Count == 0) return;
+
+            var allTimes = new SortedSet<float>();
+            foreach (var ch in channels)
+            {
+                if (ch.TargetNodePath == PropertyPath.translation)
+                    foreach (var k in ch.GetTranslationSampler().GetLinearKeys()) allTimes.Add(k.Key);
+                else if (ch.TargetNodePath == PropertyPath.rotation)
+                    foreach (var k in ch.GetRotationSampler().GetLinearKeys()) allTimes.Add(k.Key);
+                else if (ch.TargetNodePath == PropertyPath.scale)
+                    foreach (var k in ch.GetScaleSampler().GetLinearKeys()) allTimes.Add(k.Key);
+            }
+            if (allTimes.Count < 2) return;
+
+            var times = allTimes.ToList();
+            float endTime = times[^1];
+            float avgSpacing = (endTime - times[0]) / (times.Count - 1);
+            if (avgSpacing <= 0f) avgSpacing = 1f / 30f;
+            loopTime = Math.Clamp(loopTime, times[0], endTime);
+
+            foreach (var ch in channels)
+            {
+                var node = ch.TargetNode;
+                if (node == null) continue;
+
+                if (ch.TargetNodePath == PropertyPath.translation)
+                {
+                    var keys = ch.GetTranslationSampler().GetLinearKeys().OrderBy(k => k.Key).ToArray();
+                    var bridged = AppendBridgeKeys(keys, endTime, avgSpacing, loopTime, frameCount, Vector3.Lerp);
+                    node.WithTranslationAnimation(animationName, bridged);
+                }
+                else if (ch.TargetNodePath == PropertyPath.rotation)
+                {
+                    var keys = ch.GetRotationSampler().GetLinearKeys().OrderBy(k => k.Key).ToArray();
+                    var bridged = AppendBridgeKeys(keys, endTime, avgSpacing, loopTime, frameCount, Quaternion.Slerp);
+                    node.WithRotationAnimation(animationName, bridged);
+                }
+                else if (ch.TargetNodePath == PropertyPath.scale)
+                {
+                    var keys = ch.GetScaleSampler().GetLinearKeys().OrderBy(k => k.Key).ToArray();
+                    var bridged = AppendBridgeKeys(keys, endTime, avgSpacing, loopTime, frameCount, Vector3.Lerp);
+                    node.WithScaleAnimation(animationName, bridged);
+                }
+            }
+        }
+
+        // Linearly interpolates `keys` (sorted by time) at an arbitrary `time` - used to find each
+        // channel's actual pose at the loop-back point, which won't generally land exactly on an
+        // existing keyframe. Clamps to the first/last key's value outside the keys' own range.
+        private static T SampleAt<T>(IReadOnlyList<(float Key, T Value)> keys, float time, Func<T, T, float, T> lerp)
+        {
+            if (keys.Count == 0) throw new InvalidOperationException("Channel has no keyframes to sample.");
+            if (time <= keys[0].Key) return keys[0].Value;
+            if (time >= keys[^1].Key) return keys[^1].Value;
+
+            for (int i = 0; i < keys.Count - 1; i++)
+            {
+                var (t0, v0) = keys[i];
+                var (t1, v1) = keys[i + 1];
+                if (time < t0 || time > t1) continue;
+
+                float span = t1 - t0;
+                float frac = span > 0f ? (time - t0) / span : 0f;
+                return lerp(v0, v1, frac);
+            }
+            return keys[^1].Value;
+        }
+
+        // Builds this channel's new key array: its existing keys unchanged, plus `frameCount` new
+        // ones after `endTime` that ease from the channel's own end-of-clip value toward its value
+        // at `loopTime` - the last new key (frac approaching 1) ends up right at the loop-time
+        // value, so seeking back to loopTime immediately afterward reads as continuous rather than
+        // a snap.
+        private static (float Time, T Value)[] AppendBridgeKeys<T>(
+            (float Key, T Value)[] existingKeys, float endTime, float avgSpacing, float loopTime,
+            int frameCount, Func<T, T, float, T> lerp)
+        {
+            var endValue = SampleAt(existingKeys, endTime, lerp);
+            var loopValue = SampleAt(existingKeys, loopTime, lerp);
+
+            var result = existingKeys.ToList();
+            for (int i = 1; i <= frameCount; i++)
+            {
+                float frac = (float)i / (frameCount + 1);
+                float time = endTime + avgSpacing * i;
+                result.Add((time, lerp(endValue, loopValue, frac)));
+            }
+            return result.ToArray();
         }
 
         // Keeps only the keys within [startTime, endTime] and shifts them so the earliest kept

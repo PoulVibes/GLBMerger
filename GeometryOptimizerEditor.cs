@@ -1157,9 +1157,79 @@ namespace GlbMerger
                     // to a scene, never rendered. Runs independently of <model-viewer>'s own load;
                     // painting simply isn't possible until this resolves, same as it wasn't
                     // possible before <model-viewer> finished loading either.
+                    var _skinIndex = new THREE.Vector4();
+                    var _skinWeight = new THREE.Vector4();
+                    var _bindPos = new THREE.Vector3();
+                    var _bindNrm = new THREE.Vector3();
+                    var _boneMatrix = new THREE.Matrix4();
+                    var _boneNormalMat = new THREE.Matrix3();
+                    var _skinTmp = new THREE.Vector3();
+                    var _skinTmpN = new THREE.Vector3();
+
+                    // Bakes the mesh's current pose into a plain (unskinned) BufferGeometry, in the
+                    // mesh's own local frame - i.e. the position a static mesh would need so that,
+                    // once mesh.matrixWorld is applied on top (same as every other geometry here),
+                    // it lands exactly where <model-viewer>'s GPU skinning renders the posed
+                    // surface. Everything downstream (wireframe, depth mask, brush decal, paint
+                    // overlay, triangle data) reads geometry.attributes.position directly and
+                    // applies only matrixWorld - none of it runs the skinning shader, so without
+                    // this the bind pose (often a T-pose) is what gets drawn and hit-tested instead
+                    // of the actual pose. That's most visible on whatever moves furthest from bind
+                    // pose, typically the arms.
+                    function bakeSkinnedGeometry(mesh) {
+                        var srcGeom = mesh.geometry;
+                        if (!mesh.isSkinnedMesh || !mesh.skeleton
+                            || !srcGeom.attributes.skinIndex || !srcGeom.attributes.skinWeight) {
+                            return srcGeom;
+                        }
+                        var pos = srcGeom.attributes.position;
+                        var nrm = srcGeom.attributes.normal;
+                        var skinIndexAttr = srcGeom.attributes.skinIndex;
+                        var skinWeightAttr = srcGeom.attributes.skinWeight;
+                        var outPos = new Float32Array(pos.count * 3);
+                        var outNrm = nrm ? new Float32Array(nrm.count * 3) : null;
+                        var bones = mesh.skeleton.bones;
+                        var boneInverses = mesh.skeleton.boneInverses;
+
+                        for (var i = 0; i < pos.count; i++) {
+                            _skinIndex.fromBufferAttribute(skinIndexAttr, i);
+                            _skinWeight.fromBufferAttribute(skinWeightAttr, i);
+                            _bindPos.fromBufferAttribute(pos, i).applyMatrix4(mesh.bindMatrix);
+                            if (outNrm) _bindNrm.fromBufferAttribute(nrm, i).transformDirection(mesh.bindMatrix);
+
+                            var vx = 0, vy = 0, vz = 0, nx = 0, ny = 0, nz = 0;
+                            for (var w = 0; w < 4; w++) {
+                                var weight = _skinWeight.getComponent(w);
+                                if (weight === 0) continue;
+                                var boneIndex = _skinIndex.getComponent(w);
+                                _boneMatrix.multiplyMatrices(bones[boneIndex].matrixWorld, boneInverses[boneIndex]);
+                                _skinTmp.copy(_bindPos).applyMatrix4(_boneMatrix);
+                                vx += _skinTmp.x * weight; vy += _skinTmp.y * weight; vz += _skinTmp.z * weight;
+                                if (outNrm) {
+                                    _boneNormalMat.getNormalMatrix(_boneMatrix);
+                                    _skinTmpN.copy(_bindNrm).applyMatrix3(_boneNormalMat);
+                                    nx += _skinTmpN.x * weight; ny += _skinTmpN.y * weight; nz += _skinTmpN.z * weight;
+                                }
+                            }
+                            _skinTmp.set(vx, vy, vz).applyMatrix4(mesh.bindMatrixInverse);
+                            outPos[i * 3] = _skinTmp.x; outPos[i * 3 + 1] = _skinTmp.y; outPos[i * 3 + 2] = _skinTmp.z;
+                            if (outNrm) {
+                                _skinTmpN.set(nx, ny, nz).transformDirection(mesh.bindMatrixInverse);
+                                outNrm[i * 3] = _skinTmpN.x; outNrm[i * 3 + 1] = _skinTmpN.y; outNrm[i * 3 + 2] = _skinTmpN.z;
+                            }
+                        }
+
+                        var baked = new THREE.BufferGeometry();
+                        baked.setAttribute('position', new THREE.BufferAttribute(outPos, 3));
+                        if (outNrm) baked.setAttribute('normal', new THREE.BufferAttribute(outNrm, 3));
+                        if (srcGeom.index) baked.setIndex(srcGeom.index);
+                        return baked;
+                    }
+
                     var hitTestLoader = new THREE.GLTFLoader();
                     function loadHitTestGeometry(url) {
                         hitTestLoader.load(url, function (gltf) {
+                            gltf.scene.updateMatrixWorld(true);
                             var meshes = [];
                             gltf.scene.traverse(function (obj) {
                                 if (!obj.isMesh || !obj.userData || obj.userData.glbMergerMeshIndex === undefined) return;
@@ -1177,6 +1247,7 @@ namespace GlbMerger
                                 })) {
                                     primIndex = parent.children.indexOf(obj);
                                 }
+                                obj.geometry = bakeSkinnedGeometry(obj);
                                 var triData = computeTriangleData(obj);
                                 meshes.push({
                                     object: obj, meshIndex: meshIndex, primIndex: primIndex,

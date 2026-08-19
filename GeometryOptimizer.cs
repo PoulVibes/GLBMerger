@@ -300,6 +300,23 @@ namespace GlbMerger
 
             var cleaned = SceneBuilder.ToGltf2(SceneBuilder.CreateFrom(working), SceneBuilderSchema2Settings.Default);
             cleaned.MergeBuffers();
+
+            // SceneBuilder's rebuild only knows about scene-graph geometry/animation channel data -
+            // it has no concept of this app's own "loop"/"loopTime" glTF extras convention (see
+            // GlbMergeService.SetAnimationLoop), so a straight rebuild silently drops it, and
+            // DescribeLosses below is none the wiser since it only tracks channel counts, not
+            // extras. Re-attached here by matching animation name so a Save that goes through
+            // "clean up unused geometry" doesn't quietly reset every clip's loop setting back to
+            // whatever a freshly-created animation defaults to (no extras at all, which the rest of
+            // the app then reads as "loop checked" - see GlbInfoPanel's _animLoopByName fallback).
+            var extrasByName = model.LogicalAnimations.ToDictionary(a => a.Name ?? $"Anim_{a.LogicalIndex}", a => a.Extras);
+            foreach (var anim in cleaned.LogicalAnimations)
+            {
+                var name = anim.Name ?? $"Anim_{anim.LogicalIndex}";
+                if (extrasByName.TryGetValue(name, out var extras) && extras != null)
+                    anim.Extras = extras;
+            }
+
             return cleaned;
         }
 

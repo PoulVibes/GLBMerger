@@ -22,6 +22,7 @@ namespace GlbMerger
         private string? path1, path2; // GLB path for a slot; null if that slot has no GLB loaded
         private FbxAnimationSource? fbxAnims1; // slot 1's single FBX source, if it holds one
         private List<FbxAnimationSource> fbxAnimsList2 = new(); // slot 2 accumulates any number of dropped FBX sources
+        private List<GlbAnimationSource> libraryAnimsList2 = new(); // slot 2 also accumulates any number of GLBs added from the animation library dropdown
         private SharpGLTF.Schema2.ModelRoot? latestMergedModel; // in-memory result of the last "Process Merge" - not yet saved anywhere the user chose
 
         public MainForm()
@@ -153,12 +154,19 @@ namespace GlbMerger
 
             panel1 = new GlbInfoPanel { Dock = DockStyle.Fill, ShowAnimationCheckboxes = true };
             panel1.UpdateTitle("Model 1 (geometry, materials, animations)");
+            panel1.SettingsChanged += OnPanelSettingsChanged;
 
-            panel2 = new GlbInfoPanel(showGeometryBox: false) { Dock = DockStyle.Fill, ShowAnimationCheckboxes = true };
+            panel2 = new GlbInfoPanel(showGeometryBox: false, defaultFixBoneLength: true, defaultFixHipRotation: true) { Dock = DockStyle.Fill, ShowAnimationCheckboxes = true };
+            panel2.SettingsChanged += OnPanelSettingsChanged;
             panel2.UpdateTitle("Model 2 - drop a GLB onto Materials, FBX file(s) onto Animations");
             panel2.EnableDropTargets();
             panel2.GlbFileDropped += async path => await LoadGlbIntoSlot2(path);
             panel2.FbxFilesDropped += async paths => await LoadFbxFilesIntoSlot2(paths);
+
+            panel2.EnableAnimationLibrary();
+            panel2.SetAnimationLibraryDirectory(_settings.AnimationLibraryDirectory);
+            panel2.LibraryModelSelected += async path => await AddLibraryModelToSlot2(path);
+            panel2.LibraryDirectoryChangeRequested += OnChangeAnimationLibraryDirectory;
 
             splitter.Panel1.Controls.Add(panel1);
             splitter.Panel2.Controls.Add(panel2);
@@ -231,6 +239,7 @@ namespace GlbMerger
             path2 = null;
             fbxAnims1 = null;
             fbxAnimsList2 = new List<FbxAnimationSource>();
+            libraryAnimsList2 = new List<GlbAnimationSource>();
             latestMergedModel = null;
 
             panel1.Reset("Model 1 (geometry, materials, animations)");
@@ -360,9 +369,92 @@ namespace GlbMerger
             var parts = new List<string>();
             if (path2 != null) parts.Add(Path.GetFileName(path2));
             if (fbxAnimsList2.Count > 0) parts.Add($"{fbxAnimsList2.Count} FBX animation source(s)");
+            if (libraryAnimsList2.Count > 0) parts.Add($"{libraryAnimsList2.Count} library animation source(s)");
             panel2.UpdateTitle(parts.Count > 0
                 ? "Model 2: " + string.Join(" + ", parts)
                 : "Model 2 - drop a GLB onto Materials, FBX file(s) onto Animations");
+        }
+
+        // Lets the user repoint the animation-library dropdown at a different folder (e.g. a
+        // different character's pre-made animation set) instead of always reading from whatever
+        // directory shipped as the default - persisted so it's remembered next launch.
+        private void OnChangeAnimationLibraryDirectory()
+        {
+            using var dlg = new FolderBrowserDialog
+            {
+                SelectedPath = Directory.Exists(_settings.AnimationLibraryDirectory) ? _settings.AnimationLibraryDirectory : "",
+                Description = "Choose the folder containing animation library .glb files",
+            };
+            if (dlg.ShowDialog(this) != DialogResult.OK) return;
+
+            _settings.AnimationLibraryDirectory = dlg.SelectedPath;
+            _settings.Save();
+            panel2.SetAnimationLibraryDirectory(dlg.SelectedPath);
+            lblStatus.Text = $"Animation library directory set to {dlg.SelectedPath}";
+        }
+
+        // Adds one library GLB's animations to slot 2, on top of whatever it already carries
+        // (its own native clips, any dropped FBX sources, and any library GLBs added earlier) -
+        // the animation-library dropdown's equivalent of dropping an FBX file onto the animations
+        // grid, just sourced from a folder of pre-made GLBs instead of a file picker/drag-drop.
+        private async Task AddLibraryModelToSlot2(string glbPath)
+        {
+            SetBusy(true, $"Adding {Path.GetFileName(glbPath)}...");
+            try
+            {
+                var raw = await Task.Run(() => GlbMergeService.ExtractGlbAnimationSource(glbPath));
+
+                // Unlike FBX (whose own clip name is often generic, e.g. Mixamo's literal
+                // "mixamo.com", so the whole batch gets renamed off the filename instead), a
+                // library GLB's clip names are the whole point - "Idle", "Run", etc - so they're
+                // kept as-is for both the internal Name and the "Merged As" the user sees. Name
+                // only gets a numeric suffix on an actual collision (e.g. two different library
+                // files both having an "Idle"); MergedAs always keeps the true original name so
+                // the output track is still called "Idle" either way.
+                var usedNames = new HashSet<string>(panel2.GetAllAnimationNames());
+                var renamedClips = new List<AnimationClipData>();
+                var displayInfo = new List<(string Name, string MergedAs, int FrameCount, (bool Loop, int LoopFrame)? LoopInfo)>();
+                foreach (var clip in raw.Clips)
+                {
+                    var uniqueName = MakeUnique(clip.Name, usedNames);
+                    var renamed = new AnimationClipData { Name = uniqueName };
+                    renamed.NodeChannels.AddRange(clip.NodeChannels);
+                    renamedClips.Add(renamed);
+
+                    // Seeds the grid row's Loop checkbox/Loop Frame from whatever this library
+                    // GLB's own clip already carries in its extras (see GlbAnimationSource.
+                    // LoopByClipName, only populated for a clip that actually had a saved loop
+                    // setting), converting its stored seconds-offset back to the nearest matching
+                    // frame index - same "reflect the source" treatment a directly-dropped GLB
+                    // gets in LoadMaterialsFromGlb. Left null for a clip with no saved setting at
+                    // all, so the panel's own "Loop checked" default applies instead of forcing
+                    // every never-processed library clip to Pause.
+                    (bool Loop, int LoopFrame)? loopInfo = null;
+                    if (raw.LoopByClipName != null && raw.LoopByClipName.TryGetValue(clip.Name, out var loopData))
+                        loopInfo = (loopData.Loop, GlbMergeService.NearestLoopFrame(clip, loopData.LoopTime));
+                    displayInfo.Add((uniqueName, clip.Name, GlbMergeService.ComputeAnimationFrameCount(clip), loopInfo));
+                }
+
+                libraryAnimsList2.Add(new GlbAnimationSource
+                {
+                    Clips = renamedClips,
+                    BindTranslationsByName = raw.BindTranslationsByName,
+                    HipsBindRotation = raw.HipsBindRotation
+                });
+
+                UpdateSlot2Title();
+                panel2.AddSupplementalFbxAnimations(displayInfo);
+                lblStatus.Text = $"Added {Path.GetFileName(glbPath)} to Model 2 animations";
+            }
+            catch (Exception ex)
+            {
+                lblStatus.Text = "Error: " + ex.Message;
+                MessageBox.Show($"Failed to load '{Path.GetFileName(glbPath)}':\n{ex.Message}", "Import Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            finally
+            {
+                SetBusy(false, null);
+            }
         }
 
         // An FBX's own internal clip name is often generic (e.g. Mixamo's literal "mixamo.com"),
@@ -373,20 +465,31 @@ namespace GlbMerger
         private static FbxAnimationSource RenameClipsToUniqueNames(FbxAnimationSource source, string fbxPath, HashSet<string> usedNames)
         {
             var baseName = Path.GetFileNameWithoutExtension(fbxPath).Replace(' ', '_');
-            var multiClip = source.Clips.Count > 1;
+            var renamedClips = RenameClipsToUniqueNames(source.Clips, baseName, usedNames);
+            return new FbxAnimationSource { Clips = renamedClips, RootTranslationCorrection = source.RootTranslationCorrection };
+        }
+
+        // Renames every clip in `clips` to a name derived from `baseName` (its source file's
+        // name, spaces -> underscores), disambiguated against usedNames - shared by the FBX
+        // overload above and by the animation-library GLB loader, so a clip name colliding with
+        // anything already loaded into slot 2 (from either source) can't silently merge two
+        // different clips together under one grid row.
+        private static List<AnimationClipData> RenameClipsToUniqueNames(List<AnimationClipData> clips, string baseName, HashSet<string> usedNames)
+        {
+            var multiClip = clips.Count > 1;
 
             var renamedClips = new List<AnimationClipData>();
-            for (int i = 0; i < source.Clips.Count; i++)
+            for (int i = 0; i < clips.Count; i++)
             {
                 var candidate = multiClip ? $"{baseName}_{i + 1}" : baseName;
                 var uniqueName = MakeUnique(candidate, usedNames);
 
                 var renamed = new AnimationClipData { Name = uniqueName };
-                renamed.NodeChannels.AddRange(source.Clips[i].NodeChannels);
+                renamed.NodeChannels.AddRange(clips[i].NodeChannels);
                 renamedClips.Add(renamed);
             }
 
-            return new FbxAnimationSource { Clips = renamedClips, RootTranslationCorrection = source.RootTranslationCorrection };
+            return renamedClips;
         }
 
         private static string MakeUnique(string candidate, HashSet<string> usedNames)
@@ -413,6 +516,22 @@ namespace GlbMerger
         // Model 1 always supplies geometry, so it's the only thing strictly required to merge.
         private bool CanMerge() => path1 != null;
 
+        // Fired by either panel's SettingsChanged whenever the user edits a per-item setting
+        // (Include, Loop, frame trim, etc.) in its grids. latestMergedModel is a snapshot built
+        // from whatever the panels said the *moment* Process Merge last ran - a later edit here
+        // doesn't retroactively change it, so Save/Edit Model have to be taken off the table until
+        // Process Merge runs again, rather than silently writing/opening the now-stale snapshot.
+        // A no-op before the first merge (nothing to go stale yet).
+        private void OnPanelSettingsChanged()
+        {
+            if (latestMergedModel == null) return;
+
+            btnSave.Enabled = false;
+            btnEditModel.Enabled = false;
+            btnSetHeight.Enabled = false;
+            lblStatus.Text = "Settings changed since last merge - click Process Merge to update before saving.";
+        }
+
         // Builds the merge in memory, without asking where to save it - "Save..." handles that as
         // its own separate step, and the editor works off the same in-memory result.
         private void OnProcessMerge(object? sender, EventArgs e)
@@ -422,11 +541,13 @@ namespace GlbMerger
                 lblStatus.Text = "Processing targeted composite...";
                 Application.DoEvents();
 
-                bool loaded2 = path2 != null || fbxAnimsList2.Count > 0;
+                bool loaded2 = path2 != null || fbxAnimsList2.Count > 0 || libraryAnimsList2.Count > 0;
 
                 var selectedTextures1 = panel1.GetSelectedMaterialNames();
                 var selectedAnims1 = panel1.GetSelectedAnimationNames();
                 var inPlaceAnims1 = panel1.GetInPlaceAnimationNames();
+                var loopAnims1 = panel1.GetLoopAnimationNames();
+                var loopFrameAnims1 = panel1.GetLoopFrameByAnimation();
                 var groundFixAnims1 = panel1.GetGroundFixAnimationNames();
                 var fixBoneLengthAnims1 = panel1.GetFixBoneLengthAnimationNames();
                 var fixHipRotationAnims1 = panel1.GetFixHipRotationAnimationNames();
@@ -443,6 +564,8 @@ namespace GlbMerger
                 var selectedTextures2 = loaded2 ? panel2.GetSelectedMaterialNames() : new List<string>();
                 var selectedAnims2 = loaded2 ? panel2.GetSelectedAnimationNames() : new List<string>();
                 var inPlaceAnims2 = loaded2 ? panel2.GetInPlaceAnimationNames() : new List<string>();
+                var loopAnims2 = loaded2 ? panel2.GetLoopAnimationNames() : new List<string>();
+                var loopFrameAnims2 = loaded2 ? panel2.GetLoopFrameByAnimation() : new Dictionary<string, int>();
                 var groundFixAnims2 = loaded2 ? panel2.GetGroundFixAnimationNames() : new List<string>();
                 var fixBoneLengthAnims2 = loaded2 ? panel2.GetFixBoneLengthAnimationNames() : new List<string>();
                 var fixHipRotationAnims2 = loaded2 ? panel2.GetFixHipRotationAnimationNames() : new List<string>();
@@ -467,7 +590,10 @@ namespace GlbMerger
                     frameTrim1, frameTrim2,
                     fixBoneLengthAnims1, fixBoneLengthAnims2,
                     fixHipRotationAnims1, fixHipRotationAnims2,
-                    geomRenameMap1: geomRenameMap1);
+                    geomRenameMap1: geomRenameMap1,
+                    libraryAnims2: libraryAnimsList2,
+                    loopAnims1: loopAnims1, loopAnims2: loopAnims2,
+                    loopFrameByName1: loopFrameAnims1, loopFrameByName2: loopFrameAnims2);
 
                 btnSave.Enabled = true;
                 btnEditModel.Enabled = true;

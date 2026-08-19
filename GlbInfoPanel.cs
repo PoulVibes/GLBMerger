@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.IO;
 using System.Linq;
 using System.Windows.Forms;
 using System.ComponentModel;
@@ -36,14 +37,55 @@ namespace GlbMerger
         // of clips already loaded from the other source.
         private readonly Dictionary<string, int> _animFrameCounts = new();
 
+        // Clip name -> the loop/pause setting (and which frame to resume at, in that clip's own
+        // pre-trim numbering) already baked into its *source* file's glTF extras - read at load
+        // time from a native GLB (LoadMaterialsFromGlb) or a library GLB (see
+        // AddSupplementalFbxAnimations' loop-aware overload), so re-loading a GLB this app (or the
+        // Animation Trim editor) already stamped a loop setting onto shows that setting instead of
+        // always resetting to the row default. FBX sources carry no such data, so they simply never
+        // add an entry here - AddRow's own (true, 0) fallback covers them, same as before this
+        // existed. Only consulted for a brand-new row; an already-present row's own edited Loop/
+        // LoopFrame cells always win (see RebuildAnimationGrid's previousSettings).
+        private readonly Dictionary<string, (bool Loop, int LoopFrame)> _animLoopByName = new();
+
         public event Action<string>? GlbFileDropped;
         public event Action<List<string>>? FbxFilesDropped;
+
+        // Fired on any user edit to a per-item setting (Include, Loop, Merged As, frame trim,
+        // material channel, etc.) in this panel's grids - after a merge has already been produced,
+        // this is the caller's signal that latestMergedModel no longer reflects what's on screen,
+        // so Save shouldn't write it out until Process Merge runs again. Deliberately does NOT
+        // fire while a grid is being repopulated from a fresh load (DataGridView.Rows.Add doesn't
+        // raise CellValueChanged for the values it's initializing a new row with - only genuine
+        // post-load edits, and header-click bulk toggles, actually assign into an existing cell).
+        public event Action? SettingsChanged;
+
+        // Fired when the user picks a file from the animation-library dropdown (full path) or
+        // clicks the button next to it to change which folder the dropdown lists. See
+        // EnableAnimationLibrary.
+        public event Action<string>? LibraryModelSelected;
+        public event Action? LibraryDirectoryChangeRequested;
+
+        private FlowLayoutPanel? _libraryBar;
+        private ComboBox? _libraryCombo;
+
+        // Default state of a newly-added animation row's "Fix Bone Length"/"Fix Hip Rotation"
+        // checkboxes - see RebuildAnimationGrid. Differs by slot: model 1's own clips are already
+        // in the structural model's own bone lengths/bind pose, so both corrections would be a
+        // no-op there and default off; model 2 (and any FBX/library source layered onto it) is
+        // being retargeted onto a *different* rig, where both corrections are the normal case, so
+        // both default on.
+        private readonly bool _defaultFixBoneLength;
+        private readonly bool _defaultFixHipRotation;
 
         // Model 2 never uses its own geometry (model 1's is always used), so the "Available
         // Geometry" reference list is meaningless there - showGeometryBox omits it entirely and
         // lets the materials/animations lists expand to fill the space instead.
-        public GlbInfoPanel(bool showGeometryBox = true)
+        public GlbInfoPanel(bool showGeometryBox = true, bool defaultFixBoneLength = false, bool defaultFixHipRotation = false)
         {
+            _defaultFixBoneLength = defaultFixBoneLength;
+            _defaultFixHipRotation = defaultFixHipRotation;
+
             Padding = new Padding(4);
 
             mainGroup = new GroupBox { Text = "No Model Loaded", Dock = DockStyle.Fill };
@@ -71,6 +113,7 @@ namespace GlbMerger
                 if (grdGeometry.IsCurrentCellDirty)
                     grdGeometry.CommitEdit(DataGridViewDataErrorContexts.Commit);
             };
+            grdGeometry.CellValueChanged += (s, e) => SettingsChanged?.Invoke();
 
             lblMat = MakeLabel("Textures / Materials (Check to Inject)");
             grdMaterials = new DataGridView
@@ -107,6 +150,7 @@ namespace GlbMerger
                     grdMaterials.CommitEdit(DataGridViewDataErrorContexts.Commit);
             };
             grdMaterials.CellValueChanged += (s, e) => EnforceSingleFirst(grdMaterials, e);
+            grdMaterials.CellValueChanged += (s, e) => SettingsChanged?.Invoke();
             grdMaterials.ColumnHeaderMouseClick += (s, e) => ToggleAllInColumn(
                 grdMaterials, e.ColumnIndex,
                 new HashSet<string>(new[] { "Include" }.Concat(GlbMergeService.KnownMaterialChannelNames.Select(ChannelColumnName))));
@@ -131,6 +175,13 @@ namespace GlbMerger
             // source file itself - selection/lock-in-place matching still keys off "Name".
             grdAnimations.Columns.Add(new DataGridViewTextBoxColumn { Name = "MergedAs", HeaderText = "Merged As", FillWeight = 40 });
             grdAnimations.Columns.Add(new DataGridViewCheckBoxColumn { Name = "InPlace", HeaderText = "Lock In Place", FillWeight = 30 });
+            // Playback behavior once the engine reaches the clip's last frame: checked loops back
+            // to the clip's own first frame (frame 0 after any trim above already rebases it
+            // there) and keeps playing; unchecked holds/pauses on the last frame. Written into the
+            // output animation's own glTF "extras" (see GlbMergeService.MergeTargeted) since
+            // glTF/GLB has no native concept of loop-vs-pause - it's purely a runtime engine
+            // decision, so the merged file just carries the author's intent for the engine to read.
+            grdAnimations.Columns.Add(new DataGridViewCheckBoxColumn { Name = "Loop", HeaderText = "Loop (else Pause)", FillWeight = 30 });
             // Analyzes the clip's own foot motion to find its most "grounded" pose (feet level
             // with each other and at their lowest point) and shifts the whole clip vertically so
             // that pose's feet align with the target rig's own resting ground height - corrects a
@@ -183,6 +234,17 @@ namespace GlbMerger
                 Name = "EndFrame", HeaderText = "Last Frame", FillWeight = 25,
                 Minimum = 0m, Maximum = 0m, Increment = 1m, DecimalPlaces = 0
             });
+            // Which frame (in this clip's own pre-trim numbering, same as First/Last Frame above)
+            // a looping clip resumes at once playback reaches the end - only meaningful when Loop
+            // is checked. Bound to the clip's own full range rather than the current First/Last
+            // Frame selection; if it ends up outside whatever range those two keep, the merge
+            // clamps it to the nearest kept frame automatically (see GlbMergeService.
+            // ComputeLoopTimes) rather than rejecting the edit.
+            grdAnimations.Columns.Add(new NumericUpDownColumn
+            {
+                Name = "LoopFrame", HeaderText = "Loop Frame", FillWeight = 25,
+                Minimum = 0m, Maximum = 0m, Increment = 1m, DecimalPlaces = 0
+            });
 
             // Marks which animation should be written first into the output's animation list
             // (some engines/tools default to playing/showing index 0) - only one row can be
@@ -197,12 +259,13 @@ namespace GlbMerger
             };
             grdAnimations.CellValueChanged += (s, e) => EnforceSingleFirst(grdAnimations, e);
             grdAnimations.CellValueChanged += (s, e) => EnforceFrameOrder(grdAnimations, e);
+            grdAnimations.CellValueChanged += (s, e) => SettingsChanged?.Invoke();
             // Clicking a checkbox column's header toggles that checkbox for every row at once -
             // "First" is excluded since only one row can ever be marked First (EnforceSingleFirst
             // would just immediately undo a bulk-check anyway).
             grdAnimations.ColumnHeaderMouseClick += (s, e) => ToggleAllInColumn(
                 grdAnimations, e.ColumnIndex,
-                new HashSet<string> { "Include", "InPlace", "GroundFix", "FixBoneLength", "FixHipRotation" });
+                new HashSet<string> { "Include", "InPlace", "GroundFix", "FixBoneLength", "FixHipRotation", "Loop" });
 
             // Each box (label + list/grid) sits in its own SplitContainer panel with a draggable
             // divider between it and its neighbor, instead of the old TableLayoutPanel's fixed
@@ -312,6 +375,75 @@ namespace GlbMerger
             };
         }
 
+        // Adds a small toolbar (a library dropdown + "Change Directory..." button) directly above
+        // the Animation Clips box, letting the user pick from a folder of pre-made GLB animation
+        // sources instead of dragging files in one at a time. Opt-in rather than always present,
+        // since only slot 2 uses it - slot 1 is always a single file picked via dialog.
+        public void EnableAnimationLibrary()
+        {
+            if (_libraryBar != null) return;
+
+            _libraryCombo = new ComboBox
+            {
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                Width = 220,
+                Margin = new Padding(0, 2, 6, 0),
+            };
+            var changeDirButton = new Button
+            {
+                AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                Text = "Change Directory...",
+                Margin = new Padding(0),
+            };
+
+            _libraryBar = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Top,
+                AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                FlowDirection = FlowDirection.LeftToRight,
+                WrapContents = false,
+                Margin = new Padding(0),
+                Padding = new Padding(0, 0, 0, 4),
+            };
+            _libraryBar.Controls.Add(new Label { Text = "Animation Library:", AutoSize = true, Margin = new Padding(0, 6, 6, 0) });
+            _libraryBar.Controls.Add(_libraryCombo);
+            _libraryBar.Controls.Add(changeDirButton);
+
+            // Resets back to unselected after firing, so picking the same file again later (to
+            // add another supplemental source) still raises SelectedIndexChanged instead of
+            // being a no-op because the selection didn't change.
+            _libraryCombo.SelectedIndexChanged += (s, e) =>
+            {
+                if (_libraryCombo.SelectedItem is LibraryDirectoryHelper.LibraryEntry entry)
+                {
+                    LibraryModelSelected?.Invoke(entry.Path);
+                    _libraryCombo.SelectedIndex = -1;
+                }
+            };
+            changeDirButton.Click += (s, e) => LibraryDirectoryChangeRequested?.Invoke();
+
+            // lblAnim's parent is the Panel MakeBox created for it - adding a Dock=Top control to
+            // it after the label (itself Dock=Top) puts this bar above the label, i.e. above the
+            // whole Animation Clips box, matching MakeBox's own "later Top addition claims the
+            // outer position" ordering.
+            lblAnim.Parent!.Controls.Add(_libraryBar);
+        }
+
+        // Repopulates the dropdown from every .glb file directly inside `directory`
+        // (non-recursive). A missing/inaccessible directory just leaves the dropdown empty
+        // rather than throwing, since this can run from a stale saved setting on startup before
+        // the user has confirmed the path still exists.
+        public void SetAnimationLibraryDirectory(string directory)
+        {
+            if (_libraryCombo == null) return;
+
+            _libraryCombo.Items.Clear();
+            foreach (var file in LibraryDirectoryHelper.ListGlbFiles(directory))
+                _libraryCombo.Items.Add(new LibraryDirectoryHelper.LibraryEntry { Path = file });
+        }
+
         private static void HandleDragEnter(DragEventArgs e, string requiredExtension)
         {
             e.Effect = DragDropEffects.None;
@@ -404,6 +536,7 @@ namespace GlbMerger
             _glbAnimNames = new List<string>();
             _fbxAnimNames = new List<(string Name, string MergedAs)>();
             _animFrameCounts.Clear();
+            _animLoopByName.Clear();
             mainGroup.Text = defaultTitle;
 
             this.ResumeLayout(true);
@@ -507,19 +640,37 @@ namespace GlbMerger
 
             _glbAnimNames = model.LogicalAnimations.Select(a => a.Name ?? $"Anim_{a.LogicalIndex}").ToList();
             foreach (var anim in model.LogicalAnimations)
-                _animFrameCounts[anim.Name ?? $"Anim_{anim.LogicalIndex}"] = ComputeGlbAnimationFrameCount(anim);
+            {
+                var name = anim.Name ?? $"Anim_{anim.LogicalIndex}";
+                var times = ComputeGlbAnimationFrameTimes(anim);
+                _animFrameCounts[name] = times.Length;
+
+                // Seeds the Loop checkbox/Loop Frame default from whatever this GLB's own extras
+                // already say (e.g. a file this app previously exported, or one hand-authored to
+                // the same convention) - see GlbMergeService.GetAnimationLoop. Only when extras
+                // actually carry a saved loop setting (HasAnimationLoopExtras) - otherwise leave
+                // _animLoopByName untouched for this clip so RebuildAnimationGrid's own (true, 0)
+                // "no data" default applies, instead of GetAnimationLoop's (false, 0) "nothing to
+                // report" fallback masquerading as an explicit Pause.
+                if (GlbMergeService.HasAnimationLoopExtras(model, name))
+                {
+                    var (loop, loopTime) = GlbMergeService.GetAnimationLoop(model, name);
+                    _animLoopByName[name] = (loop, NearestFrameIndex(times, loopTime));
+                }
+            }
             RebuildAnimationGrid();
 
             this.ResumeLayout(true);
         }
 
-        // Distinct keyframe-time count for a glTF-native animation, read directly off the
-        // ModelRoot's own channel data - same "frame" numbering GlbMergeService.
-        // ComputeAnimationFrameCount uses for the AnimationClipData form, computed independently
-        // here only because this runs before that extraction step (at load time, for display).
-        private static int ComputeGlbAnimationFrameCount(Animation anim)
+        // Distinct keyframe times for a glTF-native animation, read directly off the ModelRoot's
+        // own channel data, sorted ascending - same "frame" numbering GlbMergeService.
+        // ComputeAnimationFrameCount/CollectFrameTimes use for the AnimationClipData form, computed
+        // independently here only because this runs before that extraction step (at load time, for
+        // display).
+        private static float[] ComputeGlbAnimationFrameTimes(Animation anim)
         {
-            var times = new HashSet<float>();
+            var times = new SortedSet<float>();
             foreach (var ch in anim.Channels)
             {
                 if (ch.TargetNodePath == PropertyPath.translation)
@@ -529,19 +680,72 @@ namespace GlbMerger
                 else if (ch.TargetNodePath == PropertyPath.scale)
                     foreach (var k in ch.GetScaleSampler().GetLinearKeys()) times.Add(k.Key);
             }
-            return times.Count;
+            return times.ToArray();
+        }
+
+        // Index of whichever entry in `times` is closest to `target` - converts a stored
+        // loopTime (seconds) back to the nearest matching frame index for the Loop Frame column,
+        // the reverse of what the column itself does when the merge resolves a chosen frame back
+        // to a time (GlbMergeService.ComputeLoopTimes).
+        private static int NearestFrameIndex(float[] times, float target)
+        {
+            if (times.Length == 0) return 0;
+
+            int best = 0;
+            float bestDist = Math.Abs(times[0] - target);
+            for (int i = 1; i < times.Length; i++)
+            {
+                float dist = Math.Abs(times[i] - target);
+                if (dist < bestDist) { bestDist = dist; best = i; }
+            }
+            return best;
         }
 
         // Supplemental load for slot 2: ADDS this FBX's clips to the animation grid without
         // touching whatever materials/animations (or previously dropped FBX clips) are already
         // loaded - so dropping multiple FBX files at once, or one after another, accumulates
         // rather than replaces. clips are already final, guaranteed-unique names (computed by the
-        // caller, e.g. from each FBX's filename) paired with that clip's own frame count.
-        public void AddSupplementalFbxAnimations(List<(string Name, int FrameCount)> clips)
+        // caller, e.g. from each FBX's filename) paired with that clip's own frame count. Default
+        // "Merged As" is the same as the (already-unique) Name, since an FBX's own clip name is
+        // often generic (e.g. Mixamo's literal "mixamo.com") and not worth showing as-is.
+        public void AddSupplementalFbxAnimations(List<(string Name, int FrameCount)> clips) =>
+            AddSupplementalFbxAnimations(clips.Select(c => (c.Name, MergedAs: c.Name, c.FrameCount)).ToList());
+
+        // Same accumulation as above, but for a caller (the animation-library dropdown) that
+        // wants "Merged As" to default to something other than the row's own unique Name - e.g.
+        // the clip's original animation name (say "Idle") when Name itself had to be
+        // disambiguated with a numeric suffix (say "Idle_2") because a same-named clip was
+        // already loaded from another source.
+        public void AddSupplementalFbxAnimations(List<(string Name, string MergedAs, int FrameCount)> clips)
         {
             this.SuspendLayout();
-            _fbxAnimNames.AddRange(clips.Select(c => (Name: c.Name, MergedAs: c.Name)));
+            _fbxAnimNames.AddRange(clips.Select(c => (Name: c.Name, MergedAs: c.MergedAs)));
             foreach (var c in clips) _animFrameCounts[c.Name] = c.FrameCount;
+            RebuildAnimationGrid();
+            this.ResumeLayout(true);
+        }
+
+        // Same accumulation again, but for the animation-library dropdown specifically: unlike an
+        // FBX, a library GLB's own clips can already carry a loop/pause setting in their glTF
+        // extras (e.g. a file this app previously exported), so this overload also seeds
+        // _animLoopByName from it - same "reflect what the source already says" treatment
+        // LoadMaterialsFromGlb gives a directly-dropped GLB. LoopInfo is null for a clip whose
+        // source never saved a loop setting at all (the common case for a plain, never-processed
+        // library GLB) - such a clip is deliberately left OUT of _animLoopByName so
+        // RebuildAnimationGrid's own (true, 0) "no data" default applies, rather than forcing
+        // every library clip to (false, 0) just because there was nothing to report. The caller
+        // (MainForm) resolves the frame index itself via GlbMergeService.NearestLoopFrame, since
+        // it's the one holding the actual AnimationClipData needed to look up that clip's own
+        // keyframe times.
+        public void AddSupplementalFbxAnimations(List<(string Name, string MergedAs, int FrameCount, (bool Loop, int LoopFrame)? LoopInfo)> clips)
+        {
+            this.SuspendLayout();
+            _fbxAnimNames.AddRange(clips.Select(c => (Name: c.Name, MergedAs: c.MergedAs)));
+            foreach (var c in clips)
+            {
+                _animFrameCounts[c.Name] = c.FrameCount;
+                if (c.LoopInfo.HasValue) _animLoopByName[c.Name] = c.LoopInfo.Value;
+            }
             RebuildAnimationGrid();
             this.ResumeLayout(true);
         }
@@ -564,7 +768,7 @@ namespace GlbMerger
         // earlier drop.
         private void RebuildAnimationGrid()
         {
-            var previousSettings = new Dictionary<string, (bool Include, string MergedAs, bool InPlace, bool GroundFix, bool FixBoneLength, bool FixHipRotation, decimal YRotation, decimal YOffset, decimal StartFrame, decimal EndFrame, bool First)>();
+            var previousSettings = new Dictionary<string, (bool Include, string MergedAs, bool InPlace, bool GroundFix, bool FixBoneLength, bool FixHipRotation, decimal YRotation, decimal YOffset, decimal StartFrame, decimal EndFrame, bool First, bool Loop, decimal LoopFrame)>();
             foreach (DataGridViewRow row in grdAnimations.Rows)
             {
                 var name = (string)row.Cells["Name"].Value!;
@@ -579,7 +783,9 @@ namespace GlbMerger
                     row.Cells["YOffset"].Value is decimal yo ? yo : 0m,
                     row.Cells["StartFrame"].Value is decimal sf ? sf : 0m,
                     row.Cells["EndFrame"].Value is decimal ef ? ef : 0m,
-                    row.Cells["First"].Value is bool f && f);
+                    row.Cells["First"].Value is bool f && f,
+                    row.Cells["Loop"].Value is bool lp && lp,
+                    row.Cells["LoopFrame"].Value is decimal lf ? lf : 0m);
             }
 
             grdAnimations.Rows.Clear();
@@ -596,24 +802,35 @@ namespace GlbMerger
                 {
                     decimal start = Math.Clamp(s.StartFrame, 0m, lastFrame);
                     decimal end = Math.Clamp(s.EndFrame, start, lastFrame);
-                    rowIndex = grdAnimations.Rows.Add(s.Include, name, s.MergedAs, s.InPlace, s.GroundFix, s.FixBoneLength, s.FixHipRotation, s.YRotation, s.YOffset, start, end, s.First);
+                    decimal loopFrame = Math.Clamp(s.LoopFrame, 0m, lastFrame);
+                    rowIndex = grdAnimations.Rows.Add(s.Include, name, s.MergedAs, s.InPlace, s.Loop, s.GroundFix, s.FixBoneLength, s.FixHipRotation, s.YRotation, s.YOffset, start, end, loopFrame, s.First);
                 }
                 else
                 {
-                    // FixBoneLength defaults on - purely geometric, safe even when both rigs
-                    // already share the same proportions. FixHipRotation defaults off - only
-                    // needed when the torso visibly leans/shifts relative to the hips.
-                    rowIndex = grdAnimations.Rows.Add(true, name, defaultMergedAs, false, false, true, false, 0m, 0m, 0m, (decimal)lastFrame, false);
+                    // Both corrections' defaults are set per-panel (see _defaultFixBoneLength/
+                    // _defaultFixHipRotation) - on for a slot being retargeted onto a different
+                    // rig (model 2), off for model 1's own clips, which are already in the
+                    // structural model's own bone lengths/bind pose and need neither. Loop/Loop
+                    // Frame default from whatever the source file's own extras already said (see
+                    // _animLoopByName) - falling back to (true, frame 0) for a clip with no such
+                    // data (FBX, or a GLB never touched by this app before): most clips dropped
+                    // into this app are locomotion/idle loops, and a one-shot clip (attack, death,
+                    // etc.) is the exception and easy to uncheck per-row.
+                    var (defaultLoop, defaultLoopFrame) = _animLoopByName.GetValueOrDefault(name, (true, 0));
+                    decimal loopFrame = Math.Clamp((decimal)defaultLoopFrame, 0m, lastFrame);
+                    rowIndex = grdAnimations.Rows.Add(true, name, defaultMergedAs, false, defaultLoop, false, _defaultFixBoneLength, _defaultFixHipRotation, 0m, 0m, 0m, (decimal)lastFrame, loopFrame, false);
                 }
 
                 var row = grdAnimations.Rows[rowIndex];
                 var startCell = (NumericUpDownCell)row.Cells["StartFrame"];
                 var endCell = (NumericUpDownCell)row.Cells["EndFrame"];
+                var loopFrameCell = (NumericUpDownCell)row.Cells["LoopFrame"];
                 startCell.MaximumOverride = lastFrame;
                 endCell.MaximumOverride = lastFrame;
-                // A clip with fewer than 2 distinct keyframes has nothing to trim - disable the
-                // cells rather than offering a range that can only ever be [0, 0].
-                startCell.ReadOnly = endCell.ReadOnly = lastFrame == 0;
+                loopFrameCell.MaximumOverride = lastFrame;
+                // A clip with fewer than 2 distinct keyframes has nothing to trim (or loop within)
+                // - disable the cells rather than offering a range that can only ever be [0, 0].
+                startCell.ReadOnly = endCell.ReadOnly = loopFrameCell.ReadOnly = lastFrame == 0;
             }
 
             foreach (var name in _glbAnimNames)
@@ -776,6 +993,43 @@ namespace GlbMerger
                 bool inPlace = row.Cells["InPlace"].Value is bool ip && ip;
                 if (included && inPlace)
                     result.Add((string)row.Cells["Name"].Value!);
+            }
+            return result;
+        }
+
+        // Clips whose engine playback should loop back to frame 0 once finished, rather than
+        // pause on the last frame - see the "Loop" column's comment above. Passed through to
+        // GlbMergeService.MergeTargeted, which stamps the resulting choice onto each output
+        // animation's own glTF extras for the engine to read at load time.
+        public List<string> GetLoopAnimationNames()
+        {
+            var result = new List<string>();
+            foreach (DataGridViewRow row in grdAnimations.Rows)
+            {
+                bool included = row.Cells["Include"].Value is bool inc && inc;
+                bool loop = row.Cells["Loop"].Value is bool lp && lp;
+                if (included && loop)
+                    result.Add((string)row.Cells["Name"].Value!);
+            }
+            return result;
+        }
+
+        // Which frame (in this clip's own pre-trim numbering) a looping clip should resume at,
+        // per included+looping clip - passed to GlbMergeService.MergeTargeted's loopFrameByName1/2,
+        // which resolves it to a rebased seconds-offset *after* trimming, so Process Merge never
+        // silently resets it back to "loop to frame 0". Only present for rows this method's own
+        // GetLoopAnimationNames would also return - a row that isn't looping has nothing to resume.
+        public Dictionary<string, int> GetLoopFrameByAnimation()
+        {
+            var result = new Dictionary<string, int>();
+            foreach (DataGridViewRow row in grdAnimations.Rows)
+            {
+                bool included = row.Cells["Include"].Value is bool inc && inc;
+                bool loop = row.Cells["Loop"].Value is bool lp && lp;
+                if (!included || !loop) continue;
+
+                int loopFrame = row.Cells["LoopFrame"].Value is decimal lf ? (int)lf : 0;
+                result[(string)row.Cells["Name"].Value!] = loopFrame;
             }
             return result;
         }
