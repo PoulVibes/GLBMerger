@@ -11,7 +11,7 @@ namespace GlbMerger
 {
     public class MainForm : Form
     {
-        private Button btnFile1, btnClear, btnMerge, btnSave, btnEditModel, btnSetHeight;
+        private Button btnFile1, btnClear, btnMerge, btnSave, btnSaveModel1, btnEditModel, btnSetHeight;
         private NumericUpDown numModelHeightIn;
         private Label lblStatus;
         private const float InchesToMeters = 0.0254f;
@@ -84,6 +84,7 @@ namespace GlbMerger
             btnClear = MakeToolbarButton("Clear");
             btnMerge = MakeToolbarButton("Process Merge", enabled: false);
             btnSave = MakeToolbarButton("Save...", enabled: false);
+            btnSaveModel1 = MakeToolbarButton("Save Model 1", enabled: false);
             btnEditModel = MakeToolbarButton("🖥️ Open Model Editor", enabled: false);
 
             var lblHeight = new Label
@@ -116,7 +117,7 @@ namespace GlbMerger
             };
             heightGroup.Controls.AddRange(new Control[] { lblHeight, numModelHeightIn, btnSetHeight });
 
-            buttonRow.Controls.AddRange(new Control[] { btnFile1, btnClear, btnMerge, btnSave, btnEditModel, heightGroup });
+            buttonRow.Controls.AddRange(new Control[] { btnFile1, btnClear, btnMerge, btnSave, btnSaveModel1, btnEditModel, heightGroup });
 
             lblStatus = new Label { AutoSize = false, Width = 700, Height = 20, Margin = new Padding(0, 6, 0, 0), AutoEllipsis = true };
 
@@ -190,6 +191,7 @@ namespace GlbMerger
             btnClear.Click += (s, e) => ClearAll();
             btnMerge.Click += OnProcessMerge;
             btnSave.Click += OnSave;
+            btnSaveModel1.Click += async (s, e) => await OnSaveModel1();
 
             // Every mode of the editor (joint corrections, ball anchor, stiff-arm poses, animation
             // trimming) edits latestMergedModel in place, so closing it needs no extra "commit"
@@ -247,6 +249,7 @@ namespace GlbMerger
 
             btnMerge.Enabled = false;
             btnSave.Enabled = false;
+            btnSaveModel1.Enabled = false;
             btnEditModel.Enabled = false;
             btnSetHeight.Enabled = false;
             numModelHeightIn.Value = 70m;
@@ -508,7 +511,7 @@ namespace GlbMerger
             // Loading a new file invalidates whatever was last processed, so Save/Edit shouldn't
             // offer up a stale result while busy - once done, they stay off until Process Merge
             // runs again.
-            if (busy) { btnSave.Enabled = false; btnEditModel.Enabled = false; btnSetHeight.Enabled = false; }
+            if (busy) { btnSave.Enabled = false; btnSaveModel1.Enabled = false; btnEditModel.Enabled = false; btnSetHeight.Enabled = false; }
             Cursor = busy ? Cursors.WaitCursor : Cursors.Default;
             if (statusText != null) lblStatus.Text = statusText;
         }
@@ -527,6 +530,7 @@ namespace GlbMerger
             if (latestMergedModel == null) return;
 
             btnSave.Enabled = false;
+            btnSaveModel1.Enabled = false;
             btnEditModel.Enabled = false;
             btnSetHeight.Enabled = false;
             lblStatus.Text = "Settings changed since last merge - click Process Merge to update before saving.";
@@ -596,6 +600,7 @@ namespace GlbMerger
                     loopFrameByName1: loopFrameAnims1, loopFrameByName2: loopFrameAnims2);
 
                 btnSave.Enabled = true;
+                btnSaveModel1.Enabled = true;
                 btnEditModel.Enabled = true;
                 btnSetHeight.Enabled = true;
                 lblStatus.Text = "Merge processed - use Open Model Editor or Save.";
@@ -605,6 +610,7 @@ namespace GlbMerger
                 lblStatus.Text = "Error: " + ex.Message;
                 latestMergedModel = null;
                 btnSave.Enabled = false;
+                btnSaveModel1.Enabled = false;
                 btnEditModel.Enabled = false;
                 btnSetHeight.Enabled = false;
                 MessageBox.Show(ex.ToString(), "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
@@ -804,6 +810,65 @@ namespace GlbMerger
                 lblStatus.Text = "Error: " + ex.Message;
                 MessageBox.Show(ex.ToString(), "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
+        }
+
+        // Bakes the last processed merge back into Model 1's own file, then refreshes the session
+        // around that new file: clears everything, reloads the just-saved GLB into slot 1, and
+        // re-runs Process Merge - so a round of edits (Model Editor, height, etc.) becomes the new
+        // starting point for the next round instead of something that has to be manually
+        // saved-as/reloaded/reprocessed each time. Overwrites path1 on disk, so it's confirmed
+        // first.
+        private async Task OnSaveModel1()
+        {
+            if (latestMergedModel == null || path1 == null) return;
+
+            string targetPath = path1;
+
+            var confirm = MessageBox.Show(
+                $"This will overwrite '{Path.GetFileName(targetPath)}' with the current processed result, "
+                + "then clear and reload it as Model 1 and re-run Process Merge.\n\nContinue?",
+                "Save Model 1",
+                MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+            if (confirm != DialogResult.Yes) return;
+
+            try
+            {
+                Cursor = Cursors.WaitCursor;
+                try { latestMergedModel.SaveGLB(targetPath); }
+                finally { Cursor = Cursors.Default; }
+            }
+            catch (Exception ex)
+            {
+                lblStatus.Text = "Error: " + ex.Message;
+                MessageBox.Show(ex.ToString(), "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            ClearAll();
+
+            SetBusy(true, $"Reloading {Path.GetFileName(targetPath)}...");
+            try
+            {
+                await Task.Run(() => { });
+                path1 = targetPath;
+                fbxAnims1 = null;
+                panel1.UpdateTitle($"Model 1: {Path.GetFileName(targetPath)}");
+                panel1.LoadModel(targetPath);
+                UpdateHeightBoxFromGlb(targetPath);
+            }
+            catch (Exception ex)
+            {
+                lblStatus.Text = "Error: " + ex.Message;
+                MessageBox.Show($"Failed to reload '{Path.GetFileName(targetPath)}':\n{ex.Message}", "Import Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+            finally
+            {
+                SetBusy(false, null);
+            }
+
+            OnProcessMerge(this, EventArgs.Empty);
+            lblStatus.Text = $"Saved Model 1, reloaded, and reprocessed {Path.GetFileName(targetPath)}.";
         }
 
         private static string DescribeCleanup(GeometryOptimizer.CleanupEstimate estimate)

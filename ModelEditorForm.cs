@@ -18,6 +18,7 @@ namespace GlbMerger
         public enum EditorMode
         {
             JointOrientation,
+            Rigging,
             BallAnchor,
             StiffArm,
             AnimationTrim,
@@ -32,6 +33,7 @@ namespace GlbMerger
         private static readonly (EditorMode Mode, string Label)[] Modes =
         {
             (EditorMode.JointOrientation, "Fix Joint Orientation"),
+            (EditorMode.Rigging,          "Rigging (Move Joints)"),
             (EditorMode.BallAnchor,       "Ball Anchor"),
             (EditorMode.StiffArm,         "Stiff Arm Poses"),
             (EditorMode.AnimationTrim,    "Animation Start / Stop (Trim)"),
@@ -143,6 +145,7 @@ namespace GlbMerger
                 Control editor = mode switch
                 {
                     EditorMode.JointOrientation => new JointOrientationEditor(_model, _darkMode),
+                    EditorMode.Rigging => new RiggingEditor(_model, _darkMode, _settings),
                     EditorMode.BallAnchor => new BallAnchorEditor(_model, _darkMode, _settings),
                     EditorMode.StiffArm => new StiffArmPoseEditor(_model, _darkMode, _settings),
                     EditorMode.AnimationTrim => new AnimationTrimEditor(_model, _darkMode,

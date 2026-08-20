@@ -15,9 +15,7 @@ namespace GlbMerger
     // gutter means that average pulls in a neighboring island's baked color across the seam,
     // reading as a faint color fringe along the seam.
     //
-    // Purely a 2D image-space fill: unlike TextureLineThinner (which sources a replacement color
-    // from the nearest point on the 3D surface, because it's repairing paint that's supposed to
-    // read as a specific texture), padding doesn't care what the gutter "should" look like - any
+    // Purely a 2D image-space fill: padding doesn't care what the gutter "should" look like - any
     // island's own edge color is a better fallback there than whatever happens to already occupy
     // that unused space, since nothing samples deep into the gutter, only its first few texels at
     // minification. So this is a straight multi-source flood of RGBA color, seeded from every texel
@@ -70,12 +68,12 @@ namespace GlbMerger
         }
 
         // Computes the padded result without touching the model - lets a preview be shown before
-        // committing, same split as TextureLineThinner.Process.
+        // committing, same Analyze/Apply split the other editors use.
         public static (Report Report, byte[] PngBytes) Process(ModelRoot model, int imageIndex, Options options)
         {
             byte[] originalBytes = model.LogicalImages[imageIndex].Content.Content.ToArray();
 
-            using var srcBitmap = TextureLineThinner.LoadBitmap(originalBytes);
+            using var srcBitmap = TextureAtlasUtil.LoadBitmap(originalBytes);
             int width = srcBitmap.Width, height = srcBitmap.Height;
 
             var tris = GatherTriangles(model, imageIndex, width, height);
@@ -83,11 +81,11 @@ namespace GlbMerger
             RasterizeCoverage(tris, width, height, covered);
             int coveredCount = covered.Count(c => c);
 
-            var pixels = TextureLineThinner.ReadPixels(srcBitmap);
+            var pixels = TextureAtlasUtil.ReadPixels(srcBitmap);
             int paddedCount = DilateColor(width, height, pixels, covered, options.PaddingTexels);
 
-            using var resultBitmap = TextureLineThinner.WritePixels(pixels, width, height);
-            byte[] pngBytes = TextureLineThinner.EncodePng(resultBitmap);
+            using var resultBitmap = TextureAtlasUtil.WritePixels(pixels, width, height);
+            byte[] pngBytes = TextureAtlasUtil.EncodePng(resultBitmap);
 
             var report = new Report
             {
@@ -113,8 +111,8 @@ namespace GlbMerger
         }
 
         // Every triangle from every primitive whose material binds this image on ANY channel - the
-        // one deliberate difference from TextureLineThinner.GatherTriangles, which only follows
-        // BaseColor because it's editing paint. A UV footprint is a UV footprint regardless of which
+        // one deliberate difference from TextureAtlasUtil.GatherTriangles, which only follows
+        // BaseColor because its callers edit paint. A UV footprint is a UV footprint regardless of which
         // channel put it there, and padding a normal or ORM map matters exactly as much as albedo.
         private static List<Tri2> GatherTriangles(ModelRoot model, int imageIndex, int width, int height)
         {
@@ -205,8 +203,8 @@ namespace GlbMerger
 
         // Multi-source BFS from every covered texel, flooding outward up to maxRadius texels and
         // stamping each newly-reached texel with the color of whichever covered texel it was
-        // reached from - the same 8-connected BFS shape as TextureLineThinner's own gutter dilation,
-        // just carrying color instead of a 3D position. Returns how many texels were filled.
+        // reached from, carrying color outward one texel-ring at a time. Returns how many texels
+        // were filled.
         private static int DilateColor(int width, int height, byte[] pixels, bool[] covered, int maxRadius)
         {
             if (maxRadius <= 0) return 0;

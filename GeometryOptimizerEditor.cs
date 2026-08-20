@@ -676,7 +676,7 @@ namespace GlbMerger
                     // with the (meshIndex, primIndex) it corresponds to in GeometryOptimizer's own
                     // primitive list (see the mesh-level glTF extras set in WritePreviewFile),
                     // exactly the same tagging/lookup convention the old raw-Three.js viewer used.
-                    var paintableMeshes = [];      // { meshIndex, primIndex, object, centroids, radii, normals }
+                    var paintableMeshes = [];      // { meshIndex, primIndex, object, centroids, radii, normals, corners }
                     var selection = {};             // 'meshIndex_primIndex' -> Set<triangleIndex>
                     var paintMode = false;
                     var painting = false;
@@ -900,12 +900,14 @@ namespace GlbMerger
                     // re-touch the raw attribute buffers:
                     //
                     //   centroid - the triangle's centre.
-                    //   radius   - centroid to its furthest vertex. Turns the centroid into a
-                    //              bounding sphere, which is what makes 'any face PARTIALLY inside
-                    //              the brush' testable: the brush ball and the triangle overlap when
-                    //              their centres are closer than the sum of their radii. A centroid-
-                    //              only test misses a large triangle the brush lands in the middle
-                    //              of, and clips small ones sticking into the edge of the circle.
+                    //   radius   - centroid to its furthest vertex, i.e. a bounding sphere. This is
+                    //              only the cheap REJECT in front of the real test: a triangle whose
+                    //              sphere doesn't reach the brush ball can't reach it either, so one
+                    //              distance compare throws out almost the whole mesh per event.
+                    //   corners  - the three world-space vertices, so the exact point-to-triangle
+                    //              test in triangleTouchesBrush has something to measure against.
+                    //              36 bytes a face, computed once here rather than re-transformed
+                    //              out of the attribute buffers on every pointer move.
                     //   normal   - for the facing test in paintAllInBrush. Taken from the NORMAL
                     //              attribute where the asset has one (it's what the shading the user
                     //              is actually looking at comes from) and derived from winding
@@ -919,6 +921,7 @@ namespace GlbMerger
                         var centroids = new Array(triCount);
                         var radii = new Float32Array(triCount);
                         var normals = new Float32Array(triCount * 3);
+                        var corners = new Float32Array(triCount * 9);
 
                         // Normals transform by the inverse-transpose, not the model matrix - a
                         // non-uniform scale anywhere in the node chain skews them otherwise.
@@ -939,6 +942,11 @@ namespace GlbMerger
                                 centroid.distanceToSquared(b),
                                 centroid.distanceToSquared(c)));
 
+                            var o = t * 9;
+                            corners[o] = a.x; corners[o + 1] = a.y; corners[o + 2] = a.z;
+                            corners[o + 3] = b.x; corners[o + 4] = b.y; corners[o + 5] = b.z;
+                            corners[o + 6] = c.x; corners[o + 7] = c.y; corners[o + 8] = c.z;
+
                             if (nrm) {
                                 n.set(0, 0, 0);
                                 n.add(tmp.fromBufferAttribute(nrm, ia));
@@ -951,20 +959,43 @@ namespace GlbMerger
                             if (n.lengthSq() > 1e-20) n.normalize();
                             normals[t * 3] = n.x; normals[t * 3 + 1] = n.y; normals[t * 3 + 2] = n.z;
                         }
-                        return { centroids: centroids, radii: radii, normals: normals };
+                        return { centroids: centroids, radii: radii, normals: normals, corners: corners };
                     }
 
                     function selectionKey(meshInfo) { return meshInfo.meshIndex + '_' + meshInfo.primIndex; }
 
+                    // Does the triangle actually intersect the brush ball? Distance from the brush
+                    // centre to the closest point ON the triangle - the face is in when that lands
+                    // within the brush radius, which is the same condition, on the same surface,
+                    // that the cursor shader discards fragments by. Only ever reached by triangles
+                    // the bounding-sphere reject already let through.
+                    var _brushTri = new THREE.Triangle();
+                    var _brushClosest = new THREE.Vector3();
+
+                    function triangleTouchesBrush(corners, t, point) {
+                        var o = t * 9;
+                        _brushTri.a.set(corners[o], corners[o + 1], corners[o + 2]);
+                        _brushTri.b.set(corners[o + 3], corners[o + 4], corners[o + 5]);
+                        _brushTri.c.set(corners[o + 6], corners[o + 7], corners[o + 8]);
+                        _brushTri.closestPointToPoint(point, _brushClosest);
+                        return _brushClosest.distanceToSquared(point) <= brushRadius * brushRadius;
+                    }
+
                     // Every triangle that the brush ball touches AT ALL, in every primitive, facing
                     // the camera. Three things that matters for, in the order they bit:
                     //
-                    //   Partial overlap counts. The test is bounding-sphere against the brush ball
-                    //   (centroid distance minus the triangle's own radius), so a face only clipped
-                    //   by the edge of the circle is in, and a face big enough to swallow the whole
-                    //   circle is in. That's what 'even partially inside' means, and it also makes
-                    //   the face under the cursor land in the selection for free - the pick point is
-                    //   on it, so it can't fail the test.
+                    //   Partial overlap counts - but only REAL overlap. A face clipped by the edge
+                    //   of the circle is in, a face big enough to swallow the whole circle is in,
+                    //   and the face under the cursor is in for free (the pick point lies on it, so
+                    //   its distance is zero). What decides that is triangleTouchesBrush, measuring
+                    //   to the closest point on the triangle itself. The bounding-sphere compare in
+                    //   front of it is a reject, not the test: on its own it admits every triangle
+                    //   whose sphere overlaps the ball, and a sphere is a poor stand-in for a
+                    //   triangle - a long thin face, or a big flat panel, has a sphere radius far
+                    //   larger than anything the face reaches in most directions, so faces nowhere
+                    //   near the circle came back inside it. Using it as the test is what made the
+                    //   brush overselect, and what made the selection disagree with a cursor drawn
+                    //   from exactly the same radius.
                     //
                     //   No connectivity requirement. This walks the triangles directly instead of
                     //   flood-filling across shared edges, so the brush covers everything under the
@@ -984,6 +1015,7 @@ namespace GlbMerger
                             var centroids = meshInfo.centroids;
                             var radii = meshInfo.radii;
                             var normals = meshInfo.normals;
+                            var corners = meshInfo.corners;
                             var key = selectionKey(meshInfo);
                             var set = selection[key];
 
@@ -991,6 +1023,7 @@ namespace GlbMerger
                                 var centroid = centroids[t];
                                 var reach = brushRadius + radii[t];
                                 if (centroid.distanceToSquared(point) > reach * reach) continue;
+                                if (!triangleTouchesBrush(corners, t, point)) continue;
 
                                 // Positive dot means the face turns away from the eye.
                                 var dot = normals[t * 3] * (centroid.x - camera.x)
@@ -1254,6 +1287,7 @@ namespace GlbMerger
                                     centroids: triData.centroids,
                                     radii: triData.radii,
                                     normals: triData.normals,
+                                    corners: triData.corners,
                                 });
                             });
                             paintableMeshes = meshes;

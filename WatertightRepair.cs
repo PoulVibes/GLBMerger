@@ -30,7 +30,7 @@ namespace GlbMerger
     // whenever the loop's vertices sit in different UV islands of the same atlas - common right at
     // a seam - because the average then samples a meaningless blend of two unrelated patches. So
     // instead, for any primitive whose material has a BaseColor texture, this looks for a patch of
-    // that atlas nothing already maps to (reusing TextureLineThinner's own UV-footprint
+    // that atlas nothing already maps to (reusing TextureAtlasUtil's own UV-footprint
     // rasterizer to find it) and, if a sufficiently blank one exists, points every cap vertex at
     // one fixed spot inside it - which also means the cap's vertices can no longer be the primitive's
     // original boundary vertices (those still need their real UV for the surface beside the hole),
@@ -575,7 +575,7 @@ namespace GlbMerger
 
         // Finds one blank-ish spot in an image's UV atlas and returns it as a UV coordinate, or null
         // if the image can't be read or nothing suitable was found (fully packed, or too small).
-        // Reuses TextureLineThinner's own UV-footprint rasterizer, so "unused" here means exactly
+        // Reuses TextureAtlasUtil's own UV-footprint rasterizer, so "unused" here means exactly
         // what it means there: no triangle in the whole model, not just this primitive, maps to it -
         // which is what keeps a cap from being pointed at a patch some other, unrelated part of the
         // model is already relying on.
@@ -599,7 +599,7 @@ namespace GlbMerger
             catch { return null; }
 
             Bitmap fullBitmap;
-            try { fullBitmap = TextureLineThinner.LoadBitmap(bytes); }
+            try { fullBitmap = TextureAtlasUtil.LoadBitmap(bytes); }
             catch { return null; }
 
             using (fullBitmap)
@@ -609,11 +609,11 @@ namespace GlbMerger
                 int height = Math.Min(PatchSearchResolution, fullBitmap.Height);
                 if (width < required || height < required) return null;
 
-                var tris = TextureLineThinner.GatherTriangles(model, imageIndex, width, height, null);
+                var tris = TextureAtlasUtil.GatherTriangles(model, imageIndex, width, height);
                 var positions = new Vector3[width * height];
                 var covered = new bool[width * height];
                 var texelSize = new float[width * height];
-                TextureLineThinner.RasterizeTriangles(tris, width, height, positions, covered, texelSize);
+                TextureAtlasUtil.RasterizeTriangles(tris, width, height, positions, covered, texelSize);
 
                 byte[] pixels;
                 using (var resized = new Bitmap(width, height))
@@ -621,7 +621,7 @@ namespace GlbMerger
                     using var g = Graphics.FromImage(resized);
                     g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBilinear;
                     g.DrawImage(fullBitmap, new Rectangle(0, 0, width, height));
-                    pixels = TextureLineThinner.ReadPixels(resized);
+                    pixels = TextureAtlasUtil.ReadPixels(resized);
                 }
 
                 int stride = width + 1;

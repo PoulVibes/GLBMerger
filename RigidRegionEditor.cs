@@ -26,8 +26,8 @@ namespace GlbMerger
     // blends back to the mesh's original weights gradually instead of tearing at a hard seam.
     //
     // The paint tool itself (brush, triangle selection, posed-mesh hit-testing) is the same
-    // approach TextureEditorEditor and GeometryOptimizerEditor use - see TextureEditorEditor's
-    // paintAllInBrush for the fuller rationale on bounding-sphere overlap and facing-only. What's
+    // approach GeometryOptimizerEditor uses - see its paintAllInBrush for the fuller rationale
+    // on exact triangle-vs-brush overlap and facing-only. What's
     // new here is what Apply does with the selection: rather than restricting a 2D texture
     // operation to the painted triangles, the painted triangles' vertices have their
     // JOINTS_0/WEIGHTS_0 skin data rewritten directly, the same way ModelAdjusterEditor already
@@ -934,10 +934,11 @@ namespace GlbMerger
                     // --- end animated preview pane ------------------------------------------------
 
                     // --- Paint-a-region tool (Paint pane only) ------------------------------------
-                    // Ported near-verbatim from TextureEditorEditor's paint tool - see that file's
-                    // paintAllInBrush for the fuller rationale (bounding-sphere overlap vs brush
-                    // radius, facing-the-camera-only, no connectivity requirement).
-                    var paintableMeshes = [];      // { meshIndex, primIndex, object, centroids, radii, normals }
+                    // Ported near-verbatim from GeometryOptimizerEditor's paint tool - see that
+                    // file's paintAllInBrush for the fuller rationale (exact triangle-vs-brush
+                    // overlap behind a bounding-sphere reject, facing-the-camera-only, no
+                    // connectivity requirement).
+                    var paintableMeshes = [];      // { meshIndex, primIndex, object, centroids, radii, normals, corners }
                     var selection = {};             // 'meshIndex_primIndex' -> Set<triangleIndex>
                     var paintMode = false;
                     var painting = false;
@@ -1239,6 +1240,7 @@ namespace GlbMerger
                         var centroids = new Array(triCount);
                         var radii = new Float32Array(triCount);
                         var normals = new Float32Array(triCount * 3);
+                        var corners = new Float32Array(triCount * 9);
 
                         var normalMatrix = new THREE.Matrix3().getNormalMatrix(mesh.matrixWorld);
                         var a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3();
@@ -1273,6 +1275,11 @@ namespace GlbMerger
                                 centroid.distanceToSquared(b),
                                 centroid.distanceToSquared(c)));
 
+                            var o = t * 9;
+                            corners[o] = a.x; corners[o + 1] = a.y; corners[o + 2] = a.z;
+                            corners[o + 3] = b.x; corners[o + 4] = b.y; corners[o + 5] = b.z;
+                            corners[o + 6] = c.x; corners[o + 7] = c.y; corners[o + 8] = c.z;
+
                             if (nrm && isSkinned) {
                                 n.set(0, 0, 0).add(na).add(nb).add(nc);
                             } else if (nrm) {
@@ -1287,10 +1294,27 @@ namespace GlbMerger
                             if (n.lengthSq() > 1e-20) n.normalize();
                             normals[t * 3] = n.x; normals[t * 3 + 1] = n.y; normals[t * 3 + 2] = n.z;
                         }
-                        return { centroids: centroids, radii: radii, normals: normals };
+                        return { centroids: centroids, radii: radii, normals: normals, corners: corners };
                     }
 
                     function selectionKey(meshInfo) { return meshInfo.meshIndex + '_' + meshInfo.primIndex; }
+
+                    // Does the triangle actually intersect the brush ball? Distance from the brush
+                    // centre to the closest point ON the triangle - the face is in when that lands
+                    // within the brush radius, which is the same condition, on the same surface,
+                    // that the cursor shader discards fragments by. Only ever reached by triangles
+                    // the bounding-sphere reject already let through.
+                    var _brushTri = new THREE.Triangle();
+                    var _brushClosest = new THREE.Vector3();
+
+                    function triangleTouchesBrush(corners, t, point) {
+                        var o = t * 9;
+                        _brushTri.a.set(corners[o], corners[o + 1], corners[o + 2]);
+                        _brushTri.b.set(corners[o + 3], corners[o + 4], corners[o + 5]);
+                        _brushTri.c.set(corners[o + 6], corners[o + 7], corners[o + 8]);
+                        _brushTri.closestPointToPoint(point, _brushClosest);
+                        return _brushClosest.distanceToSquared(point) <= brushRadius * brushRadius;
+                    }
 
                     function paintAllInBrush(point, erase) {
                         var camera = overlayCamera.position;
@@ -1301,6 +1325,7 @@ namespace GlbMerger
                             var centroids = meshInfo.centroids;
                             var radii = meshInfo.radii;
                             var normals = meshInfo.normals;
+                            var corners = meshInfo.corners;
                             var key = selectionKey(meshInfo);
                             var set = selection[key];
 
@@ -1308,6 +1333,7 @@ namespace GlbMerger
                                 var centroid = centroids[t];
                                 var reach = brushRadius + radii[t];
                                 if (centroid.distanceToSquared(point) > reach * reach) continue;
+                                if (!triangleTouchesBrush(corners, t, point)) continue;
 
                                 var dot = normals[t * 3] * (centroid.x - camera.x)
                                     + normals[t * 3 + 1] * (centroid.y - camera.y)
@@ -1464,6 +1490,7 @@ namespace GlbMerger
                                     centroids: triData.centroids,
                                     radii: triData.radii,
                                     normals: triData.normals,
+                                    corners: triData.corners,
                                 });
                             });
                             paintableMeshes = meshes;

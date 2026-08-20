@@ -102,8 +102,11 @@ namespace GlbMerger
                 AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
                 BackgroundColor = SystemColors.Window,
             };
-            grdGeometry.Columns.Add(new DataGridViewTextBoxColumn { Name = "Name", HeaderText = "Geometry", ReadOnly = true, FillWeight = 35 });
-            grdGeometry.Columns.Add(new DataGridViewTextBoxColumn { Name = "Info", HeaderText = "Materials", ReadOnly = true, FillWeight = 35 });
+            grdGeometry.Columns.Add(new DataGridViewTextBoxColumn { Name = "Name", HeaderText = "Geometry", ReadOnly = true, FillWeight = 30 });
+            grdGeometry.Columns.Add(new DataGridViewTextBoxColumn { Name = "Info", HeaderText = "Materials", ReadOnly = true, FillWeight = 30 });
+            // Verts/faces summed across the mesh's own primitives - shown for quick sanity-checking
+            // of geometry complexity without needing to open a separate model viewer.
+            grdGeometry.Columns.Add(new DataGridViewTextBoxColumn { Name = "VertsFaces", HeaderText = "Verts / Faces", ReadOnly = true, FillWeight = 20 });
             // Editable output name: lets the user rename how this mesh/node appears in the merged
             // file, without touching the source model - matched against the merge's own baseName
             // (Mesh.Name, falling back to Node.Name) so it lands on exactly the right part.
@@ -562,7 +565,7 @@ namespace GlbMerger
             this.SuspendLayout();
 
             grdGeometry.Rows.Clear();
-            grdGeometry.Rows.Add("(FBX source - animation only, no geometry)", "", "");
+            grdGeometry.Rows.Add("(FBX source - animation only, no geometry)", "", "", "");
 
             grdMaterials.Rows.Clear();
 
@@ -597,7 +600,10 @@ namespace GlbMerger
                     if (seenBaseNames.Add(baseName))
                     {
                         var matNames = node.Mesh.Primitives.Select(p => p.Material?.Name ?? "No Material").Distinct();
-                        grdGeometry.Rows.Add(baseName, string.Join(", ", matNames), baseName);
+                        long vertCount = node.Mesh.Primitives.Sum(p =>
+                            p.VertexAccessors.TryGetValue("POSITION", out var posAcc) ? posAcc.Count : 0);
+                        long faceCount = node.Mesh.Primitives.Sum(p => p.GetTriangleIndices().Count());
+                        grdGeometry.Rows.Add(baseName, string.Join(", ", matNames), $"{vertCount:N0} / {faceCount:N0}", baseName);
                     }
                 }
 
@@ -610,7 +616,7 @@ namespace GlbMerger
                     WalkNode(node);
 
             if (grdGeometry.Rows.Count == 0)
-                grdGeometry.Rows.Add("(no geometry found)", "", "");
+                grdGeometry.Rows.Add("(no geometry found)", "", "", "");
 
             foreach (var mat in model.LogicalMaterials)
             {

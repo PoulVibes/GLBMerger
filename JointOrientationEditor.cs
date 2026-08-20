@@ -85,6 +85,17 @@ namespace GlbMerger
         // Translation counterpart to _originalKeysCache, same anti-compounding purpose.
         private readonly Dictionary<(string Bone, string? Anim), (float Time, Vector3 Value)[]> _originalTranslationKeysCache = new();
 
+        // (Bone, animation name or null for the static/bind pose) -> the offset actually written
+        // into the model for it, i.e. its total correction relative to the matching baseline in
+        // _originalKeysCache. This is what makes a save survive an animation switch: the 3D
+        // preview is a one-shot snapshot of the model taken when this editor opened (see
+        // InitializeViewerAsync) and is never reloaded, so a saved correction only ever shows up
+        // ON SCREEN as a live overlay. Without this record, switching animations dropped every
+        // overlay and the saved joints visibly snapped back to their uncorrected pose - and
+        // re-dialing them to "fix" that stacked a second correction on top of the first.
+        private readonly Dictionary<(string Bone, string? Anim), (int X, int Y, int Z)> _committedOffsets = new();
+        private readonly Dictionary<(string Bone, string? Anim), (float X, float Y, float Z)> _committedTranslationOffsets = new();
+
         // Bone name -> which rotation/position axes have "Mirror" checked for that bone, kept per
         // bone (like _pendingOffsets) so switching away and back restores the checkboxes exactly.
         private readonly Dictionary<string, (bool X, bool Y, bool Z)> _mirrorRotFlags = new();
@@ -345,6 +356,16 @@ namespace GlbMerger
                         var liveTranslationCorrections = {};
                         var basePositions = {};
 
+                        // Every bone's transform exactly as the file loaded it, captured once
+                        // before any correction has ever been applied. Used as the fallback base
+                        // for a bone with no track in the current clip: reading bone.quaternion
+                        // instead would read back a value a previous frame's correction had
+                        // already been written into, so switching animations (which drops
+                        // baseQuaternions) would fold the old correction into the new base and
+                        // then stack the new one on top of it.
+                        var restQuaternions = {};
+                        var restPositions = {};
+
                         // Reads a bone's own animation-curve value directly from its KeyframeTrack
                         // via the track's interpolant, entirely bypassing bone.position/quaternion.
                         // Those live properties are NOT a safe source for 'the clean, uncorrected
@@ -439,7 +460,11 @@ namespace GlbMerger
                                             if (orderedMaterials.indexOf(mat) === -1) orderedMaterials.push(mat);
                                         });
                                     }
-                                    if (obj.name) bonesByName[obj.name] = obj;
+                                    if (obj.name) {
+                                        bonesByName[obj.name] = obj;
+                                        restQuaternions[obj.name] = obj.quaternion.clone();
+                                        restPositions[obj.name] = obj.position.clone();
+                                    }
                                 });
 
                                 // Default to showing only the first material, same as the main
@@ -578,12 +603,13 @@ namespace GlbMerger
                                         baseQuaternions[name].fromArray(sampledRot);
                                     } else if (!baseQuaternions[name]) {
                                         // No track for this bone in the current clip (e.g. an
-                                        // un-keyframed hand/finger joint) or paused - fall back to
-                                        // whatever the bone's rotation already is, once.
-                                        baseQuaternions[name] = bone.quaternion.clone();
+                                        // un-keyframed hand/finger joint) - fall back to its rest
+                                        // rotation, once. Deliberately not bone.quaternion, which
+                                        // may already carry last frame's correction.
+                                        baseQuaternions[name] = (restQuaternions[name] || bone.quaternion).clone();
                                     }
                                 } else if (!baseQuaternions[name]) {
-                                    baseQuaternions[name] = bone.quaternion.clone();
+                                    baseQuaternions[name] = (restQuaternions[name] || bone.quaternion).clone();
                                 }
 
                                 bone.quaternion.copy(baseQuaternions[name]).premultiply(liveCorrections[name]);
@@ -599,10 +625,13 @@ namespace GlbMerger
                                         if (!basePositions[posName]) basePositions[posName] = new THREE.Vector3();
                                         basePositions[posName].fromArray(sampledPos);
                                     } else if (!basePositions[posName]) {
-                                        basePositions[posName] = posBone.position.clone();
+                                        // Rest position rather than posBone.position, for the same
+                                        // reason as baseQuaternions above - the live property may
+                                        // already carry last frame's correction.
+                                        basePositions[posName] = (restPositions[posName] || posBone.position).clone();
                                     }
                                 } else if (!basePositions[posName]) {
-                                    basePositions[posName] = posBone.position.clone();
+                                    basePositions[posName] = (restPositions[posName] || posBone.position).clone();
                                 }
 
                                 // The correction is a WORLD-space delta (e.g. 'always 10cm
@@ -656,8 +685,9 @@ namespace GlbMerger
         private void OnAnimationSelected()
         {
             // Adjustments are per-animation, so switching to a different animation should not
-            // carry over any not-yet-saved corrections dialed in against the previous one.
-            ResetAllPendingOffsets();
+            // carry over any not-yet-saved corrections dialed in against the previous one - but it
+            // should bring back whatever was already saved to the animation being switched TO.
+            LoadOffsetsForSelectedAnimation();
 
             // A newly selected animation should start playing, not stay paused from whatever the
             // previous one was left at.
@@ -1006,7 +1036,7 @@ namespace GlbMerger
             // bind pose) - any other animation's baseline cached by a previous "Apply to All
             // Animations" Save is already-written, saved data, not something this button touches.
             bool isStaticPose = _animDropdown.SelectedIndex <= 0;
-            var cacheKey = (boneName, isStaticPose ? null : (string?)_animDropdown.SelectedItem!);
+            var cacheKey = (boneName, SelectedAnimationKey());
 
             if (_originalKeysCache.TryGetValue(cacheKey, out var originalKeys))
             {
@@ -1016,6 +1046,7 @@ namespace GlbMerger
                     node.WithRotationAnimation((string)_animDropdown.SelectedItem!, originalKeys);
                 _originalKeysCache.Remove(cacheKey);
             }
+            _committedOffsets.Remove(cacheKey);
 
             if (_originalTranslationKeysCache.TryGetValue(cacheKey, out var originalTranslationKeys))
             {
@@ -1025,6 +1056,7 @@ namespace GlbMerger
                     node.WithTranslationAnimation((string)_animDropdown.SelectedItem!, originalTranslationKeys);
                 _originalTranslationKeysCache.Remove(cacheKey);
             }
+            _committedTranslationOffsets.Remove(cacheKey);
 
             _pendingOffsets.Remove(boneName);
             _pendingTranslationOffsets.Remove(boneName);
@@ -1043,28 +1075,67 @@ namespace GlbMerger
             _lblStatus.Text = "";
         }
 
-        private void ResetAllPendingOffsets()
+        // Runs when the animation dropdown changes, after the new selection is already in place.
+        // Not-yet-saved offsets are dropped (they were only ever meaningful against the animation
+        // they were dialed in on), but anything already SAVED to the animation being switched TO
+        // is loaded back in - into the sliders, and via the overlays into the 3D preview.
+        //
+        // The baseline caches deliberately survive this. They are keyed per-animation, so there's
+        // no cross-talk between clips, and keeping them means a second visit to an animation still
+        // measures its correction from that clip's pristine keys instead of from keys an earlier
+        // save already corrected - which is what stops repeat visits from compounding.
+        private void LoadOffsetsForSelectedAnimation()
         {
-            if (_viewerReady)
-            {
-                foreach (var boneName in _pendingOffsets.Keys)
-                    _webView.CoreWebView2.ExecuteScriptAsync($"setLiveCorrection('{EscapeJs(boneName)}', 0, 0, 0, 1);");
-                foreach (var boneName in _pendingTranslationOffsets.Keys)
-                    _webView.CoreWebView2.ExecuteScriptAsync($"setLiveTranslationCorrection('{EscapeJs(boneName)}', 0, 0, 0);");
-            }
+            // Every bone currently showing an overlay is in one of the pending maps - committed
+            // offsets get loaded into them too, so this covers saved and unsaved alike.
+            var previouslyShown = new HashSet<string>(_pendingOffsets.Keys);
+            previouslyShown.UnionWith(_pendingTranslationOffsets.Keys);
+
             _pendingOffsets.Clear();
-            _originalKeysCache.Clear();
             _pendingTranslationOffsets.Clear();
-            _originalTranslationKeysCache.Clear();
             _mirrorRotFlags.Clear();
             _mirrorPosFlags.Clear();
             _mirrorRotInverseFlags.Clear();
             _mirrorPosInverseFlags.Clear();
             _distributeSpineFlags.Clear();
 
+            string? animKey = SelectedAnimationKey();
+            foreach (var entry in _committedOffsets)
+                if (entry.Key.Anim == animKey) _pendingOffsets[entry.Key.Bone] = entry.Value;
+            foreach (var entry in _committedTranslationOffsets)
+                if (entry.Key.Anim == animKey) _pendingTranslationOffsets[entry.Key.Bone] = entry.Value;
+
+            if (_viewerReady)
+            {
+                // Cleared first - both kinds, for every bone that was overlaid - so nothing from
+                // the outgoing animation leaks into this one, then the incoming animation's own
+                // saved corrections are pushed back on.
+                foreach (var boneName in previouslyShown)
+                {
+                    _webView.CoreWebView2.ExecuteScriptAsync($"setLiveCorrection('{EscapeJs(boneName)}', 0, 0, 0, 1);");
+                    _webView.CoreWebView2.ExecuteScriptAsync($"setLiveTranslationCorrection('{EscapeJs(boneName)}', 0, 0, 0);");
+                }
+                foreach (var entry in _pendingOffsets)
+                {
+                    var offset = ComputeOffsetQuaternion(entry.Value.X, entry.Value.Y, entry.Value.Z);
+                    _webView.CoreWebView2.ExecuteScriptAsync(
+                        $"setLiveCorrection('{EscapeJs(entry.Key)}', {Inv(offset.X)}, {Inv(offset.Y)}, {Inv(offset.Z)}, {Inv(offset.W)});");
+                }
+                foreach (var entry in _pendingTranslationOffsets)
+                    _webView.CoreWebView2.ExecuteScriptAsync(
+                        $"setLiveTranslationCorrection('{EscapeJs(entry.Key)}', {Inv(entry.Value.X)}, {Inv(entry.Value.Y)}, {Inv(entry.Value.Z)});");
+            }
+
             if (_boneDropdown.SelectedItem is string) OnBoneSelected();
-            _lblStatus.Text = "";
+            _lblStatus.Text = _pendingOffsets.Count > 0 || _pendingTranslationOffsets.Count > 0
+                ? "Showing adjustments already saved to this animation."
+                : "";
         }
+
+        // The key both offset dictionaries and both baseline caches use: null for "None (Static
+        // Pose)", otherwise the selected animation's name.
+        private string? SelectedAnimationKey() =>
+            _animDropdown.SelectedIndex > 0 ? (string?)_animDropdown.SelectedItem! : null;
 
         // ExecuteScriptAsync builds a literal JS number from this - $"{value}" would use the
         // current culture (e.g. "0,125" with a comma on many non-US locales), which is not valid
@@ -1252,6 +1323,11 @@ namespace GlbMerger
                             var corrected = originalKeys.Select(k => (k.Time, Quaternion.Normalize(Quaternion.Multiply(offset, k.Value)))).ToArray();
                             node.WithRotationAnimation(targetAnimName!, corrected);
                         }
+
+                        // Assignment, not accumulation: `degrees` is always measured against the
+                        // baseline this same target was corrected from, so re-saving while still
+                        // dragging the slider replaces the record instead of stacking onto it.
+                        _committedOffsets[(boneName, targetAnimName)] = degrees;
                     }
 
                     if (_pendingTranslationOffsets.TryGetValue(boneName, out var posOffset))
@@ -1275,15 +1351,17 @@ namespace GlbMerger
                                 .ToArray();
                             node.WithTranslationAnimation(targetAnimName!, corrected);
                         }
+
+                        _committedTranslationOffsets[(boneName, targetAnimName)] = posOffset;
                     }
                 }
             }
 
             // Deliberately does NOT reset sliders, the live preview, or pending offsets - the user
-            // wants to keep dialing in a joint and re-save without losing their place. Everything
-            // only resets when switching to a different animation (see OnAnimationSelected /
-            // ResetAllPendingOffsets), since a correction is only ever meaningful relative to the
-            // one specific animation (or bind pose) it was computed against.
+            // wants to keep dialing in a joint and re-save without losing their place. Switching
+            // animations swaps them for whatever that animation has saved (see OnAnimationSelected
+            // / LoadOffsetsForSelectedAnimation), since a correction is only ever meaningful
+            // relative to the one animation (or bind pose) it was computed against.
             _lblStatus.Text = isStaticPose
                 ? "Saved to bind (static) pose."
                 : applyToAll

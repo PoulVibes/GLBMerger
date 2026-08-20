@@ -470,6 +470,7 @@ namespace GlbMerger
                         var _a = new THREE.Vector3(), _b = new THREE.Vector3(), _c = new THREE.Vector3();
                         var _e1 = new THREE.Vector3(), _e2 = new THREE.Vector3(), _n = new THREE.Vector3();
                         var _centroid = new THREE.Vector3();
+                        var _brushTri = new THREE.Triangle(), _brushClosest = new THREE.Vector3();
 
                         // One Laplacian pass on the triangles under the brush, for ONE primitive.
                         // Every triangle the ball touches at all (partial overlap counts, same as
@@ -499,6 +500,17 @@ namespace GlbMerger
                                     _centroid.distanceToSquared(_a), _centroid.distanceToSquared(_b), _centroid.distanceToSquared(_c)));
                                 var reach = brushRadius + radius;
                                 if (_centroid.distanceToSquared(worldPoint) > reach * reach) continue;
+
+                                // That sphere compare is only a reject. It lets through any face
+                                // whose bounding sphere overlaps the brush ball, which on a long
+                                // thin triangle or a large flat one means faces sitting well
+                                // outside the circle the cursor shader draws - and every corner of
+                                // such a face would then be dragged by the smoothing pass. The
+                                // distance to the closest point ON the triangle is the real test,
+                                // and it is the same condition the cursor clips fragments by.
+                                _brushTri.set(_a, _b, _c);
+                                _brushTri.closestPointToPoint(worldPoint, _brushClosest);
+                                if (_brushClosest.distanceToSquared(worldPoint) > brushRadius * brushRadius) continue;
 
                                 _e1.subVectors(_b, _a); _e2.subVectors(_c, _a);
                                 _n.crossVectors(_e1, _e2);

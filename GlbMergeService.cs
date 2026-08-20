@@ -354,11 +354,17 @@ namespace GlbMerger
             ApplyFrameTrim(clips2, frameTrimByName2);
 
             // The animation the user marked "First" should end up at index 0 of the output's
-            // animation array. SharpGLTF assigns indices in first-registered order (the order
-            // WithLocalTranslation/Rotation/Scale are first called for a given animation name), so
-            // moving its clip to the front of its own slot's list, and processing that slot's
-            // ApplyClipsToNodes call before the other slot's, achieves this without touching the
-            // scene/node data itself.
+            // animation array. Moving its clip to the front of its own slot's list controls the
+            // order ApplyClipsToNodes *visits* clips in, but that alone doesn't reliably control
+            // SharpGLTF's own output order: a glTF animation's index is actually determined by
+            // where its name first appears in the *first scene node's own* track dictionary, not
+            // by call order across the whole scene. If the "First" clip happens not to touch
+            // whatever node SharpGLTF considers first (e.g. a bone it doesn't animate, or a mesh
+            // root node), some other clip silently wins index 0 instead - reproduced directly
+            // against SharpGLTF 1.0.6. So still move the clip to the front (harmless, and keeps
+            // per-node track order sensible), but enforce the actual output order explicitly
+            // afterwards via ReorderAnimationToFront, which is unaffected by which nodes either
+            // clip happens to touch.
             if (firstAnimName1 != null) MoveClipToFront(clips1, firstAnimName1);
             if (firstAnimName2 != null) MoveClipToFront(clips2, firstAnimName2);
 
@@ -372,6 +378,16 @@ namespace GlbMerger
 
             var result = outScene.ToGltf2();
             StampLoopExtras(result, loopAnims1, loopTimeByName1, animRenameMap1, loopAnims2, loopTimeByName2, animRenameMap2);
+
+            // Resolve to the *output* name (post "Merged As" rename) the same way ApplyClipsToNodes
+            // does, since that's the name the clip actually ended up registered under.
+            string? firstOutputName = firstAnimName1 != null
+                ? (animRenameMap1 != null && animRenameMap1.TryGetValue(firstAnimName1, out var renamed1) ? renamed1 : firstAnimName1)
+                : firstAnimName2 != null
+                    ? (animRenameMap2 != null && animRenameMap2.TryGetValue(firstAnimName2, out var renamed2) ? renamed2 : firstAnimName2)
+                    : null;
+
+            if (firstOutputName != null) result = ReorderAnimationToFront(result, firstOutputName);
             return result;
         }
 
@@ -450,6 +466,67 @@ namespace GlbMerger
             var clip = clips[index];
             clips.RemoveAt(index);
             clips.Insert(0, clip);
+        }
+
+        // Forces a named animation to index 0 of the output glTF's "animations" array, regardless
+        // of where SharpGLTF itself decided to put it. Nothing in the glTF spec references an
+        // animation *by array index* from anywhere else in the document (channels/samplers are
+        // private to their own animation, and this app's own loop extras live inside each
+        // animation's own extras) - so reordering that one top-level array is always safe.
+        // Round-trips through GLB bytes because ModelRoot's object model exposes LogicalAnimations
+        // as read-only with no reorder/insert API; editing the JSON chunk directly and reloading is
+        // the only way to actually move an animation without rebuilding the whole model by hand.
+        private static ModelRoot ReorderAnimationToFront(ModelRoot model, string animationName)
+        {
+            var index = -1;
+            for (int i = 0; i < model.LogicalAnimations.Count; i++)
+                if (model.LogicalAnimations[i].Name == animationName) { index = i; break; }
+            if (index <= 0) return model; // not found, or already first
+
+            var glb = model.WriteGLB().ToArray();
+
+            // GLB container: 12-byte header (magic, version, total length), then chunks of
+            // [uint32 length][uint32 type][data]. The JSON chunk always comes first.
+            int jsonChunkLength = (int)BitConverter.ToUInt32(glb, 12);
+            const int jsonChunkDataStart = 20;
+            string json = System.Text.Encoding.UTF8.GetString(glb, jsonChunkDataStart, jsonChunkLength);
+
+            var root = JsonNode.Parse(json)!.AsObject();
+            var animations = root["animations"]!.AsArray();
+            var moved = animations[index];
+            animations.RemoveAt(index);
+            animations.Insert(0, moved);
+
+            var newJsonBytes = System.Text.Encoding.UTF8.GetBytes(root.ToJsonString());
+            // glTF JSON chunks must be padded to a 4-byte boundary, with trailing spaces (0x20).
+            int pad = (4 - (newJsonBytes.Length % 4)) % 4;
+            if (pad > 0)
+            {
+                var padded = new byte[newJsonBytes.Length + pad];
+                Array.Copy(newJsonBytes, padded, newJsonBytes.Length);
+                for (int i = newJsonBytes.Length; i < padded.Length; i++) padded[i] = (byte)' ';
+                newJsonBytes = padded;
+            }
+
+            int oldJsonChunkTotal = 8 + jsonChunkLength;
+            int binLength = glb.Length - 12 - oldJsonChunkTotal;
+
+            using var ms = new System.IO.MemoryStream();
+            using (var bw = new System.IO.BinaryWriter(ms, System.Text.Encoding.UTF8, leaveOpen: true))
+            {
+                int newTotalLength = 12 + 8 + newJsonBytes.Length + binLength;
+                bw.Write(glb, 0, 4);  // magic
+                bw.Write(glb, 4, 4);  // version
+                bw.Write(newTotalLength);
+                bw.Write(newJsonBytes.Length);
+                bw.Write(glb, 16, 4); // chunk type "JSON"
+                bw.Write(newJsonBytes);
+                if (binLength > 0)
+                    bw.Write(glb, 12 + oldJsonChunkTotal, binLength);
+            }
+
+            ms.Position = 0;
+            return ModelRoot.ReadGLB(ms, new ReadSettings());
         }
 
         private static void ApplyFrameTrim(List<AnimationClipData> clips, Dictionary<string, (int Start, int End)>? trimByName)
