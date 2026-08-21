@@ -1001,28 +1001,37 @@ namespace GlbMerger
 
                     // --- Wireframe -------------------------------------------------------------
                     // Same approach as GeometryOptimizerEditor's wireframe toggle (see that file
-                    // for the fuller rationale): drawn from the same hit-test geometry everything
-                    // else here uses, and only built while switched on since WireframeGeometry
-                    // expands to six vertices per triangle.
-                    var wireframeMaterial = new THREE.LineBasicMaterial({
+                    // for the fuller rationale): edges drawn into the overlay canvas from the same
+                    // hit-test geometry everything else here uses, with the depth mask making them
+                    // read as lines ON the model rather than an x-ray of it.
+                    //
+                    // The one difference is that these are a SkinnedMesh in wireframe mode rather
+                    // than WireframeGeometry line segments. That editor bakes the pose into the
+                    // hit-test copy's positions (bakeSkinnedGeometry), so plain lines carrying only
+                    // matrixWorld land on the model; here the hit-test copy stays skinned and is
+                    // posed by the skeleton at draw time (makeSkinnedCopy), and WireframeGeometry
+                    // keeps only positions - it drops skinIndex/skinWeight, so the lines drew in
+                    // BIND pose and floated off any model whose rest pose differs from it.
+                    // Sharing the source geometry keeps those attributes, so the edges deform with
+                    // the model exactly like the depth mask and the paint highlight do - and costs
+                    // no extra memory either, unlike WireframeGeometry's six vertices per triangle.
+                    var wireframeMaterial = new THREE.MeshBasicMaterial({
                         color: 0x8ab4f8, transparent: true, opacity: 0.55, depthTest: true,
+                        wireframe: true, skinning: true,
                     });
                     var wireframeGroup = new THREE.Group();
                     overlayScene.add(wireframeGroup);
 
                     function rebuildWireframe() {
+                        // Geometry is shared with the hit-test copy, not owned, so nothing is
+                        // disposed on the way out.
                         for (var i = wireframeGroup.children.length - 1; i >= 0; i--) {
-                            var old = wireframeGroup.children[i];
-                            wireframeGroup.remove(old);
-                            old.geometry.dispose();
+                            wireframeGroup.remove(wireframeGroup.children[i]);
                         }
                         if (!wireframe) return;
                         paintableMeshes.forEach(function (meshInfo) {
-                            var lines = new THREE.LineSegments(
-                                new THREE.WireframeGeometry(meshInfo.object.geometry), wireframeMaterial);
-                            lines.matrixAutoUpdate = false;
-                            lines.matrix.copy(meshInfo.object.matrixWorld);
-                            wireframeGroup.add(lines);
+                            wireframeGroup.add(makeSkinnedCopy(
+                                meshInfo.object, meshInfo.object.geometry, wireframeMaterial));
                         });
                     }
 
