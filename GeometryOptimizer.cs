@@ -22,7 +22,7 @@ namespace GlbMerger
     // Simplification only ever produces a new INDEX buffer over the existing vertices - meshopt
     // collapses edges onto vertices that are already there and never invents one - so every
     // surviving vertex keeps its exact original position, UV, normal and skin binding. That is what
-    // makes this safe to apply to a skinned character and cheap to undo (see SnapshotIndices).
+    // makes this safe to apply to a skinned character and cheap to undo (see GeometryHistory).
     public static class GeometryOptimizer
     {
         public sealed class SimplifyOptions
@@ -142,7 +142,7 @@ namespace GlbMerger
 
         // Writes whatever Analyze computed. Only the index accessor is rewritten - vertex data is
         // left exactly as it was, which is what makes this safe for skinned meshes and cheap to
-        // undo (see SnapshotIndices).
+        // undo (see GeometryHistory).
         public static void Apply(Report report, ModelRoot model)
         {
             foreach (var p in report.Primitives)
@@ -150,25 +150,6 @@ namespace GlbMerger
                 if (p.NewIndices == null) continue;
                 var prim = model.LogicalMeshes[p.MeshIndex].Primitives[p.PrimitiveIndex];
                 prim.WithIndicesAccessor(PrimitiveType.TRIANGLES, p.NewIndices);
-            }
-        }
-
-        // Captures every primitive's current index buffer so an in-session "Revert" can put the
-        // geometry back - the model is shared with the other editor modes and there's no other
-        // copy of it anywhere.
-        public static List<int[]> SnapshotIndices(ModelRoot model) =>
-            model.LogicalMeshes
-                .SelectMany(m => m.Primitives)
-                .Select(p => p.GetTriangleIndices().SelectMany(t => new[] { t.A, t.B, t.C }).ToArray())
-                .ToList();
-
-        public static void RestoreIndices(ModelRoot model, List<int[]> snapshot)
-        {
-            int i = 0;
-            foreach (var prim in model.LogicalMeshes.SelectMany(m => m.Primitives))
-            {
-                if (i >= snapshot.Count) break;
-                prim.WithIndicesAccessor(PrimitiveType.TRIANGLES, snapshot[i++]);
             }
         }
 

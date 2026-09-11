@@ -82,22 +82,6 @@ namespace GlbMerger
             public bool HasChanges => Primitives.Any(p => p.Patch != null);
         }
 
-        // Snapshot of everything Apply is about to touch, captured up front so Restore can put it
-        // back exactly as it was.
-        public sealed class Snapshot
-        {
-            public sealed class PrimitiveState
-            {
-                public required int MeshIndex { get; init; }
-                public required int PrimitiveIndex { get; init; }
-                public required Dictionary<string, Accessor> OriginalAccessorSources { get; init; }
-                public required Dictionary<string, IReadOnlyList<Vector4>> OriginalAttributes { get; init; }
-                public required int[] OriginalIndices { get; init; }
-            }
-
-            public List<PrimitiveState> Primitives { get; } = new();
-        }
-
         private const float WeldTolerance = 1e-4f;
 
         private readonly struct Edge : IEquatable<Edge>
@@ -275,45 +259,6 @@ namespace GlbMerger
                 if (p.Patch == null) continue;
                 var prim = model.LogicalMeshes[p.MeshIndex].Primitives[p.PrimitiveIndex];
                 WritePatch(prim, p.Patch);
-            }
-        }
-
-        public static Snapshot TakeSnapshot(Report report, ModelRoot model)
-        {
-            var snapshot = new Snapshot();
-            foreach (var p in report.Primitives)
-            {
-                if (p.Patch == null) continue;
-                var prim = model.LogicalMeshes[p.MeshIndex].Primitives[p.PrimitiveIndex];
-
-                var sources = new Dictionary<string, Accessor>();
-                var values = new Dictionary<string, IReadOnlyList<Vector4>>();
-                foreach (var (name, accessor) in prim.VertexAccessors)
-                {
-                    sources[name] = accessor;
-                    values[name] = (IReadOnlyList<Vector4>)ReadAsVector4(accessor);
-                }
-
-                snapshot.Primitives.Add(new Snapshot.PrimitiveState
-                {
-                    MeshIndex = p.MeshIndex,
-                    PrimitiveIndex = p.PrimitiveIndex,
-                    OriginalAccessorSources = sources,
-                    OriginalAttributes = values,
-                    OriginalIndices = prim.GetTriangleIndices().SelectMany(t => new[] { t.A, t.B, t.C }).ToArray(),
-                });
-            }
-            return snapshot;
-        }
-
-        public static void Restore(ModelRoot model, Snapshot snapshot)
-        {
-            foreach (var state in snapshot.Primitives)
-            {
-                var prim = model.LogicalMeshes[state.MeshIndex].Primitives[state.PrimitiveIndex];
-                foreach (var (name, values) in state.OriginalAttributes)
-                    WriteAttribute(prim, name, state.OriginalAccessorSources[name], values);
-                prim.WithIndicesAccessor(PrimitiveType.TRIANGLES, state.OriginalIndices);
             }
         }
 
@@ -735,7 +680,11 @@ namespace GlbMerger
         // attribute type. The lost dimensions are always zero and are never read back for them
         // (WriteAttribute is told the original accessor's shape and only reads the components it
         // originally had).
-        private static IList<Vector4> ReadAsVector4(Accessor accessor)
+        //
+        // Internal rather than private because GeometryHistory captures and restores vertex data in
+        // exactly this form - a fill is the one operation in the optimizer that changes it, so the
+        // encoding round-trip it needs is the one already written here.
+        internal static IList<Vector4> ReadAsVector4(Accessor accessor)
         {
             switch (accessor.Dimensions)
             {
@@ -757,7 +706,7 @@ namespace GlbMerger
         // byte for byte rather than through the float helpers, because writing them as floats
         // would produce a glTF that violates the spec and that runtimes reject - same reasoning as
         // GeometryOptimizer.BuildCompactedRewrite.
-        private static void WriteAttribute(MeshPrimitive prim, string name, Accessor source, IReadOnlyList<Vector4> values)
+        internal static void WriteAttribute(MeshPrimitive prim, string name, Accessor source, IReadOnlyList<Vector4> values)
         {
             if (source.Encoding == EncodingType.FLOAT)
             {

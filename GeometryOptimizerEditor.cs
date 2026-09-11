@@ -20,9 +20,14 @@ namespace GlbMerger
     //
     // Analyze is a dry run: it reports exactly what would change, so the settings can be dialled
     // against real numbers before anything is committed. Apply writes the result onto the shared
-    // merge result in place (like every other editor mode), and Revert puts the original index
-    // buffers back - worth having here specifically because this is the one mode that can silently
-    // alter geometry across the whole model at once.
+    // merge result in place, like every other editor mode.
+    //
+    // Unlike every other editor mode, though, this one keeps a full History rather than a single
+    // "revert to how it arrived" step: it is the one mode that can silently alter geometry across
+    // the whole model at once, and reaching a good result means stacking several passes at
+    // different ratios and regions, so the state worth going back to is rarely the original. Every
+    // pass - simplification and hole filling alike - records into GeometryHistory, and any of them
+    // can be clicked back to without destroying the ones after it.
     //
     // The preview uses <model-viewer> for the visible model, for the same PBR rendering,
     // environment lighting and camera framing as AnimationTrimEditor. Note that the choice of
@@ -47,7 +52,7 @@ namespace GlbMerger
         private Label _lblSkin = null!, _lblRatio = null!, _lblStatus = null!, _lblTotals = null!;
         private NumericUpDown _numError = null!;
         private CheckBox _chkLockBorders = null!, _chkVertexOrder = null!, _chkWireframe = null!;
-        private Button _btnAnalyze = null!, _btnApply = null!, _btnRevert = null!;
+        private Button _btnAnalyze = null!, _btnApply = null!;
         private DataGridView _grid = null!;
 
         private CheckBox _chkPaintMode = null!, _chkRestrictSelection = null!, _chkExcludeSelection = null!;
@@ -63,25 +68,29 @@ namespace GlbMerger
         private int _previewVersion;
         private string? _previewPath;
 
-        // Taken once, immediately before the first Apply of the session - the model is shared with
-        // every other editor mode and nothing else keeps a copy of the original geometry.
-        private List<int[]>? _originalIndices;
+        private Button _btnAnalyzeWatertight = null!, _btnApplyWatertight = null!;
 
-        private Button _btnAnalyzeWatertight = null!, _btnApplyWatertight = null!, _btnRevertWatertight = null!;
+        // Every state the geometry has been in this session, including the untouched merge result
+        // it started from - the model is shared with every other editor mode and nothing else keeps
+        // a copy of it. Both kinds of operation here (simplify, fill holes) record into the one
+        // list, so backing out of a fill and then out of the simplification that preceded it is
+        // just two clicks down the History grid.
+        private GeometryHistory _history = null!;
+        private DataGridView _historyGrid = null!;
 
-        // Kept separate from _originalIndices: filling a hole appends vertices, which a plain
-        // index-buffer snapshot can't undo, so this carries full vertex accessor contents for
-        // whatever primitives a fill actually touched. Each button pair here manages its own
-        // single-level revert, same as every other editor mode.
-        private WatertightRepair.Snapshot? _watertightSnapshot;
+        // Restoring a state selects its row, which raises SelectionChanged again - without this the
+        // handler would re-enter and restore the same state a second time.
+        private bool _syncingHistory;
 
         public GeometryOptimizerEditor(ModelRoot model, bool darkMode = false)
         {
             _model = model;
+            _history = new GeometryHistory(model);
 
             Dock = DockStyle.Fill;
 
             BuildUi();
+            RefreshHistoryGrid();
             ShowBaseline();
             UpdateSimplifyEnabled();
 
@@ -234,11 +243,6 @@ namespace GlbMerger
             _btnApply.Click += async (s, e) => await RunAnalyzeAsync(apply: true);
             flow.Controls.Add(_btnApply);
 
-            _btnRevert = MakeButton("Revert Geometry");
-            _btnRevert.Enabled = false;
-            _btnRevert.Click += (s, e) => RevertGeometry();
-            flow.Controls.Add(_btnRevert);
-
             flow.Controls.Add(HelpText(
                 "Optimizing rewrites triangles only, so vertices the result no longer references - " +
                 "and the index buffer each pass replaces - stay in the model, and it can grow rather " +
@@ -256,7 +260,7 @@ namespace GlbMerger
                 "each one with a new triangle fan. Boundaries shared between two parts of this " +
                 "mesh (a material or UV seam) are recognized and left alone, not capped. A hole " +
                 "that's meant to stay open, like a mouth interior, will get capped too since there's " +
-                "no way to tell intent from geometry alone - revert if that happens."));
+                "no way to tell intent from geometry alone - step back in History if that happens."));
 
             flow.Controls.Add(HelpText(
                 "When the material has a texture, caps look for an unused, blank-looking patch of " +
@@ -271,11 +275,6 @@ namespace GlbMerger
             _btnApplyWatertight = MakeButton("Fill Holes");
             _btnApplyWatertight.Click += async (s, e) => await RunWatertightAsync(apply: true);
             flow.Controls.Add(_btnApplyWatertight);
-
-            _btnRevertWatertight = MakeButton("Revert Watertight Fill");
-            _btnRevertWatertight.Enabled = false;
-            _btnRevertWatertight.Click += (s, e) => RevertWatertight();
-            flow.Controls.Add(_btnRevertWatertight);
 
             _chkWireframe = new CheckBox { Text = "Wireframe preview", AutoSize = true, Margin = new Padding(3, 8, 3, 0) };
             _chkWireframe.CheckedChanged += (s, e) => PushWireframe();
@@ -320,6 +319,44 @@ namespace GlbMerger
             _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "After", FillWeight = 20 });
             _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Saved", FillWeight = 20 });
             flow.Controls.Add(_grid);
+
+            flow.Controls.Add(new Label
+            {
+                Text = "History",
+                AutoSize = true,
+                Margin = new Padding(3, 8, 3, 4),
+            });
+
+            _historyGrid = new DataGridView
+            {
+                Width = 340,
+                Height = 180,
+                AllowUserToAddRows = false,
+                AllowUserToDeleteRows = false,
+                AllowUserToResizeRows = false,
+                ReadOnly = true,
+                RowHeadersVisible = false,
+                MultiSelect = false,
+                SelectionMode = DataGridViewSelectionMode.FullRowSelect,
+                AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
+                Margin = new Padding(3, 0, 3, 4),
+            };
+            _historyGrid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Step", FillWeight = 52 });
+            _historyGrid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Vertices", FillWeight = 24 });
+            _historyGrid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Triangles", FillWeight = 24 });
+            _historyGrid.SelectionChanged += (s, e) => OnHistorySelectionChanged();
+            flow.Controls.Add(_historyGrid);
+
+            flow.Controls.Add(HelpText(
+                "Every pass lands here. Click a row to put the model back into that state - the " +
+                "rows below it stay, so stepping back and forward again costs nothing and loses " +
+                "nothing. Applying a new pass while standing on an older row is what drops the " +
+                "ones under it, since they were built on the geometry that pass just replaced."));
+
+            flow.Controls.Add(HelpText(
+                "Vertices counts only the ones a triangle still uses - the number a save keeps. " +
+                "Simplifying rewrites triangles alone, so the ones it stops referencing stay in " +
+                "the file at full size until then, and this column is where that shows up."));
 
             controlPanel.Controls.Add(flow);
 
@@ -392,7 +429,7 @@ namespace GlbMerger
                 total += tris;
                 _grid.Rows.Add(mesh.Name ?? "(unnamed)", tris.ToString("N0"), "-", "-");
             }
-            _lblTotals.Text = $"Current: {total:N0} triangles";
+            _lblTotals.Text = $"Current: {total:N0} triangles, {_history.Current.LiveVertices:N0} vertices";
         }
 
         private async Task RunAnalyzeAsync(bool apply)
@@ -451,27 +488,23 @@ namespace GlbMerger
                 return;
             }
 
-            _originalIndices ??= GeometryOptimizer.SnapshotIndices(_model);
+            // Simplification rewrites index buffers only, never vertex data - hence false here,
+            // which is what lets the history keep this step for the price of the indices alone.
+            _history.BeginChange(touchesVertexData: false);
             GeometryOptimizer.Apply(report, _model);
-            _btnRevert.Enabled = true;
 
             SetBusy(false, $"Removed {report.TrianglesSaved:N0} triangles ({report.PercentSaved:0.00}%). " +
                 "Included the next time you save the merge.");
+            RecordHistory($"Simplify {_sliderRatio.Value}%{SelectionSuffix()}", touchedVertexData: false);
             ReloadPreview();
         }
 
-        private void RevertGeometry()
-        {
-            if (_originalIndices == null) return;
-
-            GeometryOptimizer.RestoreIndices(_model, _originalIndices);
-            _originalIndices = null;
-            _btnRevert.Enabled = false;
-
-            ShowBaseline();
-            _lblStatus.Text = "Geometry reverted to the original merge result.";
-            ReloadPreview();
-        }
+        // What a Simplify step was scoped to, so two passes at the same ratio are still tellable
+        // apart in the History list.
+        private string SelectionSuffix() =>
+            _chkRestrictSelection.Checked ? " (painted only)"
+            : _chkExcludeSelection.Checked ? " (except painted)"
+            : "";
 
         private async Task RunWatertightAsync(bool apply)
         {
@@ -513,25 +546,87 @@ namespace GlbMerger
                 return;
             }
 
-            _watertightSnapshot ??= WatertightRepair.TakeSnapshot(report, _model);
+            // A fill appends vertices and rewrites vertex accessors, so the history has to take a
+            // full vertex capture of the pre-fill state before Apply overwrites it.
+            _history.BeginChange(touchesVertexData: true);
             WatertightRepair.Apply(report, _model);
-            _btnRevertWatertight.Enabled = true;
 
             SetBusy(false, summary + " Included the next time you save the merge.");
+            RecordHistory($"Fill {report.HolesFound:N0} hole(s)", touchedVertexData: true);
             ShowBaseline();
             ReloadPreview();
         }
 
-        private void RevertWatertight()
+        private void RecordHistory(string label, bool touchedVertexData)
         {
-            if (_watertightSnapshot == null) return;
+            _history.Record(label, touchedVertexData);
+            RefreshHistoryGrid();
+        }
 
-            WatertightRepair.Restore(_model, _watertightSnapshot);
-            _watertightSnapshot = null;
-            _btnRevertWatertight.Enabled = false;
+        // Rebuilt wholesale rather than appended to: a Record on top of a restored older state
+        // drops the rows that followed it, so the row count can shrink as well as grow.
+        private void RefreshHistoryGrid()
+        {
+            _syncingHistory = true;
+            try
+            {
+                _historyGrid.Rows.Clear();
+                var entries = _history.Entries;
+                for (int i = 0; i < entries.Count; i++)
+                {
+                    var entry = entries[i];
+                    _historyGrid.Rows.Add(
+                        entry.Label, entry.LiveVertices.ToString("N0"), entry.Triangles.ToString("N0"));
+                }
+                UpdateHistoryStyling();
+
+                if (entries.Count > 0)
+                {
+                    // Setting CurrentCell (rather than Selected) is what also moves the grid's
+                    // notion of the current row, which is what OnHistorySelectionChanged reads
+                    // back, and scrolls the row into view for free.
+                    _historyGrid.CurrentCell = _historyGrid.Rows[_history.CurrentIndex].Cells[0];
+                }
+            }
+            finally
+            {
+                _syncingHistory = false;
+            }
+        }
+
+        // Steps past the one currently applied are still reachable - the point of the list is that
+        // stepping back doesn't destroy them - but they aren't what the model looks like right now,
+        // so they read as greyed-out.
+        private void UpdateHistoryStyling()
+        {
+            for (int i = 0; i < _historyGrid.Rows.Count; i++)
+                // Empty rather than the grid's own colour for the rest, so they keep inheriting
+                // whatever ThemeManager last painted the grid.
+                _historyGrid.Rows[i].DefaultCellStyle.ForeColor = i > _history.CurrentIndex
+                    ? System.Drawing.Color.Gray
+                    : System.Drawing.Color.Empty;
+        }
+
+        private void OnHistorySelectionChanged()
+        {
+            if (_syncingHistory || IsDisposed) return;
+            if (_historyGrid.SelectedRows.Count != 1) return;
+
+            int index = _historyGrid.SelectedRows[0].Index;
+            if (index < 0 || index >= _history.Entries.Count || index == _history.CurrentIndex) return;
+
+            var entry = _history.Entries[index];
+            _history.RestoreTo(index);
+
+            // Recolouring only - rebuilding the rows from inside the grid's own SelectionChanged
+            // would re-enter it while it is still settling the new current cell, which DataGridView
+            // refuses outright. The rows themselves haven't changed here anyway: a restore keeps
+            // every step exactly as it was and only moves which one is current.
+            UpdateHistoryStyling();
 
             ShowBaseline();
-            _lblStatus.Text = "Watertight fill reverted to the original merge result.";
+            _lblStatus.Text = $"Restored to \"{entry.Label}\" - {entry.LiveVertices:N0} vertices, " +
+                $"{entry.Triangles:N0} triangles. Applying a new pass from here drops the steps below it.";
             ReloadPreview();
         }
 
@@ -563,6 +658,8 @@ namespace GlbMerger
             _btnApply.Enabled = !busy;
             _btnAnalyzeWatertight.Enabled = !busy;
             _btnApplyWatertight.Enabled = !busy;
+            // Restoring mid-run would have the pass write its result over the state just restored.
+            _historyGrid.Enabled = !busy;
             Cursor = busy ? Cursors.WaitCursor : Cursors.Default;
             if (status != null) _lblStatus.Text = status;
         }
