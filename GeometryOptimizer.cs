@@ -355,12 +355,39 @@ namespace GlbMerger
                 .Where(p => p.DrawPrimitiveType == PrimitiveType.TRIANGLES)
                 .Sum(p => p.GetTriangleIndices().Count());
 
-        private static int CompactPrimitive(MeshPrimitive prim)
+        // Whether CompactPrimitive can rewrite this primitive at all. Split out so a dry run can
+        // promise only what the real pass will actually deliver - TriangleDeleter reports the
+        // vertices a deletion strands, and a primitive this refuses has to be reported as keeping
+        // them rather than losing them.
+        internal static bool CanCompactPrimitive(MeshPrimitive prim)
         {
-            if (prim.DrawPrimitiveType != PrimitiveType.TRIANGLES) return 0;
-            if (prim.MorphTargetsCount > 0) return 0;   // morph deltas are indexed too; out of scope
-            if (!prim.VertexAccessors.TryGetValue("POSITION", out var posAcc)) return 0;
+            if (prim.DrawPrimitiveType != PrimitiveType.TRIANGLES) return false;
+            if (prim.MorphTargetsCount > 0) return false;   // morph deltas are indexed too; out of scope
+            if (!prim.VertexAccessors.ContainsKey("POSITION")) return false;
 
+            foreach (var accessor in prim.VertexAccessors.Values)
+            {
+                // Mirrors the cases BuildCompactedRewrite knows how to re-encode.
+                bool known = accessor.Encoding == EncodingType.FLOAT
+                    ? accessor.Dimensions is DimensionType.SCALAR or DimensionType.VEC2
+                        or DimensionType.VEC3 or DimensionType.VEC4
+                    : accessor.Dimensions == DimensionType.VEC4
+                        && accessor.Encoding is EncodingType.UNSIGNED_BYTE
+                            or EncodingType.UNSIGNED_SHORT or EncodingType.UNSIGNED_INT;
+                if (!known) return false;
+            }
+            return true;
+        }
+
+        // Drops one primitive's unreferenced vertices and renumbers its triangles onto what's left.
+        // Internal rather than private because deleting triangles strands vertices by design and
+        // has to clean up after itself the same way (see TriangleDeleter) - everything else should
+        // go through CompactUnusedVertices.
+        internal static int CompactPrimitive(MeshPrimitive prim)
+        {
+            if (!CanCompactPrimitive(prim)) return 0;
+
+            var posAcc = prim.VertexAccessors["POSITION"];
             int vertexCount = posAcc.Count;
             var triangles = prim.GetTriangleIndices().ToArray();
 

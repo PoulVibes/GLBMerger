@@ -38,8 +38,12 @@ namespace GlbMerger
     // back to plain UV averaging over the original vertices, unchanged from before.
     //
     // Unlike GeometryOptimizer's simplification (which only ever rewrites the index buffer),
-    // filling a hole adds vertices, so the snapshot/restore pair here has to carry full vertex
-    // accessor contents for every primitive touched, not just its indices.
+    // filling a hole adds vertices, so GeometryHistory has to capture full vertex accessor
+    // contents before a fill runs, not just the indices - see its BeginChange.
+    //
+    // Besides finding holes itself (Analyze), the capping half is offered on its own to a caller
+    // that already knows its rings (CapLoops) - PlanarCutter closes the flat edge a cut leaves
+    // that way, so a cut cap and a fill cap are textured and built by the same code.
     public static class WatertightRepair
     {
         public sealed class PrimitiveResult
@@ -252,6 +256,54 @@ namespace GlbMerger
             return report;
         }
 
+        // Caps loops a caller has already found, instead of searching the model for holes. Each
+        // loop is a closed ring of vertex indices into its primitive, in the direction the
+        // surrounding triangles traverse those edges - the same convention Analyze's own loops
+        // follow. PlanarCutter uses this for the rings its cut leaves: it knows exactly which
+        // vertices they are, and finding them again by searching would be both slower and less
+        // certain (it would have to tell them apart from any opening the model already had).
+        //
+        // flatCaps makes every cap vertex a fresh duplicate carrying the loop's own plane normal,
+        // computed from its winding, rather than sharing the boundary vertices and their normals.
+        // Right for a ring that really is planar - a cut - and wrong for the arbitrary, non-planar
+        // holes Analyze finds, which keep the averaged normals they always had.
+        public static Report CapLoops(ModelRoot model,
+            IReadOnlyDictionary<(int MeshIndex, int PrimitiveIndex), List<List<int>>> loopsByPrimitive, bool flatCaps)
+        {
+            var report = new Report();
+            var patchUvByImage = new Dictionary<int, Vector2?>();
+
+            foreach (var ((meshIdx, primIdx), loops) in loopsByPrimitive)
+            {
+                if (loops.Count == 0) continue;
+                var mesh = model.LogicalMeshes[meshIdx];
+                var result = new PrimitiveResult
+                {
+                    MeshName = mesh.Name ?? $"mesh_{meshIdx}",
+                    MeshIndex = meshIdx,
+                    PrimitiveIndex = primIdx,
+                };
+                report.Primitives.Add(result);
+
+                var data = LoadPrimitive(mesh.Primitives[primIdx], result);
+                if (data == null) continue;
+                result.HolesFound = loops.Count;
+
+                var target = FindBaseColorTarget(mesh.Primitives[primIdx]);
+                Vector2? patchUv = null;
+                if (target != null)
+                {
+                    if (!patchUvByImage.TryGetValue(target.Value.ImageIndex, out patchUv))
+                        patchUvByImage[target.Value.ImageIndex] = patchUv = FindTexturePatchUv(model, target.Value.ImageIndex);
+                }
+                result.UsedTexturePatch = patchUv.HasValue;
+
+                BuildFillPatch(data, loops, result, target?.UvAttribute, patchUv, flatCaps);
+            }
+
+            return report;
+        }
+
         public static void Apply(Report report, ModelRoot model)
         {
             foreach (var p in report.Primitives)
@@ -354,7 +406,8 @@ namespace GlbMerger
 
                 while (byStart.TryGetValue(current, out var next))
                 {
-                    consumed.Add(current);
+                    // Already walked from an earlier start: this chain's tail was counted then.
+                    if (!consumed.Add(current)) break;
                     current = next.B;
                     if (current == start) { closed = true; break; }
                     if (!visited.Add(current)) break; // revisited a non-start vertex - malformed, bail out
@@ -387,10 +440,16 @@ namespace GlbMerger
         // keep their real UV too), so this path duplicates every loop vertex it uses instead of
         // reusing the originals - the one behavioral difference from the no-patch fallback below,
         // where reuse is exactly the point (nothing to duplicate for, so don't).
+        //
+        // flatCaps (see CapLoops) changes two things: every loop vertex is duplicated whether or
+        // not there's a texture patch - the duplicates are what carry the cap's own normal, and the
+        // originals keep theirs for the surface beside the cut - and that normal is the loop's
+        // plane normal rather than an average of the boundary's.
         private static void BuildFillPatch(PrimitiveData data, List<List<int>> loops, PrimitiveResult result,
-            string? patchUvAttribute, Vector2? patchUv)
+            string? patchUvAttribute, Vector2? patchUv, bool flatCaps = false)
         {
             bool usePatch = patchUv.HasValue && patchUvAttribute != null;
+            bool duplicateLoop = usePatch || flatCaps;
             int baseVertexCount = data.Positions.Count;
             var appended = data.Attributes.Keys.ToDictionary(name => name, _ => new List<Vector4>());
             var newTriangles = new List<(int A, int B, int C)>();
@@ -402,9 +461,19 @@ namespace GlbMerger
                 return newIndex;
             }
 
-            Vector4 CentroidValue(string name, List<int> loop)
+            // What a duplicated loop vertex carries: its own attributes, except the UV when a
+            // texture patch is in use, and the normal when the cap is flat.
+            Vector4 LoopVertexValue(string name, int v, Vector3? flatNormal)
             {
                 if (usePatch && name == patchUvAttribute) return new Vector4(patchUv!.Value, 0, 0);
+                if (flatNormal.HasValue && name == "NORMAL") return new Vector4(flatNormal.Value, 0);
+                return data.Attributes[name][v];
+            }
+
+            Vector4 CentroidValue(string name, List<int> loop, Vector3? flatNormal)
+            {
+                if (usePatch && name == patchUvAttribute) return new Vector4(patchUv!.Value, 0, 0);
+                if (flatNormal.HasValue && name == "NORMAL") return new Vector4(flatNormal.Value, 0);
 
                 // Joint indices identify which bones influence a vertex - they are labels, not
                 // magnitudes, so averaging them across the loop would invent a bone that isn't in
@@ -427,40 +496,47 @@ namespace GlbMerger
 
             foreach (var loop in loops)
             {
-                if (loop.Count == 3 && !usePatch)
+                // The loop's own plane normal, oriented the way the fan below faces - the fan runs
+                // the loop backwards (see the winding note there), so the normal is negated.
+                Vector3? flatNormal = flatCaps ? -LoopNormal(data.Positions, loop) : null;
+
+                if (loop.Count == 3 && !duplicateLoop)
                 {
-                    // A triangular hole needs no new vertex - the loop direction is the boundary's
-                    // own winding, which already points the cap the right way.
-                    newTriangles.Add((loop[0], loop[1], loop[2]));
+                    // A triangular hole needs no new vertex. Reversed for the reason given at the
+                    // fan below: the loop runs the way the surrounding triangles traverse it.
+                    newTriangles.Add((loop[2], loop[1], loop[0]));
                     result.TrianglesAdded++;
                     result.HolesFilled++;
                     continue;
                 }
 
-                var loopVerts = usePatch
-                    ? loop.Select(v => AppendVertex(name =>
-                        name == patchUvAttribute ? new Vector4(patchUv!.Value, 0, 0) : data.Attributes[name][v])).ToList()
+                var loopVerts = duplicateLoop
+                    ? loop.Select(v => AppendVertex(name => LoopVertexValue(name, v, flatNormal))).ToList()
                     : loop;
-                if (usePatch) result.VerticesAdded += loop.Count;
+                if (duplicateLoop) result.VerticesAdded += loop.Count;
 
                 if (loop.Count == 3)
                 {
-                    newTriangles.Add((loopVerts[0], loopVerts[1], loopVerts[2]));
+                    newTriangles.Add((loopVerts[2], loopVerts[1], loopVerts[0]));
                     result.TrianglesAdded++;
                     result.HolesFilled++;
                     continue;
                 }
 
-                int centroidIndex = AppendVertex(name => CentroidValue(name, loop));
+                int centroidIndex = AppendVertex(name => CentroidValue(name, loop, flatNormal));
                 result.VerticesAdded++;
 
                 for (int i = 0; i < loopVerts.Count; i++)
                 {
                     int a = loopVerts[i];
                     int b = loopVerts[(i + 1) % loopVerts.Count];
-                    // Boundary edge (a -> b) already runs the direction the missing face's winding
-                    // must continue in, so the fan triangle is (a, b, centroid) - not the reverse.
-                    newTriangles.Add((a, b, centroidIndex));
+                    // Each boundary edge (a -> b) is recorded in the direction the ONE triangle
+                    // that still uses it traverses it. Two triangles sharing an edge in a
+                    // consistently wound mesh traverse it in opposite directions, so the missing
+                    // face - which is what the cap stands in for - has to run it b -> a. Hence
+                    // (b, a, centroid): the cap faces the same way as the surface around it. The
+                    // earlier (a, b, centroid) faced inward, which a double-sided material hid.
+                    newTriangles.Add((b, a, centroidIndex));
                 }
                 result.TrianglesAdded += loopVerts.Count;
                 result.HolesFilled++;
@@ -478,6 +554,23 @@ namespace GlbMerger
                 AppendedAttributes = appended.ToDictionary(kv => kv.Key, kv => (IReadOnlyList<Vector4>)kv.Value),
                 NewIndices = newIndices,
             };
+        }
+
+        // Newell's method: the normal of a polygon from its vertices alone, robust to the odd
+        // non-convex or slightly non-planar loop, with the sign following the loop's winding by
+        // the right-hand rule - the same rule the fan triangles (a, b, centroid) obey.
+        private static Vector3 LoopNormal(IList<Vector3> positions, List<int> loop)
+        {
+            var n = Vector3.Zero;
+            for (int i = 0; i < loop.Count; i++)
+            {
+                var a = positions[loop[i]];
+                var b = positions[loop[(i + 1) % loop.Count]];
+                n.X += (a.Y - b.Y) * (a.Z + b.Z);
+                n.Y += (a.Z - b.Z) * (a.X + b.X);
+                n.Z += (a.X - b.X) * (a.Y + b.Y);
+            }
+            return n.LengthSquared() > 1e-20f ? Vector3.Normalize(n) : Vector3.UnitY;
         }
 
         // The image and TEXCOORD_n accessor a primitive's cap should be textured from, if its
@@ -661,7 +754,9 @@ namespace GlbMerger
             return varR + varG + varB;
         }
 
-        private static void WritePatch(MeshPrimitive prim, VertexPatch patch)
+        // Internal so PlanarCutter can write its own VertexPatch (appended plane vertices plus the
+        // clipped index buffer) through exactly the same path a fill uses.
+        internal static void WritePatch(MeshPrimitive prim, VertexPatch patch)
         {
             foreach (var (name, accessor) in prim.VertexAccessors)
             {

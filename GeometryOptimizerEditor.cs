@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Numerics;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Threading.Tasks;
@@ -26,8 +27,14 @@ namespace GlbMerger
     // "revert to how it arrived" step: it is the one mode that can silently alter geometry across
     // the whole model at once, and reaching a good result means stacking several passes at
     // different ratios and regions, so the state worth going back to is rarely the original. Every
-    // pass - simplification and hole filling alike - records into GeometryHistory, and any of them
-    // can be clicked back to without destroying the ones after it.
+    // pass - simplification, deletion, a planar cut and hole filling alike - records into
+    // GeometryHistory, and any of them can be clicked back to without destroying the ones after it.
+    //
+    // Painting feeds two of those four. For simplification it marks the region to reduce or the
+    // region to protect (the ONLY/EXCEPT pair); for TriangleDeleter it marks the triangles to throw
+    // away outright. PlanarCutter takes geometry off the model too, but by a plane rather than by
+    // paint - it's positioned with the controls in its own section and previewed as a translucent
+    // slab over the side that goes, drawn into the same overlay canvas as the paint.
     //
     // The preview uses <model-viewer> for the visible model, for the same PBR rendering,
     // environment lighting and camera framing as AnimationTrimEditor. Note that the choice of
@@ -68,6 +75,28 @@ namespace GlbMerger
         private int _previewVersion;
         private string? _previewPath;
 
+        private Button _btnAnalyzeDelete = null!, _btnDelete = null!;
+
+        private ComboBox _cmbCutAxis = null!, _cmbCutSide = null!;
+        private TrackBar _sliderCut = null!;
+        private NumericUpDown _numCut = null!;
+        private Label _lblCut = null!;
+        private CheckBox _chkCapCut = null!, _chkShowCutPlane = null!;
+        private Button _btnAnalyzeCut = null!, _btnApplyCut = null!;
+
+        // World-space extent the cut plane's controls range over. Measured once, when the pane
+        // opens, and deliberately not again after each pass: a cut that shrinks the model would
+        // otherwise move the slider's endpoints out from under a position that was just dialled in.
+        private (Vector3 Min, Vector3 Max) _worldBounds;
+
+        // The plane's position along the chosen axis, in world units. Held separately from the
+        // slider so that a value typed into the numeric box is used as typed - the slider only
+        // has a thousand steps, which on a two-metre model is a couple of millimetres.
+        private float _cutPosition;
+
+        // The slider and the numeric box mirror each other; each one's ValueChanged writes the
+        // other, which would raise ValueChanged straight back without this.
+        private bool _syncingCut;
         private Button _btnAnalyzeWatertight = null!, _btnApplyWatertight = null!;
 
         // Every state the geometry has been in this session, including the untouched merge result
@@ -86,6 +115,7 @@ namespace GlbMerger
         {
             _model = model;
             _history = new GeometryHistory(model);
+            _worldBounds = PlanarCutter.WorldBounds(model);
 
             Dock = DockStyle.Fill;
 
@@ -247,6 +277,116 @@ namespace GlbMerger
                 "Optimizing rewrites triangles only, so vertices the result no longer references - " +
                 "and the index buffer each pass replaces - stay in the model, and it can grow rather " +
                 "than shrink. Saving offers to rebuild and drop both."));
+
+            flow.Controls.Add(new Label
+            {
+                Text = "Delete Painted Triangles",
+                AutoSize = true,
+                Margin = new Padding(3, 8, 3, 4),
+            });
+
+            flow.Controls.Add(HelpText(
+                "Throws the painted triangles away outright, then drops every vertex no triangle " +
+                "references any more - including ones earlier simplify passes over the same mesh " +
+                "part left behind. For geometry that shouldn't be in the merge at all: interior " +
+                "surfaces no camera sees, a prop's backing plane, decals buried under other parts."));
+
+            flow.Controls.Add(HelpText(
+                "This leaves a hole - nothing is closed up behind it, so paint with the far side " +
+                "of the model in mind. The ONLY/EXCEPT checkboxes above belong to simplification; " +
+                "deletion always takes exactly what is painted, and a mesh part with every triangle " +
+                "painted is left alone rather than emptied."));
+
+            _btnAnalyzeDelete = MakeButton("Analyze Deletion (dry run)");
+            _btnAnalyzeDelete.Click += async (s, e) => await RunDeleteAsync(apply: false);
+            flow.Controls.Add(_btnAnalyzeDelete);
+
+            _btnDelete = MakeButton("Delete Painted Triangles");
+            _btnDelete.Click += async (s, e) => await RunDeleteAsync(apply: true);
+            flow.Controls.Add(_btnDelete);
+
+            flow.Controls.Add(new Label
+            {
+                Text = "Planar Cut",
+                AutoSize = true,
+                Margin = new Padding(3, 8, 3, 4),
+            });
+
+            flow.Controls.Add(HelpText(
+                "Slices the whole model with a flat plane and deletes everything on one side. " +
+                "Triangles the plane passes through are trimmed back to it - new vertices go in " +
+                "exactly where each edge crosses - so the model ends in a clean, flat edge on the " +
+                "plane rather than a jagged one. Positions are measured as the preview shows them, " +
+                "so the cut lands where the plane is drawn."));
+
+            var cutAxisRow = new FlowLayoutPanel
+            {
+                FlowDirection = FlowDirection.LeftToRight, WrapContents = false,
+                AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Margin = new Padding(0, 0, 0, 2),
+            };
+            cutAxisRow.Controls.Add(new Label { Text = "Axis:", AutoSize = true, Margin = new Padding(3, 7, 6, 3) });
+            _cmbCutAxis = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 60, Margin = new Padding(0, 4, 12, 3) };
+            _cmbCutAxis.Items.AddRange(new object[] { "X", "Y", "Z" });
+            _cmbCutAxis.SelectedIndex = 1;
+            cutAxisRow.Controls.Add(_cmbCutAxis);
+            _cmbCutSide = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 200, Margin = new Padding(0, 4, 3, 3) };
+            cutAxisRow.Controls.Add(_cmbCutSide);
+            flow.Controls.Add(cutAxisRow);
+
+            _lblCut = new Label { AutoSize = true, Margin = new Padding(3, 0, 3, 0) };
+            _sliderCut = new TrackBar
+            {
+                Width = 330, Height = 45, Minimum = 0, Maximum = 1000, Value = 500,
+                TickFrequency = 100, Margin = new Padding(3, 0, 3, 0),
+            };
+            flow.Controls.Add(_lblCut);
+            flow.Controls.Add(_sliderCut);
+
+            var cutPosRow = new FlowLayoutPanel
+            {
+                FlowDirection = FlowDirection.LeftToRight, WrapContents = false,
+                AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Margin = new Padding(0, 0, 0, 4),
+            };
+            cutPosRow.Controls.Add(new Label { Text = "Exact position:", AutoSize = true, Margin = new Padding(3, 7, 6, 3) });
+            _numCut = new NumericUpDown { Width = 110, DecimalPlaces = 4, Margin = new Padding(0, 4, 3, 3) };
+            cutPosRow.Controls.Add(_numCut);
+            flow.Controls.Add(cutPosRow);
+
+            _chkCapCut = new CheckBox
+            {
+                Text = "Cap the cut with a flat surface", AutoSize = true, Checked = true, Margin = new Padding(3, 0, 3, 0),
+            };
+            flow.Controls.Add(_chkCapCut);
+
+            _chkShowCutPlane = new CheckBox
+            {
+                Text = "Show the cut plane in the preview", AutoSize = true, Margin = new Padding(3, 0, 3, 4),
+            };
+            _chkShowCutPlane.CheckedChanged += (s, e) => PushCutPlane();
+            flow.Controls.Add(_chkShowCutPlane);
+
+            flow.Controls.Add(HelpText(
+                "The cap closes each ring the cut edge forms with a flat fan on the plane, textured " +
+                "from a blank patch of the material where one exists - the same fill Make Watertight " +
+                "uses, restricted to the cut. Where the plane runs into an opening the model already " +
+                "had, that ring isn't closed (there's nothing flat to close), and where it meets a " +
+                "seam between two mesh parts, each part's half of the ring is capped on its own. " +
+                "A part lying entirely on the deleted side is left alone rather than emptied."));
+
+            _btnAnalyzeCut = MakeButton("Analyze Cut (dry run)");
+            _btnAnalyzeCut.Click += async (s, e) => await RunCutAsync(apply: false);
+            flow.Controls.Add(_btnAnalyzeCut);
+
+            _btnApplyCut = MakeButton("Apply Cut");
+            _btnApplyCut.Click += async (s, e) => await RunCutAsync(apply: true);
+            flow.Controls.Add(_btnApplyCut);
+
+            // Wired after every control exists: the axis handler reaches all of them.
+            _cmbCutAxis.SelectedIndexChanged += (s, e) => OnCutAxisChanged();
+            _cmbCutSide.SelectedIndexChanged += (s, e) => OnCutControlTouched();
+            _sliderCut.ValueChanged += (s, e) => OnCutSliderChanged();
+            _numCut.ValueChanged += (s, e) => OnCutNumericChanged();
+            OnCutAxisChanged();
 
             flow.Controls.Add(new Label
             {
@@ -506,6 +646,294 @@ namespace GlbMerger
             : _chkExcludeSelection.Checked ? " (except painted)"
             : "";
 
+        private async Task RunDeleteAsync(bool apply)
+        {
+            var selection = await ReadSelectionAsync();
+            if (IsDisposed) return;
+            if (selection == null || selection.Values.All(s => s.Count == 0))
+            {
+                _lblStatus.Text = "Nothing is painted - turn on paint mode and drag over the triangles to delete.";
+                return;
+            }
+
+            SetBusy(true, apply ? "Deleting..." : "Analyzing...");
+
+            TriangleDeleter.Report report;
+            try
+            {
+                // Read-only, like the other two analyses, so it can go off the UI thread; the
+                // write-back below happens back on it.
+                report = await Task.Run(() => TriangleDeleter.Analyze(_model, selection));
+            }
+            catch (Exception ex)
+            {
+                SetBusy(false, null);
+                MessageBox.Show(this, $"Deletion analysis failed: {ex.Message}",
+                    "Optimize Geometry", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            if (IsDisposed) return;
+
+            if (!report.HasChanges)
+            {
+                SetBusy(false, report.PrimitivesFullyPainted > 0
+                    ? $"Every triangle of {report.PrimitivesFullyPainted} mesh part(s) is painted - a part can't be " +
+                      "emptied here, only thinned. Leave some of it unpainted, or drop the whole part at merge time."
+                    : "Nothing to delete - the painted triangles are all in mesh parts this can't touch.");
+                return;
+            }
+
+            FillDeleteGrid(report);
+
+            string summary =
+                $"{report.TrianglesDeleted:N0} triangle(s) ({report.PercentDeleted:0.00}% of the model) and " +
+                $"{report.VerticesDropped:N0} vertex/vertices" +
+                (apply ? " deleted." : " would be deleted.") +
+                (report.PrimitivesFullyPainted > 0
+                    ? $" {report.PrimitivesFullyPainted} fully-painted mesh part(s) left alone - a part can't be emptied here."
+                    : "") +
+                (report.PrimitivesKeepingVertices > 0
+                    ? $" {report.PrimitivesKeepingVertices} mesh part(s) keep their stranded vertices " +
+                      $"({report.Primitives.First(p => p.VerticesKeptReason != null).VerticesKeptReason})."
+                    : "");
+
+            if (!apply)
+            {
+                SetBusy(false, summary + " Nothing changed yet.");
+                return;
+            }
+
+            // Compaction renumbers the surviving vertices, so this rewrites vertex accessors as
+            // well as indices - the history has to capture the full pre-deletion vertex state.
+            _history.BeginChange(touchesVertexData: true);
+            TriangleDeleter.Apply(report, _model);
+
+            SetBusy(false, summary + " Included the next time you save the merge.");
+            RecordHistory($"Delete {report.TrianglesDeleted:N0} triangle(s)", touchedVertexData: true);
+            ShowBaseline();
+            ReloadPreview();
+        }
+
+        private void FillDeleteGrid(TriangleDeleter.Report report)
+        {
+            _grid.Rows.Clear();
+            foreach (var group in report.Primitives.Where(p => p.TrianglesDeleted > 0).GroupBy(p => p.MeshName))
+            {
+                int before = group.Sum(p => p.TrianglesBefore);
+                int after = group.Sum(p => p.TrianglesAfter);
+                int deleted = before - after;
+                _grid.Rows.Add(
+                    group.Key,
+                    before.ToString("N0"),
+                    after.ToString("N0"),
+                    $"{deleted:N0} ({100.0 * deleted / Math.Max(before, 1):0.0}%)");
+            }
+
+            _lblTotals.Text =
+                $"{report.TrianglesBefore:N0} -> {report.TrianglesBefore - report.TrianglesDeleted:N0} triangles " +
+                $"({report.PercentDeleted:0.00}% deleted)\n" +
+                $"{report.VerticesDropped:N0} vertex/vertices left with no triangle, dropped with them";
+        }
+
+        // --- Planar cut controls ------------------------------------------------------------
+
+        private int CutAxis => Math.Max(0, _cmbCutAxis.SelectedIndex);
+        private bool CutDeletesPositive => _cmbCutSide.SelectedIndex == 0;
+
+        private (float Min, float Max) CutRange()
+        {
+            float min = Component(_worldBounds.Min, CutAxis);
+            float max = Component(_worldBounds.Max, CutAxis);
+            // A hair beyond the model at either end, so the extremes read as "delete nothing" and
+            // "delete everything" rather than a sliver.
+            float pad = Math.Max((max - min) * 0.01f, 1e-4f);
+            return (min - pad, max + pad);
+        }
+
+        private static float Component(Vector3 v, int axis) => axis switch { 0 => v.X, 1 => v.Y, _ => v.Z };
+
+        private float CutPosition() => _cutPosition;
+
+        private float SliderPosition()
+        {
+            var (min, max) = CutRange();
+            return min + (max - min) * (_sliderCut.Value / 1000f);
+        }
+
+        private PlanarCutter.Plane CurrentCutPlane() =>
+            PlanarCutter.Plane.AxisAligned(CutAxis, CutPosition(), CutDeletesPositive);
+
+        private void OnCutAxisChanged()
+        {
+            string axis = "XYZ"[CutAxis].ToString();
+            int side = Math.Max(0, _cmbCutSide.SelectedIndex);
+
+            _syncingCut = true;
+            try
+            {
+                _cmbCutSide.Items.Clear();
+                if (CutAxis == 1)
+                    _cmbCutSide.Items.AddRange(new object[] { "Delete above the plane (+Y)", "Delete below the plane (-Y)" });
+                else
+                    _cmbCutSide.Items.AddRange(new object[] { $"Delete the +{axis} side", $"Delete the -{axis} side" });
+                _cmbCutSide.SelectedIndex = side;
+
+                // The slider keeps its fraction across an axis change; the numeric box is re-ranged
+                // to the new axis and set from that fraction.
+                var (min, max) = CutRange();
+                _cutPosition = SliderPosition();
+                _numCut.Minimum = (decimal)min;
+                _numCut.Maximum = (decimal)max;
+                _numCut.Increment = Math.Max((decimal)((max - min) / 200f), 0.0001m);
+                _numCut.Value = Math.Clamp((decimal)_cutPosition, _numCut.Minimum, _numCut.Maximum);
+            }
+            finally
+            {
+                _syncingCut = false;
+            }
+
+            UpdateCutLabel();
+            OnCutControlTouched();
+        }
+
+        private void OnCutSliderChanged()
+        {
+            if (_syncingCut) return;
+            _cutPosition = SliderPosition();
+            _syncingCut = true;
+            try { _numCut.Value = Math.Clamp((decimal)_cutPosition, _numCut.Minimum, _numCut.Maximum); }
+            finally { _syncingCut = false; }
+            UpdateCutLabel();
+            OnCutControlTouched();
+        }
+
+        private void OnCutNumericChanged()
+        {
+            if (_syncingCut) return;
+            _cutPosition = (float)_numCut.Value;
+            var (min, max) = CutRange();
+            float fraction = max > min ? (_cutPosition - min) / (max - min) : 0.5f;
+            _syncingCut = true;
+            try { _sliderCut.Value = Math.Clamp((int)MathF.Round(fraction * 1000f), 0, 1000); }
+            finally { _syncingCut = false; }
+            UpdateCutLabel();
+            OnCutControlTouched();
+        }
+
+        private void UpdateCutLabel() =>
+            _lblCut.Text = $"Cut at {"XYZ"[CutAxis]} = {CutPosition().ToString("0.####", CultureInfo.InvariantCulture)}";
+
+        // Adjusting any cut control switches the plane preview on - there's no dialling a cut in
+        // blind - after which the checkbox is the user's to turn off again.
+        private void OnCutControlTouched()
+        {
+            if (_syncingCut) return;
+            if (_chkShowCutPlane != null && !_chkShowCutPlane.Checked && _viewerReady) _chkShowCutPlane.Checked = true;
+            else PushCutPlane();
+        }
+
+        private void PushCutPlane()
+        {
+            if (!_viewerReady || _webView.CoreWebView2 == null || _chkShowCutPlane == null) return;
+            string position = CutPosition().ToString("R", CultureInfo.InvariantCulture);
+            _ = _webView.CoreWebView2.ExecuteScriptAsync(
+                $"setCutPlane({CutAxis}, {position}, {(CutDeletesPositive ? "true" : "false")}, {(_chkShowCutPlane.Checked ? "true" : "false")});");
+        }
+
+        private string CutStepLabel()
+        {
+            string position = CutPosition().ToString("0.###", CultureInfo.InvariantCulture);
+            string axis = "XYZ"[CutAxis].ToString();
+            if (CutAxis == 1) return CutDeletesPositive ? $"Cut off above Y = {position}" : $"Cut off below Y = {position}";
+            return $"Cut off {(CutDeletesPositive ? "+" : "-")}{axis} side at {position}";
+        }
+
+        private async Task RunCutAsync(bool apply)
+        {
+            var plane = CurrentCutPlane();
+            SetBusy(true, apply ? "Cutting..." : "Analyzing...");
+
+            PlanarCutter.Report report;
+            try
+            {
+                report = await Task.Run(() => PlanarCutter.Analyze(_model, plane));
+            }
+            catch (Exception ex)
+            {
+                SetBusy(false, null);
+                MessageBox.Show(this, $"Cut analysis failed: {ex.Message}",
+                    "Optimize Geometry", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            if (IsDisposed) return;
+
+            if (!report.HasChanges)
+            {
+                SetBusy(false, report.PrimitivesFullyDeleted > 0
+                    ? $"The plane leaves nothing of {report.PrimitivesFullyDeleted} mesh part(s), and nothing else " +
+                      "crosses it - a part can't be emptied here, only trimmed. Move the plane, or drop the part at merge time."
+                    : "Nothing on the deleted side of the plane - the model is untouched at this position.");
+                return;
+            }
+
+            FillCutGrid(report);
+
+            string summary =
+                $"{report.TrianglesDeleted:N0} triangle(s) removed and {report.TrianglesClipped:N0} trimmed to the plane, " +
+                $"placing {report.VerticesAdded:N0} new vertex/vertices on it and dropping {report.VerticesDropped:N0}." +
+                (report.CutLoops > 0 ? $" The cut edge forms {report.CutLoops} ring(s)." : "") +
+                (report.OpenCutEdges > 0 ? $" {report.OpenCutEdges} cut edge(s) run into an existing opening and don't close." : "") +
+                (report.PrimitivesFullyDeleted > 0
+                    ? $" {report.PrimitivesFullyDeleted} mesh part(s) entirely on the deleted side left alone."
+                    : "");
+
+            if (!apply)
+            {
+                SetBusy(false, summary + (_chkCapCut.Checked && report.CutLoops > 0
+                    ? " Each ring would be capped. Nothing changed yet."
+                    : " Nothing changed yet."));
+                return;
+            }
+
+            // New vertices on the plane and compaction of the deleted side both rewrite vertex
+            // accessors - a full vertex capture, like a fill or a delete.
+            _history.BeginChange(touchesVertexData: true);
+            var capReport = PlanarCutter.Apply(report, _model, cap: _chkCapCut.Checked);
+
+            string capSummary = capReport == null ? ""
+                : capReport.HolesFilled > 0
+                    ? $" Capped {capReport.HolesFilled} ring(s) with {capReport.TrianglesAdded:N0} triangle(s)" +
+                      (capReport.PrimitivesUsingTexturePatch > 0 ? ", textured from a blank patch of the atlas." : ".")
+                    : " No closed ring to cap.";
+
+            SetBusy(false, summary + capSummary + " Included the next time you save the merge.");
+            RecordHistory(CutStepLabel(), touchedVertexData: true);
+            ShowBaseline();
+            ReloadPreview();
+        }
+
+        private void FillCutGrid(PlanarCutter.Report report)
+        {
+            _grid.Rows.Clear();
+            foreach (var group in report.Primitives.Where(p => p.Patch != null).GroupBy(p => p.MeshName))
+            {
+                int before = group.Sum(p => p.TrianglesBefore);
+                int after = group.Sum(p => p.TrianglesAfter);
+                int removed = before - after;
+                _grid.Rows.Add(
+                    group.Key,
+                    before.ToString("N0"),
+                    after.ToString("N0"),
+                    removed <= 0 ? "-" : $"{removed:N0} ({100.0 * removed / Math.Max(before, 1):0.0}%)");
+            }
+
+            _lblTotals.Text =
+                $"{report.TrianglesBefore:N0} -> {report.TrianglesAfter:N0} triangles before any cap\n" +
+                $"{report.VerticesAdded:N0} vertex/vertices placed on the plane, {report.VerticesDropped:N0} dropped";
+        }
+
         private async Task RunWatertightAsync(bool apply)
         {
             SetBusy(true, apply ? "Filling holes..." : "Analyzing holes...");
@@ -656,6 +1084,10 @@ namespace GlbMerger
         {
             _btnAnalyze.Enabled = !busy;
             _btnApply.Enabled = !busy;
+            _btnAnalyzeDelete.Enabled = !busy;
+            _btnDelete.Enabled = !busy;
+            _btnAnalyzeCut.Enabled = !busy;
+            _btnApplyCut.Enabled = !busy;
             _btnAnalyzeWatertight.Enabled = !busy;
             _btnApplyWatertight.Enabled = !busy;
             // Restoring mid-run would have the pass write its result over the state just restored.
@@ -930,6 +1362,77 @@ namespace GlbMerger
                     var brushDecalGroup = new THREE.Group();
                     brushDecalGroup.visible = false;
                     overlayScene.add(brushDecalGroup);
+
+                    // --- Cut plane preview -----------------------------------------------------
+                    // Two translucent shapes drawn into the overlay: the plane itself as a quad
+                    // sized to the model's bounds, and a box over the whole deleted half of those
+                    // bounds. Both are depth-tested against the model's depth mask, so the box
+                    // tints exactly the surface that is about to go and nothing behind it, and
+                    // the quad disappears where the model is in front of it - which is what makes
+                    // it read as a plane THROUGH the model rather than a card in front of it.
+                    // Positioned from the same world-space bounds the hit-test load measures, so
+                    // it can only be built once that load has finished (see modelBox below).
+                    var cutPlane = { axis: 1, position: 0, deletePositive: true, visible: false };
+                    var modelBox = null;
+                    var cutPlaneGroup = new THREE.Group();
+                    overlayScene.add(cutPlaneGroup);
+                    var cutPlaneMaterial = new THREE.MeshBasicMaterial({
+                        color: 0xff6a3d, transparent: true, opacity: 0.35, depthTest: true, depthWrite: false,
+                        side: THREE.DoubleSide,
+                    });
+                    var cutSideMaterial = new THREE.MeshBasicMaterial({
+                        color: 0xff6a3d, transparent: true, opacity: 0.12, depthTest: true, depthWrite: false,
+                        side: THREE.DoubleSide,
+                    });
+
+                    function rebuildCutPlane() {
+                        for (var i = cutPlaneGroup.children.length - 1; i >= 0; i--) {
+                            var old = cutPlaneGroup.children[i];
+                            cutPlaneGroup.remove(old);
+                            old.geometry.dispose();
+                        }
+                        if (!cutPlane.visible || !modelBox) return;
+
+                        var pad = 1.08;
+                        var size = modelBox.getSize(new THREE.Vector3()).multiplyScalar(pad);
+                        var center = modelBox.getCenter(new THREE.Vector3());
+                        var axis = cutPlane.axis;
+
+                        // PlaneGeometry lies in XY facing +Z; turn it to face the cut axis.
+                        var quad;
+                        if (axis === 0) {
+                            quad = new THREE.Mesh(new THREE.PlaneGeometry(size.z, size.y), cutPlaneMaterial);
+                            quad.rotation.y = Math.PI / 2;
+                        } else if (axis === 1) {
+                            quad = new THREE.Mesh(new THREE.PlaneGeometry(size.x, size.z), cutPlaneMaterial);
+                            quad.rotation.x = -Math.PI / 2;
+                        } else {
+                            quad = new THREE.Mesh(new THREE.PlaneGeometry(size.x, size.y), cutPlaneMaterial);
+                        }
+                        var quadPos = center.clone();
+                        quadPos.setComponent(axis, cutPlane.position);
+                        quad.position.copy(quadPos);
+                        cutPlaneGroup.add(quad);
+
+                        var boxMin = center.clone().sub(size.clone().multiplyScalar(0.5));
+                        var boxMax = center.clone().add(size.clone().multiplyScalar(0.5));
+                        if (cutPlane.deletePositive) boxMin.setComponent(axis, cutPlane.position);
+                        else boxMax.setComponent(axis, cutPlane.position);
+                        var extent = boxMax.clone().sub(boxMin);
+                        if (extent.x > 0 && extent.y > 0 && extent.z > 0) {
+                            var box = new THREE.Mesh(new THREE.BoxGeometry(extent.x, extent.y, extent.z), cutSideMaterial);
+                            box.position.copy(boxMin.clone().add(extent.clone().multiplyScalar(0.5)));
+                            cutPlaneGroup.add(box);
+                        }
+                    }
+
+                    window.setCutPlane = function (axis, position, deletePositive, visible) {
+                        cutPlane.axis = axis;
+                        cutPlane.position = position;
+                        cutPlane.deletePositive = deletePositive;
+                        cutPlane.visible = visible;
+                        rebuildCutPlane();
+                    };
 
                     function rebuildBrushDecal() {
                         for (var i = brushDecalGroup.children.length - 1; i >= 0; i--) {
@@ -1394,6 +1897,8 @@ namespace GlbMerger
                             var box = new THREE.Box3().setFromObject(gltf.scene);
                             var size = box.getSize(new THREE.Vector3());
                             modelMaxDim = Math.max(size.x, size.y, size.z) || 1;
+                            modelBox = box;
+                            rebuildCutPlane();
 
                             // Only now is the brush fraction resolvable into a world-space radius,
                             // and only now is there geometry to draw a wireframe from - .NET pushed
@@ -1419,10 +1924,12 @@ namespace GlbMerger
                         // deferred to the 'load' handler above (see the comment there for why).
                         paintableMeshes = [];
                         selection = {};
+                        modelBox = null;
                         rebuildOverlay();
                         rebuildDepthMask();
                         rebuildWireframe();
                         rebuildBrushDecal();
+                        rebuildCutPlane();
                         hideBrushCursor();
                         viewer.src = url;
                     };
@@ -1520,6 +2027,7 @@ namespace GlbMerger
                 PushPaintMode();
                 PushBrushRadius();
                 PushWireframe();
+                PushCutPlane();
                 return;
             }
 
