@@ -65,6 +65,22 @@ namespace GlbMerger
             /// border - only which side of it moves changes. Ignored when Selection is null.
             /// </summary>
             public bool InvertSelection { get; set; }
+
+            /// <summary>
+            /// Simplify THESE triangles (a flat index buffer over the primitive's current vertices)
+            /// instead of the primitive's own index buffer, per primitive. A primitive with no entry
+            /// is left alone entirely. RegionRestorer hands the ORIGINAL triangles in here, with the
+            /// painted ones protected via <see cref="Selection"/>, to re-simplify around a region
+            /// that gets its full detail back; the report's TrianglesBefore still counts the
+            /// primitive's current triangles, so before/after reads as the change actually made.
+            /// </summary>
+            internal Dictionary<(int MeshIndex, int PrimitiveIndex), int[]>? SourceIndices { get; set; }
+
+            /// <summary>
+            /// Absolute triangle target for the part handed to meshopt (passthrough triangles
+            /// excluded), per primitive. Overrides <see cref="TargetRatio"/> where present.
+            /// </summary>
+            internal Dictionary<(int MeshIndex, int PrimitiveIndex), int>? TargetTriangles { get; set; }
         }
 
         public sealed class PrimitiveResult
@@ -81,6 +97,15 @@ namespace GlbMerger
 
             // Filled in by Analyze, consumed by Apply - null when this primitive is unchanged.
             public int[]? NewIndices { get; set; }
+
+            // Where the triangles that were NOT handed to meshopt landed in NewIndices: they are
+            // written after the simplified block, in ascending order of their index in the input,
+            // starting at triangle PassthroughStart. PassthroughSourceIndices[k] is the input
+            // triangle that became output triangle PassthroughStart + k. What the editor uses to
+            // carry a painted region across an Apply, since the paint is recorded by triangle
+            // index and Apply is precisely what renumbers those.
+            internal int PassthroughStart { get; set; }
+            internal int[] PassthroughSourceIndices { get; set; } = Array.Empty<int>();
 
             public int TrianglesSaved => TrianglesBefore - TrianglesAfter;
         }
@@ -115,6 +140,13 @@ namespace GlbMerger
                         PrimitiveIndex = primIdx,
                     };
                     report.Primitives.Add(result);
+
+                    if (options.SourceIndices != null && !options.SourceIndices.ContainsKey((meshIdx, primIdx)))
+                    {
+                        result.SkippedReason = "not painted";
+                        continue;
+                    }
+
                     // When a selection is active at all, every primitive is restricted by it - one
                     // with no entry in the dictionary was never painted, so it gets an empty set
                     // (nothing eligible, left untouched) rather than null (which means "no
@@ -526,6 +558,18 @@ namespace GlbMerger
             var tris = prim.GetTriangleIndices().Select(t => new Tri(t.A, t.B, t.C)).ToArray();
             result.TrianglesBefore = tris.Length;
             result.TrianglesAfter = tris.Length;
+
+            // Handed a different starting point (see SourceIndices), the primitive's own triangles
+            // only matter for the before count above.
+            bool fromSource = options.SourceIndices != null
+                && options.SourceIndices.TryGetValue((result.MeshIndex, result.PrimitiveIndex), out var source);
+            if (fromSource)
+            {
+                var flat = options.SourceIndices![(result.MeshIndex, result.PrimitiveIndex)];
+                tris = new Tri[flat.Length / 3];
+                for (int i = 0; i < tris.Length; i++)
+                    tris[i] = new Tri(flat[i * 3], flat[i * 3 + 1], flat[i * 3 + 2]);
+            }
             if (tris.Length < 3) return;
 
             // Inverted, what arrived is the region to PROTECT, so what's eligible is everything else.
@@ -539,13 +583,46 @@ namespace GlbMerger
                 selection = eligible;
             }
 
-            if (selection != null && selection.Count == 0) return;   // painted, but nothing in it - nothing to do
+            if (selection != null && selection.Count == 0)
+            {
+                // Painted, but nothing in it - nothing to do. Unless the starting point isn't the
+                // primitive's own triangles: then "everything is protected" is still an answer,
+                // and it is those triangles, as they are.
+                if (fromSource) UseAsIs(tris, result);
+                return;
+            }
 
-            var simplified = MeshoptSimplifier.Run(tris, positions, normals, uvs, joints, weights, options, selection, result);
-            if (simplified == null) return;
+            var simplified = MeshoptSimplifier.Run(tris, positions, normals, uvs, joints, weights, options, selection, result,
+                acceptNoReduction: fromSource);
+            if (simplified == null)
+            {
+                // A null with no reason is "nothing meshopt could collapse" (too few eligible
+                // triangles, or none removed); with a reason it's a real failure, not a result.
+                if (fromSource && result.SkippedReason == null) UseAsIs(tris, result);
+                return;
+            }
 
             result.TrianglesAfter = simplified.Length / 3;
             result.NewIndices = simplified;
+        }
+
+        // The source triangles written unchanged - what a re-simplification from SourceIndices
+        // amounts to when meshopt has nothing (or too little) it is allowed to collapse.
+        private static void UseAsIs(Tri[] tris, PrimitiveResult result)
+        {
+            var flat = new int[tris.Length * 3];
+            for (int i = 0; i < tris.Length; i++)
+            {
+                flat[i * 3] = tris[i].A;
+                flat[i * 3 + 1] = tris[i].B;
+                flat[i * 3 + 2] = tris[i].C;
+            }
+            result.TrianglesAfter = tris.Length;
+            result.NewIndices = flat;
+
+            // Written as they came, so every triangle is its own passthrough.
+            result.PassthroughStart = 0;
+            result.PassthroughSourceIndices = Enumerable.Range(0, tris.Length).ToArray();
         }
 
         private readonly struct Tri
@@ -572,9 +649,13 @@ namespace GlbMerger
         // recovered per output triangle - see PickDuplicate.
         private static class MeshoptSimplifier
         {
+            // acceptNoReduction: normally meshopt failing to remove a single triangle means there
+            // is nothing to write. Starting from a different index buffer than the primitive holds
+            // (SourceIndices), the output is a change even then, and has to be written.
             public static int[]? Run(Tri[] tris, IList<Vector3> positions, IList<Vector3>? normals,
                 IList<Vector2>? uvs, IList<Vector4>? joints, IList<Vector4>? weights,
-                SimplifyOptions options, HashSet<int>? selection, PrimitiveResult result)
+                SimplifyOptions options, HashSet<int>? selection, PrimitiveResult result,
+                bool acceptNoReduction = false)
             {
                 if (!MeshoptNative.IsAvailable)
                 {
@@ -588,12 +669,17 @@ namespace GlbMerger
                 // simplified region can never pull away from the untouched region and open a gap.
                 Tri[] simplifyTris = tris;
                 Tri[] passthroughTris = Array.Empty<Tri>();
+                var passthroughSources = new List<int>();
                 if (selection != null)
                 {
                     var selected = new List<Tri>(selection.Count);
                     var unselected = new List<Tri>(tris.Length - selection.Count);
                     for (int i = 0; i < tris.Length; i++)
-                        (selection.Contains(i) ? selected : unselected).Add(tris[i]);
+                    {
+                        if (selection.Contains(i)) { selected.Add(tris[i]); continue; }
+                        unselected.Add(tris[i]);
+                        passthroughSources.Add(i);
+                    }
                     simplifyTris = selected.ToArray();
                     passthroughTris = unselected.ToArray();
                 }
@@ -637,7 +723,10 @@ namespace GlbMerger
 
                 var locks = BuildLockMask(simplifyTris, weld, joints, weights, options, passthroughTris);
 
-                int targetTriangles = Math.Max(1, (int)MathF.Round(simplifyTris.Length * Math.Clamp(options.TargetRatio, 0.01f, 1f)));
+                int targetTriangles = options.TargetTriangles != null
+                    && options.TargetTriangles.TryGetValue((result.MeshIndex, result.PrimitiveIndex), out int absolute)
+                    ? Math.Clamp(absolute, 1, simplifyTris.Length)
+                    : Math.Max(1, (int)MathF.Round(simplifyTris.Length * Math.Clamp(options.TargetRatio, 0.01f, 1f)));
                 var destination = new uint[weldedIndices.Length];
                 float resultError;
                 nuint produced;
@@ -664,7 +753,8 @@ namespace GlbMerger
                 }
 
                 int producedIndices = (int)produced;
-                if (producedIndices < 3 || producedIndices >= weldedIndices.Length) return null;
+                if (producedIndices < 3 || producedIndices > weldedIndices.Length) return null;
+                if (producedIndices == weldedIndices.Length && !acceptNoReduction) return null;
 
                 var simplified = MapBackToOriginals(destination, producedIndices, weld, positions, normals);
                 if (simplified == null) return null;
@@ -672,6 +762,8 @@ namespace GlbMerger
                 if (options.OptimizeVertexOrder) OptimizeOrder(simplified, positions.Count);
 
                 result.SimplifyError = resultError;
+                result.PassthroughStart = simplified.Length / 3;
+                result.PassthroughSourceIndices = passthroughSources.ToArray();
 
                 if (passthroughTris.Length == 0) return simplified;
 

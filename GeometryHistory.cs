@@ -175,6 +175,113 @@ namespace GlbMerger
             _current = index;
         }
 
+        // One primitive's geometry as it stood at some entry, in that entry's own vertex numbering.
+        // UvWarpRepair measures the current surface against entry 0 (the one state whose UV mapping
+        // is known to be right, and which never changes - Trim keeps it); RegionRestorer puts
+        // triangles back from the oldest entry whose vertices are still the model's current ones.
+        internal sealed class ReferencePrimitive
+        {
+            public required int[] Indices { get; init; }
+            public required IReadOnlyList<Vector3> Positions { get; init; }
+            public required Dictionary<string, IReadOnlyList<Vector2>> UvSets { get; init; }
+        }
+
+        internal List<ReferencePrimitive?> GetOriginalGeometry() => GetReferenceGeometry(0);
+
+        // An entry's triangles with the vertices they address; null for a primitive that isn't a
+        // triangle list or has no POSITION. Per primitive in LogicalMeshes x Primitives order.
+        //
+        // Where the vertices come from depends on whether anything has rewritten them yet. A
+        // vertex capture only exists once some vertex-touching operation has run (BeginChange
+        // stores its pre-operation capture on entry 0, so every later lookup can reach it), and
+        // until then the live accessors still hold exactly the original contents - so a missing
+        // capture is read straight off the model rather than treated as an error.
+        internal List<ReferencePrimitive?> GetReferenceGeometry(int entryIndex)
+        {
+            var entry = _entries[entryIndex];
+            var vertexData = LookupVertexData(entryIndex);
+            var result = new List<ReferencePrimitive?>();
+
+            int i = 0;
+            foreach (var prim in _model.LogicalMeshes.SelectMany(m => m.Primitives))
+            {
+                int index = i++;
+                var indices = index < entry.Indices.Count ? entry.Indices[index] : null;
+                if (indices == null) { result.Add(null); continue; }
+
+                var captured = vertexData != null && index < vertexData.Primitives.Count
+                    ? vertexData.Primitives[index]
+                    : null;
+
+                IReadOnlyList<Vector3>? positions = null;
+                var uvSets = new Dictionary<string, IReadOnlyList<Vector2>>();
+
+                if (captured != null)
+                {
+                    foreach (var (name, values) in captured.Values)
+                    {
+                        if (name == "POSITION")
+                            positions = values.Select(v => new Vector3(v.X, v.Y, v.Z)).ToList();
+                        else if (name.StartsWith("TEXCOORD_", StringComparison.Ordinal))
+                            uvSets[name] = values.Select(v => new Vector2(v.X, v.Y)).ToList();
+                    }
+                }
+                else
+                {
+                    foreach (var (name, accessor) in prim.VertexAccessors)
+                    {
+                        if (name == "POSITION")
+                            positions = accessor.AsVector3Array().ToList();
+                        else if (name.StartsWith("TEXCOORD_", StringComparison.Ordinal))
+                            uvSets[name] = accessor.AsVector2Array().ToList();
+                    }
+                }
+
+                if (positions == null) { result.Add(null); continue; }
+                result.Add(new ReferencePrimitive { Indices = indices, Positions = positions, UvSets = uvSets });
+            }
+
+            return result;
+        }
+
+        // The oldest entry whose vertex positions are the ones the model holds right now - the
+        // furthest back an index-only operation can safely reach for triangles. A simplify pass or
+        // the texture-warp fix leaves POSITION alone, so the run of entries since the last delete,
+        // cut or fill all share it; that operation's own entry is where the run starts. Entry 0
+        // when nothing has ever rewritten the vertices.
+        //
+        // Judged on the POSITION list by reference: CaptureVertexState shares an attribute's
+        // decoded list between captures whenever the accessor underneath was not rewritten, so
+        // two entries whose POSITION lists are the same object provably hold the same positions
+        // in the same numbering, whatever happened to their UVs in between.
+        public int OldestEntrySharingCurrentVertices()
+        {
+            var current = LookupVertexData(_current);
+            int oldest = _current;
+            for (int i = _current - 1; i >= 0; i--)
+                if (SamePositions(LookupVertexData(i), current)) oldest = i;
+            return oldest;
+        }
+
+        private static bool SamePositions(VertexState? a, VertexState? b)
+        {
+            if (a == null || b == null) return a == null && b == null;   // both null: untouched originals
+            if (ReferenceEquals(a, b)) return true;
+            if (a.Primitives.Count != b.Primitives.Count) return false;
+
+            for (int i = 0; i < a.Primitives.Count; i++)
+            {
+                var pa = a.Primitives[i];
+                var pb = b.Primitives[i];
+                if (pa == null || pb == null) { if (pa != pb) return false; continue; }
+
+                pa.Values.TryGetValue("POSITION", out var la);
+                pb.Values.TryGetValue("POSITION", out var lb);
+                if (!ReferenceEquals(la, lb)) return false;
+            }
+            return true;
+        }
+
         // The vertex contents that apply to an entry: its own capture, or the nearest one below it.
         private VertexState? LookupVertexData(int index)
         {

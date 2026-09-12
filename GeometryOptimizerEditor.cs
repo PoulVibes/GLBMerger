@@ -27,14 +27,20 @@ namespace GlbMerger
     // "revert to how it arrived" step: it is the one mode that can silently alter geometry across
     // the whole model at once, and reaching a good result means stacking several passes at
     // different ratios and regions, so the state worth going back to is rarely the original. Every
-    // pass - simplification, deletion, a planar cut and hole filling alike - records into
-    // GeometryHistory, and any of them can be clicked back to without destroying the ones after it.
+    // pass - simplification, deletion, a planar cut, hole filling and the texture-warp fix alike -
+    // records into GeometryHistory, and any of them can be clicked back to without destroying the
+    // ones after it.
     //
-    // Painting feeds two of those four. For simplification it marks the region to reduce or the
+    // Painting feeds three of those. For simplification it marks the region to reduce or the
     // region to protect (the ONLY/EXCEPT pair); for TriangleDeleter it marks the triangles to throw
-    // away outright. PlanarCutter takes geometry off the model too, but by a plane rather than by
-    // paint - it's positioned with the controls in its own section and previewed as a translucent
-    // slab over the side that goes, drawn into the same overlay canvas as the paint.
+    // away outright; for RegionRestorer it marks where the original triangles should come back.
+    // PlanarCutter takes geometry off the model too, but by a plane rather than by paint - it's
+    // positioned with its own controls and previewed as a translucent slab over the side that
+    // goes, drawn into the same overlay canvas as the paint.
+    //
+    // The operations are picked from a dropdown at the top of the pane and only the chosen one's
+    // controls are shown; the paint controls, the wireframe toggle, the status line, the results
+    // grid and the History list are shared and stay put.
     //
     // The preview uses <model-viewer> for the visible model, for the same PBR rendering,
     // environment lighting and camera framing as AnimationTrimEditor. Note that the choice of
@@ -75,6 +81,12 @@ namespace GlbMerger
         private int _previewVersion;
         private string? _previewPath;
 
+        // A painted region to put back once the preview has reloaded after an Apply. The viewer
+        // drops its selection on every reload (the triangle indices it was recorded against have
+        // just been rewritten), so an operation that wants the paint to survive works out where
+        // its triangles ended up and leaves the answer here for the 'ready' handler to push.
+        private Dictionary<(int MeshIndex, int PrimitiveIndex), HashSet<int>>? _pendingSelection;
+
         private Button _btnAnalyzeDelete = null!, _btnDelete = null!;
 
         private ComboBox _cmbCutAxis = null!, _cmbCutSide = null!;
@@ -98,6 +110,34 @@ namespace GlbMerger
         // other, which would raise ValueChanged straight back without this.
         private bool _syncingCut;
         private Button _btnAnalyzeWatertight = null!, _btnApplyWatertight = null!;
+
+        private NumericUpDown _numUvJump = null!;
+        private Button _btnAnalyzeUv = null!, _btnApplyUv = null!;
+        private Button _btnAnalyzeRestore = null!, _btnRestore = null!;
+
+        private enum Operation { Simplify, Delete, Cut, Watertight, TextureWarp, Restore }
+
+        // Dropdown order and labels, indexed by Operation.
+        private static readonly (Operation Op, string Label)[] Operations =
+        {
+            (Operation.Simplify,    "Simplify (meshoptimizer)"),
+            (Operation.Delete,      "Delete Painted Triangles"),
+            (Operation.Cut,         "Planar Cut"),
+            (Operation.Watertight,  "Make Watertight"),
+            (Operation.TextureWarp, "Fix Texture Warp"),
+            (Operation.Restore,     "Restore Painted Detail"),
+        };
+
+        private ComboBox _cmbOperation = null!;
+        private FlowLayoutPanel _secSimplifySettings = null!, _secPaint = null!, _secSimplifyActions = null!,
+            _secDelete = null!, _secCut = null!, _secWatertight = null!, _secUv = null!, _secRestore = null!;
+
+        private Operation CurrentOperation => Operations[Math.Max(0, _cmbOperation.SelectedIndex)].Op;
+
+        // The original merge result, indexed for closest-point queries (see UvWarpRepair). Built
+        // the first time the texture-warp fix runs and kept for the session: History entry 0 never
+        // changes, and building the spatial grids is the slow half of a run.
+        private UvWarpRepair.Reference? _uvReference;
 
         // Every state the geometry has been in this session, including the untouched merge result
         // it started from - the model is shared with every other editor mode and nothing else keeps
@@ -126,6 +166,14 @@ namespace GlbMerger
 
             ThemeManager.Apply(this, darkMode);
 
+            // After the theme, which paints every label the same foreground: the outcome line is
+            // the one thing in the pane that is output rather than a control, and it's coloured
+            // to say so. Dark green as asked; lifted a little on the dark theme so it still reads
+            // against the near-black panel.
+            _lblStatus.ForeColor = darkMode
+                ? System.Drawing.Color.FromArgb(70, 170, 80)
+                : System.Drawing.Color.DarkGreen;
+
             _ = InitializeViewerAsync();
         }
 
@@ -143,12 +191,28 @@ namespace GlbMerger
                 Padding = new Padding(12),
             };
 
-            flow.Controls.Add(new Label
+            // One operation on screen at a time - the pane had grown to six sections of controls
+            // stacked end to end, most of them irrelevant to whatever is being done at the moment.
+            // The paint controls are shared by the three operations that take a painted region and
+            // sit between the simplifier's settings and its buttons, where they always were.
+            flow.Controls.Add(new Label { Text = "Operation:", AutoSize = true, Margin = new Padding(3, 0, 3, 2) });
+            _cmbOperation = new ComboBox
             {
-                Text = "Simplify (meshoptimizer)",
-                AutoSize = true,
-                Margin = new Padding(3, 0, 3, 8),
-            });
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                Width = 330,
+                Margin = new Padding(3, 0, 3, 10),
+            };
+            foreach (var (_, label) in Operations) _cmbOperation.Items.Add(label);
+            flow.Controls.Add(_cmbOperation);
+
+            var simplifySettings = _secSimplifySettings = NewSection();
+            var paint = _secPaint = NewSection();
+            var simplifyActions = _secSimplifyActions = NewSection();
+            var delete = _secDelete = NewSection();
+            var cut = _secCut = NewSection();
+            var watertight = _secWatertight = NewSection();
+            var uv = _secUv = NewSection();
+            var restore = _secRestore = NewSection();
 
             _lblRatio = new Label { Text = "Keep 50% of triangles", AutoSize = true, Margin = new Padding(3, 0, 3, 0) };
             _sliderRatio = new TrackBar
@@ -157,8 +221,8 @@ namespace GlbMerger
                 TickFrequency = 10, Margin = new Padding(3, 0, 3, 4),
             };
             _sliderRatio.ValueChanged += (s, e) => _lblRatio.Text = $"Keep {_sliderRatio.Value}% of triangles";
-            flow.Controls.Add(_lblRatio);
-            flow.Controls.Add(_sliderRatio);
+            simplifySettings.Controls.Add(_lblRatio);
+            simplifySettings.Controls.Add(_sliderRatio);
 
             var errorRow = new FlowLayoutPanel
             {
@@ -172,18 +236,18 @@ namespace GlbMerger
                 Margin = new Padding(0, 4, 3, 3),
             };
             errorRow.Controls.Add(_numError);
-            flow.Controls.Add(errorRow);
+            simplifySettings.Controls.Add(errorRow);
 
-            flow.Controls.Add(HelpText(
+            simplifySettings.Controls.Add(HelpText(
                 "Whichever comes first wins: simplification stops at the keep ratio, or earlier if " +
                 "it would exceed the error budget. For a near-lossless pass, use a high keep ratio " +
                 "with a small budget."));
 
             _chkLockBorders = new CheckBox { Text = "Preserve mesh outlines", AutoSize = true, Checked = true, Margin = new Padding(3, 0, 3, 0) };
-            flow.Controls.Add(_chkLockBorders);
+            simplifySettings.Controls.Add(_chkLockBorders);
 
             _chkVertexOrder = new CheckBox { Text = "Optimize vertex cache order", AutoSize = true, Checked = true, Margin = new Padding(3, 0, 3, 8) };
-            flow.Controls.Add(_chkVertexOrder);
+            simplifySettings.Controls.Add(_chkVertexOrder);
 
             _lblSkin = new Label { Text = SkinLabel(0), AutoSize = true, Margin = new Padding(3, 0, 3, 0) };
             _sliderSkin = new TrackBar
@@ -192,14 +256,14 @@ namespace GlbMerger
                 TickFrequency = 10, Margin = new Padding(3, 0, 3, 4),
             };
             _sliderSkin.ValueChanged += (s, e) => _lblSkin.Text = SkinLabel(_sliderSkin.Value);
-            flow.Controls.Add(_lblSkin);
-            flow.Controls.Add(_sliderSkin);
+            simplifySettings.Controls.Add(_lblSkin);
+            simplifySettings.Controls.Add(_sliderSkin);
 
-            flow.Controls.Add(HelpText(
+            simplifySettings.Controls.Add(HelpText(
                 "Collapsing an edge re-interpolates its skin weights. At 0% only vertices whose " +
                 "neighbours share identical weights can move, so deformation cannot change."));
 
-            flow.Controls.Add(new Label
+            paint.Controls.Add(new Label
             {
                 Text = "Paint a region",
                 AutoSize = true,
@@ -214,24 +278,26 @@ namespace GlbMerger
                 Margin = new Padding(3, 0, 3, 4),
             };
             _chkPaintMode.CheckedChanged += (s, e) => PushPaintMode();
-            flow.Controls.Add(_chkPaintMode);
+            paint.Controls.Add(_chkPaintMode);
 
-            _lblBrush = new Label { Text = "Brush size: 5%", AutoSize = true, Margin = new Padding(3, 0, 3, 0) };
+            // In tenths of a percent of the model's size: a window frame on a building or a
+            // fingernail on a character wants a brush well under 1%.
+            _lblBrush = new Label { Text = "Brush size: 5.0%", AutoSize = true, Margin = new Padding(3, 0, 3, 0) };
             _sliderBrush = new TrackBar
             {
-                Width = 330, Height = 45, Minimum = 1, Maximum = 40, Value = 5,
-                TickFrequency = 5, Margin = new Padding(3, 0, 3, 4),
+                Width = 330, Height = 45, Minimum = 2, Maximum = 400, Value = 50,
+                TickFrequency = 50, Margin = new Padding(3, 0, 3, 4),
             };
-            _sliderBrush.ValueChanged += (s, e) => { _lblBrush.Text = $"Brush size: {_sliderBrush.Value}%"; PushBrushRadius(); };
-            flow.Controls.Add(_lblBrush);
-            flow.Controls.Add(_sliderBrush);
+            _sliderBrush.ValueChanged += (s, e) => { _lblBrush.Text = $"Brush size: {_sliderBrush.Value / 10.0:0.0}%"; PushBrushRadius(); };
+            paint.Controls.Add(_lblBrush);
+            paint.Controls.Add(_sliderBrush);
 
             _btnClearSelection = MakeButton("Clear Selection");
             _btnClearSelection.Click += (s, e) => ClearSelection();
-            flow.Controls.Add(_btnClearSelection);
+            paint.Controls.Add(_btnClearSelection);
 
             _lblSelection = new Label { Text = "0 triangles painted", AutoSize = true, Margin = new Padding(3, 0, 3, 4) };
-            flow.Controls.Add(_lblSelection);
+            paint.Controls.Add(_lblSelection);
 
             _chkRestrictSelection = new CheckBox
             {
@@ -243,7 +309,7 @@ namespace GlbMerger
             };
             _chkRestrictSelection.CheckedChanged += (s, e) =>
                 SyncSelectionMode(_chkRestrictSelection, _chkExcludeSelection);
-            flow.Controls.Add(_chkRestrictSelection);
+            simplifyActions.Controls.Add(_chkRestrictSelection);
 
             _chkExcludeSelection = new CheckBox
             {
@@ -255,9 +321,9 @@ namespace GlbMerger
             };
             _chkExcludeSelection.CheckedChanged += (s, e) =>
                 SyncSelectionMode(_chkExcludeSelection, _chkRestrictSelection);
-            flow.Controls.Add(_chkExcludeSelection);
+            simplifyActions.Controls.Add(_chkExcludeSelection);
 
-            flow.Controls.Add(HelpText(
+            simplifyActions.Controls.Add(HelpText(
                 "Two ways to use a painted region, and only one applies at a time - ticking either " +
                 "clears the other. ONLY makes the paint the region to simplify; EXCEPT makes it the " +
                 "region to protect and simplifies all the rest, which is the one to reach for on " +
@@ -267,31 +333,24 @@ namespace GlbMerger
 
             _btnAnalyze = MakeButton("Analyze (dry run)");
             _btnAnalyze.Click += async (s, e) => await RunAnalyzeAsync(apply: false);
-            flow.Controls.Add(_btnAnalyze);
+            simplifyActions.Controls.Add(_btnAnalyze);
 
             _btnApply = MakeButton("Apply to Merge");
             _btnApply.Click += async (s, e) => await RunAnalyzeAsync(apply: true);
-            flow.Controls.Add(_btnApply);
+            simplifyActions.Controls.Add(_btnApply);
 
-            flow.Controls.Add(HelpText(
+            simplifyActions.Controls.Add(HelpText(
                 "Optimizing rewrites triangles only, so vertices the result no longer references - " +
                 "and the index buffer each pass replaces - stay in the model, and it can grow rather " +
                 "than shrink. Saving offers to rebuild and drop both."));
 
-            flow.Controls.Add(new Label
-            {
-                Text = "Delete Painted Triangles",
-                AutoSize = true,
-                Margin = new Padding(3, 8, 3, 4),
-            });
-
-            flow.Controls.Add(HelpText(
+            delete.Controls.Add(HelpText(
                 "Throws the painted triangles away outright, then drops every vertex no triangle " +
                 "references any more - including ones earlier simplify passes over the same mesh " +
                 "part left behind. For geometry that shouldn't be in the merge at all: interior " +
                 "surfaces no camera sees, a prop's backing plane, decals buried under other parts."));
 
-            flow.Controls.Add(HelpText(
+            delete.Controls.Add(HelpText(
                 "This leaves a hole - nothing is closed up behind it, so paint with the far side " +
                 "of the model in mind. The ONLY/EXCEPT checkboxes above belong to simplification; " +
                 "deletion always takes exactly what is painted, and a mesh part with every triangle " +
@@ -299,20 +358,13 @@ namespace GlbMerger
 
             _btnAnalyzeDelete = MakeButton("Analyze Deletion (dry run)");
             _btnAnalyzeDelete.Click += async (s, e) => await RunDeleteAsync(apply: false);
-            flow.Controls.Add(_btnAnalyzeDelete);
+            delete.Controls.Add(_btnAnalyzeDelete);
 
             _btnDelete = MakeButton("Delete Painted Triangles");
             _btnDelete.Click += async (s, e) => await RunDeleteAsync(apply: true);
-            flow.Controls.Add(_btnDelete);
+            delete.Controls.Add(_btnDelete);
 
-            flow.Controls.Add(new Label
-            {
-                Text = "Planar Cut",
-                AutoSize = true,
-                Margin = new Padding(3, 8, 3, 4),
-            });
-
-            flow.Controls.Add(HelpText(
+            cut.Controls.Add(HelpText(
                 "Slices the whole model with a flat plane and deletes everything on one side. " +
                 "Triangles the plane passes through are trimmed back to it - new vertices go in " +
                 "exactly where each edge crosses - so the model ends in a clean, flat edge on the " +
@@ -331,7 +383,7 @@ namespace GlbMerger
             cutAxisRow.Controls.Add(_cmbCutAxis);
             _cmbCutSide = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 200, Margin = new Padding(0, 4, 3, 3) };
             cutAxisRow.Controls.Add(_cmbCutSide);
-            flow.Controls.Add(cutAxisRow);
+            cut.Controls.Add(cutAxisRow);
 
             _lblCut = new Label { AutoSize = true, Margin = new Padding(3, 0, 3, 0) };
             _sliderCut = new TrackBar
@@ -339,8 +391,8 @@ namespace GlbMerger
                 Width = 330, Height = 45, Minimum = 0, Maximum = 1000, Value = 500,
                 TickFrequency = 100, Margin = new Padding(3, 0, 3, 0),
             };
-            flow.Controls.Add(_lblCut);
-            flow.Controls.Add(_sliderCut);
+            cut.Controls.Add(_lblCut);
+            cut.Controls.Add(_sliderCut);
 
             var cutPosRow = new FlowLayoutPanel
             {
@@ -350,22 +402,22 @@ namespace GlbMerger
             cutPosRow.Controls.Add(new Label { Text = "Exact position:", AutoSize = true, Margin = new Padding(3, 7, 6, 3) });
             _numCut = new NumericUpDown { Width = 110, DecimalPlaces = 4, Margin = new Padding(0, 4, 3, 3) };
             cutPosRow.Controls.Add(_numCut);
-            flow.Controls.Add(cutPosRow);
+            cut.Controls.Add(cutPosRow);
 
             _chkCapCut = new CheckBox
             {
                 Text = "Cap the cut with a flat surface", AutoSize = true, Checked = true, Margin = new Padding(3, 0, 3, 0),
             };
-            flow.Controls.Add(_chkCapCut);
+            cut.Controls.Add(_chkCapCut);
 
             _chkShowCutPlane = new CheckBox
             {
                 Text = "Show the cut plane in the preview", AutoSize = true, Margin = new Padding(3, 0, 3, 4),
             };
             _chkShowCutPlane.CheckedChanged += (s, e) => PushCutPlane();
-            flow.Controls.Add(_chkShowCutPlane);
+            cut.Controls.Add(_chkShowCutPlane);
 
-            flow.Controls.Add(HelpText(
+            cut.Controls.Add(HelpText(
                 "The cap closes each ring the cut edge forms with a flat fan on the plane, textured " +
                 "from a blank patch of the material where one exists - the same fill Make Watertight " +
                 "uses, restricted to the cut. Where the plane runs into an opening the model already " +
@@ -375,11 +427,11 @@ namespace GlbMerger
 
             _btnAnalyzeCut = MakeButton("Analyze Cut (dry run)");
             _btnAnalyzeCut.Click += async (s, e) => await RunCutAsync(apply: false);
-            flow.Controls.Add(_btnAnalyzeCut);
+            cut.Controls.Add(_btnAnalyzeCut);
 
             _btnApplyCut = MakeButton("Apply Cut");
             _btnApplyCut.Click += async (s, e) => await RunCutAsync(apply: true);
-            flow.Controls.Add(_btnApplyCut);
+            cut.Controls.Add(_btnApplyCut);
 
             // Wired after every control exists: the axis handler reaches all of them.
             _cmbCutAxis.SelectedIndexChanged += (s, e) => OnCutAxisChanged();
@@ -388,21 +440,14 @@ namespace GlbMerger
             _numCut.ValueChanged += (s, e) => OnCutNumericChanged();
             OnCutAxisChanged();
 
-            flow.Controls.Add(new Label
-            {
-                Text = "Make Watertight",
-                AutoSize = true,
-                Margin = new Padding(3, 8, 3, 4),
-            });
-
-            flow.Controls.Add(HelpText(
+            watertight.Controls.Add(HelpText(
                 "Finds open holes - boundary edges with no triangle on the other side - and caps " +
                 "each one with a new triangle fan. Boundaries shared between two parts of this " +
                 "mesh (a material or UV seam) are recognized and left alone, not capped. A hole " +
                 "that's meant to stay open, like a mouth interior, will get capped too since there's " +
                 "no way to tell intent from geometry alone - step back in History if that happens."));
 
-            flow.Controls.Add(HelpText(
+            watertight.Controls.Add(HelpText(
                 "When the material has a texture, caps look for an unused, blank-looking patch of " +
                 "it and sample the fill from there, so the cap reads as a plain, unremarkable " +
                 "surface instead of a smear across unrelated texture. Where no such patch exists, " +
@@ -410,11 +455,71 @@ namespace GlbMerger
 
             _btnAnalyzeWatertight = MakeButton("Analyze Holes (dry run)");
             _btnAnalyzeWatertight.Click += async (s, e) => await RunWatertightAsync(apply: false);
-            flow.Controls.Add(_btnAnalyzeWatertight);
+            watertight.Controls.Add(_btnAnalyzeWatertight);
 
             _btnApplyWatertight = MakeButton("Fill Holes");
             _btnApplyWatertight.Click += async (s, e) => await RunWatertightAsync(apply: true);
-            flow.Controls.Add(_btnApplyWatertight);
+            watertight.Controls.Add(_btnApplyWatertight);
+
+            uv.Controls.Add(HelpText(
+                "Simplifying never moves a vertex or its texture coordinate, but a surviving " +
+                "triangle now spans surface that several triangles used to cover, and the texture " +
+                "is stretched straight across it where the original bent it - so it can read as " +
+                "slightly warped. This measures the current surface against the Original merge " +
+                "result, point by point, and nudges the surviving vertices' texture coordinates so " +
+                "the texture lands back where it was."));
+
+            uv.Controls.Add(HelpText(
+                "A triangle only has three coordinates to move, so a warp inside one large triangle " +
+                "is reduced to its best fit, not removed outright. Max correction is how far a point " +
+                "is allowed to be off before it's taken for the other side of a texture seam and " +
+                "left alone; raise it only if a warp is being skipped. Records a History step."));
+
+            uv.Controls.Add(new Label { Text = "Max correction (% of texture):", AutoSize = true, Margin = new Padding(3, 4, 3, 0) });
+            _numUvJump = new NumericUpDown
+            {
+                Minimum = 0.5m, Maximum = 50m, DecimalPlaces = 1, Increment = 0.5m, Value = 5m,
+                Width = 110, Margin = new Padding(3, 0, 3, 6),
+            };
+            uv.Controls.Add(_numUvJump);
+
+            _btnAnalyzeUv = MakeButton("Analyze Texture Warp (dry run)");
+            _btnAnalyzeUv.Click += async (s, e) => await RunUvRepairAsync(apply: false);
+            uv.Controls.Add(_btnAnalyzeUv);
+
+            _btnApplyUv = MakeButton("Fix Texture Warp");
+            _btnApplyUv.Click += async (s, e) => await RunUvRepairAsync(apply: true);
+            uv.Controls.Add(_btnApplyUv);
+
+            restore.Controls.Add(HelpText(
+                "For texture Fix Texture Warp can't straighten - window frames, lettering, anything " +
+                "finer than the triangles left under it. Paint the area and this puts the original " +
+                "triangles back there, exactly as they were, then re-simplifies the rest of that " +
+                "mesh part from the original to about the triangle count it has now, using the " +
+                "Simplify operation's error budget, outline and skin settings. The painted area costs whatever " +
+                "it cost originally; the count goes up by that much."));
+
+            restore.Controls.Add(HelpText(
+                "Anything already at original detail outside the paint - an earlier restore, a " +
+                "region a previous pass protected - is held exactly as it is, so restores stack. " +
+                "\"Original\" is the oldest History step whose vertices are the model's current " +
+                "ones: the merge result, or after a delete, cut or fill, the state that step " +
+                "left - the status line says which. Records a History step."));
+
+            _btnAnalyzeRestore = MakeButton("Analyze Restore (dry run)");
+            _btnAnalyzeRestore.Click += async (s, e) => await RunRestoreAsync(apply: false);
+            restore.Controls.Add(_btnAnalyzeRestore);
+
+            _btnRestore = MakeButton("Restore Painted Detail");
+            _btnRestore.Click += async (s, e) => await RunRestoreAsync(apply: true);
+            restore.Controls.Add(_btnRestore);
+
+            foreach (var section in new[] { simplifySettings, paint, simplifyActions, delete, cut, watertight, uv, restore })
+                flow.Controls.Add(section);
+
+            // Wired after every section exists, since the handler shows and hides all of them.
+            _cmbOperation.SelectedIndexChanged += (s, e) => OnOperationChanged();
+            _cmbOperation.SelectedIndex = 0;
 
             _chkWireframe = new CheckBox { Text = "Wireframe preview", AutoSize = true, Margin = new Padding(3, 8, 3, 0) };
             _chkWireframe.CheckedChanged += (s, e) => PushWireframe();
@@ -425,26 +530,43 @@ namespace GlbMerger
                 "where the model itself hides them - so this reads as triangle density on the " +
                 "surface you are looking at, not an x-ray of the whole mesh."));
 
-            // Status sits above the grid rather than below it: the grid is tall enough to push
-            // anything under it off the bottom of the panel, and the outcome line is the first
-            // thing to read after a run.
+            // Everything a run reports - the outcome line, the totals and the per-mesh table - is
+            // boxed and labelled as output, so it reads as the result of the last click rather
+            // than as more controls. Status sits above the grid rather than below it: the grid is
+            // tall enough to push anything under it off the bottom of the panel, and the outcome
+            // line is the first thing to read after a run.
+            var output = new GroupBox
+            {
+                Text = "Output",
+                AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                Width = 352,
+                Padding = new Padding(6, 4, 6, 6),
+                Margin = new Padding(3, 8, 3, 8),
+            };
+            var outputFlow = NewSection();
+            outputFlow.Location = new System.Drawing.Point(output.Padding.Left, output.DisplayRectangle.Top);
+            output.Controls.Add(outputFlow);
+            flow.Controls.Add(output);
+
             _lblStatus = new Label
             {
-                AutoSize = true, MaximumSize = new System.Drawing.Size(340, 0),
-                Margin = new Padding(3, 4, 3, 6), ForeColor = System.Drawing.Color.LightGreen,
+                AutoSize = true, MaximumSize = new System.Drawing.Size(328, 0),
+                Margin = new Padding(3, 4, 3, 6),
+                Font = new System.Drawing.Font(Font, System.Drawing.FontStyle.Bold),
             };
-            flow.Controls.Add(_lblStatus);
+            outputFlow.Controls.Add(_lblStatus);
 
             _lblTotals = new Label
             {
-                AutoSize = true, MaximumSize = new System.Drawing.Size(340, 0),
+                AutoSize = true, MaximumSize = new System.Drawing.Size(328, 0),
                 Margin = new Padding(3, 0, 3, 4),
             };
-            flow.Controls.Add(_lblTotals);
+            outputFlow.Controls.Add(_lblTotals);
 
             _grid = new DataGridView
             {
-                Width = 340,
+                Width = 328,
                 Height = 220,
                 AllowUserToAddRows = false,
                 AllowUserToDeleteRows = false,
@@ -454,11 +576,11 @@ namespace GlbMerger
                 AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
                 Margin = new Padding(3, 0, 3, 8),
             };
-            _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Mesh", FillWeight = 40 });
+            _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Mesh", FillWeight = 32 });
             _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Before", FillWeight = 20 });
             _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "After", FillWeight = 20 });
-            _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Saved", FillWeight = 20 });
-            flow.Controls.Add(_grid);
+            _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Saved", FillWeight = 28 });
+            outputFlow.Controls.Add(_grid);
 
             flow.Controls.Add(new Label
             {
@@ -503,6 +625,34 @@ namespace GlbMerger
             _webView = new WebView2 { Dock = DockStyle.Fill };
             Controls.Add(_webView);
             Controls.Add(controlPanel);
+        }
+
+        // One operation's worth of controls, laid out exactly as the parent flow lays out its own
+        // children, so hiding a section is the same as the controls never having been added.
+        private static FlowLayoutPanel NewSection() => new FlowLayoutPanel
+        {
+            FlowDirection = FlowDirection.TopDown,
+            WrapContents = false,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            Margin = Padding.Empty,
+            Padding = Padding.Empty,
+        };
+
+        private void OnOperationChanged()
+        {
+            var op = CurrentOperation;
+            _secSimplifySettings.Visible = op == Operation.Simplify;
+            _secPaint.Visible = op is Operation.Simplify or Operation.Delete or Operation.Restore;
+            _secSimplifyActions.Visible = op == Operation.Simplify;
+            _secDelete.Visible = op == Operation.Delete;
+            _secCut.Visible = op == Operation.Cut;
+            _secWatertight.Visible = op == Operation.Watertight;
+            _secUv.Visible = op == Operation.TextureWarp;
+            _secRestore.Visible = op == Operation.Restore;
+
+            // The cut plane overlay only makes sense while the cut is what's being set up.
+            PushCutPlane();
         }
 
         private static Label HelpText(string text) => new Label
@@ -554,6 +704,8 @@ namespace GlbMerger
             _sliderSkin.Enabled = false;
             _btnAnalyze.Enabled = false;
             _btnApply.Enabled = false;
+            _btnAnalyzeRestore.Enabled = false;
+            _btnRestore.Enabled = false;
             _lblStatus.Text = "meshoptimizer native library unavailable - optimization is disabled.";
         }
 
@@ -586,6 +738,29 @@ namespace GlbMerger
                         ? "EXCEPT is checked, but nothing is painted yet - paint a region first, or uncheck it."
                         : "ONLY is checked, but nothing is painted yet - paint a region first, or uncheck it.";
                     return;
+                }
+            }
+            else if (apply)
+            {
+                // Paint with neither box ticked is almost always a forgotten tick, not a decision
+                // to optimize the whole model - and the whole-model pass throws the paint away on
+                // reload, so the mistake would cost the region as well as the pass.
+                var painted = await ReadSelectionAsync();
+                if (IsDisposed) return;
+                int count = painted?.Values.Sum(v => v.Count) ?? 0;
+                if (count > 0)
+                {
+                    var answer = MessageBox.Show(this,
+                        $"{count:N0} triangle(s) are painted, but neither \"Optimize ONLY the painted region\" nor " +
+                        "\"Optimize everything EXCEPT the painted region\" is checked.\n\n" +
+                        "Apply will simplify the WHOLE model, ignore the paint, and clear it.\n\n" +
+                        "Continue anyway?",
+                        "Optimize Geometry", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
+                    if (answer != DialogResult.Yes)
+                    {
+                        _lblStatus.Text = "Cancelled - tick ONLY or EXCEPT to use the painted region, or clear the paint.";
+                        return;
+                    }
                 }
             }
 
@@ -636,7 +811,29 @@ namespace GlbMerger
             SetBusy(false, $"Removed {report.TrianglesSaved:N0} triangles ({report.PercentSaved:0.00}%). " +
                 "Included the next time you save the merge.");
             RecordHistory($"Simplify {_sliderRatio.Value}%{SelectionSuffix()}", touchedVertexData: false);
-            ReloadPreview();
+            ReloadPreview(selection == null ? null : RemapSimplifiedSelection(report, selection, exclude));
+        }
+
+        // Where the painted region is after a simplify pass over (ONLY) or around (EXCEPT) it. The
+        // pass writes the simplified block first and the untouched triangles after it, so with
+        // ONLY the paint becomes the simplified block, and with EXCEPT it IS the untouched block.
+        // A primitive the pass left alone keeps its paint as it was.
+        private static Dictionary<(int MeshIndex, int PrimitiveIndex), HashSet<int>> RemapSimplifiedSelection(
+            GeometryOptimizer.Report report, Dictionary<(int MeshIndex, int PrimitiveIndex), HashSet<int>> before, bool exclude)
+        {
+            var after = new Dictionary<(int, int), HashSet<int>>(before);
+            foreach (var p in report.Primitives)
+            {
+                if (p.NewIndices == null) continue;
+                var key = (p.MeshIndex, p.PrimitiveIndex);
+                if (!before.TryGetValue(key, out var painted) || painted.Count == 0) continue;
+
+                int total = p.NewIndices.Length / 3;
+                after[key] = exclude
+                    ? new HashSet<int>(Enumerable.Range(p.PassthroughStart, total - p.PassthroughStart))
+                    : new HashSet<int>(Enumerable.Range(0, p.PassthroughStart));
+            }
+            return after;
         }
 
         // What a Simplify step was scoped to, so two passes at the same ratio are still tellable
@@ -837,8 +1034,9 @@ namespace GlbMerger
         {
             if (!_viewerReady || _webView.CoreWebView2 == null || _chkShowCutPlane == null) return;
             string position = CutPosition().ToString("R", CultureInfo.InvariantCulture);
+            bool show = _chkShowCutPlane.Checked && CurrentOperation == Operation.Cut;
             _ = _webView.CoreWebView2.ExecuteScriptAsync(
-                $"setCutPlane({CutAxis}, {position}, {(CutDeletesPositive ? "true" : "false")}, {(_chkShowCutPlane.Checked ? "true" : "false")});");
+                $"setCutPlane({CutAxis}, {position}, {(CutDeletesPositive ? "true" : "false")}, {(show ? "true" : "false")});");
         }
 
         private string CutStepLabel()
@@ -936,6 +1134,10 @@ namespace GlbMerger
 
         private async Task RunWatertightAsync(bool apply)
         {
+            // Caps are appended after the existing triangles, so painted indices still hold.
+            var selection = apply ? await ReadSelectionAsync() : null;
+            if (IsDisposed) return;
+
             SetBusy(true, apply ? "Filling holes..." : "Analyzing holes...");
 
             WatertightRepair.Report report;
@@ -982,7 +1184,211 @@ namespace GlbMerger
             SetBusy(false, summary + " Included the next time you save the merge.");
             RecordHistory($"Fill {report.HolesFound:N0} hole(s)", touchedVertexData: true);
             ShowBaseline();
-            ReloadPreview();
+            ReloadPreview(selection);
+        }
+
+        private async Task RunUvRepairAsync(bool apply)
+        {
+            // Read before anything runs: the fix rewrites UVs only, so whatever is painted is
+            // still the same triangles afterwards and goes straight back on.
+            var selection = apply ? await ReadSelectionAsync() : null;
+            if (IsDisposed) return;
+
+            SetBusy(true, apply ? "Fixing texture warp..." : "Measuring texture warp...");
+
+            var options = new UvWarpRepair.Options { MaxUvJump = (float)_numUvJump.Value / 100f };
+            UvWarpRepair.Report report;
+            try
+            {
+                // Both halves only read the model - the reference is built from History entry 0's
+                // capture (or the live accessors, which are still the originals when there is
+                // none) and the analysis reads the current accessors - so off the UI thread like
+                // the other passes. The write-back below is on it.
+                report = await Task.Run(() =>
+                {
+                    _uvReference ??= UvWarpRepair.BuildReference(_history);
+                    return UvWarpRepair.Analyze(_model, _uvReference, options);
+                });
+            }
+            catch (Exception ex)
+            {
+                SetBusy(false, null);
+                MessageBox.Show(this, $"Texture warp analysis failed: {ex.Message}",
+                    "Optimize Geometry", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            if (IsDisposed) return;
+
+            FillUvGrid(report);
+
+            if (!report.HasChanges)
+            {
+                bool untouched = report.Primitives.All(p => p.SkippedReason
+                    is "unchanged since original" or "texture already matches the original" or "no texture coordinates");
+                SetBusy(false, untouched
+                    ? "Texture matches the original everywhere - nothing has moved it yet."
+                    : $"Measured {FormatUv(report.RmsBefore, report)} average drift, but no correction improved on it - model left unchanged.");
+                return;
+            }
+
+            string summary =
+                $"Texture drift {FormatUv(report.RmsBefore, report)} -> {FormatUv(report.RmsAfter, report)} average, " +
+                $"{FormatUv(report.MaxBefore, report)} -> {FormatUv(report.MaxAfter, report)} worst; " +
+                $"{report.VerticesAdjusted:N0} vertex/vertices " + (apply ? "adjusted." : "would be adjusted.");
+
+            if (!apply)
+            {
+                SetBusy(false, summary + " Nothing changed yet.");
+                return;
+            }
+
+            // Rewrites TEXCOORD accessors, so the history has to capture the pre-fix vertex state.
+            _history.BeginChange(touchesVertexData: true);
+            UvWarpRepair.Apply(report, _model);
+
+            SetBusy(false, summary + " Included the next time you save the merge.");
+            RecordHistory("Fix texture warp", touchedVertexData: true);
+            ReloadPreview(selection);
+        }
+
+        private async Task RunRestoreAsync(bool apply)
+        {
+            var selection = await ReadSelectionAsync();
+            if (IsDisposed) return;
+            if (selection == null || selection.Values.All(s => s.Count == 0))
+            {
+                _lblStatus.Text = "Nothing is painted - turn on paint mode and drag over the area whose detail should come back.";
+                return;
+            }
+
+            SetBusy(true, apply ? "Restoring..." : "Analyzing...");
+
+            var options = CurrentOptions();
+            RegionRestorer.Report report;
+            try
+            {
+                // Read-only like the other analyses (the original geometry comes out of History,
+                // the rest off the current accessors), so off the UI thread; the write-back below
+                // happens back on it.
+                report = await Task.Run(() => RegionRestorer.Analyze(_model, _history, selection, options));
+            }
+            catch (Exception ex)
+            {
+                SetBusy(false, null);
+                MessageBox.Show(this, $"Restore analysis failed: {ex.Message}",
+                    "Optimize Geometry", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            if (IsDisposed) return;
+
+            FillRestoreGrid(report);
+
+            if (report.NothingSimplifiedSince)
+            {
+                SetBusy(false, $"Nothing to restore: nothing has been simplified since \"{report.ReferenceLabel}\", " +
+                    "and that step changed the vertices, so there is no finer detail to fetch for them.");
+                return;
+            }
+
+            if (!report.HasChanges)
+            {
+                var reason = report.Primitives.FirstOrDefault(p => p.SkippedReason != null)?.SkippedReason;
+                SetBusy(false, reason != null
+                    ? $"Nothing to restore: {reason}."
+                    : "Nothing to restore in the painted area.");
+                return;
+            }
+
+            // Which state the detail came from matters once a delete, cut or fill is in the
+            // lineage: from then on it's that step's triangles, not the merge result's.
+            string source = report.ReferenceIndex == 0
+                ? ""
+                : $" Restored from step {report.ReferenceIndex + 1} \"{report.ReferenceLabel}\" - the oldest state with the model's current vertices.";
+
+            string summary =
+                $"{report.PaintedCurrent:N0} painted triangle(s) " + (apply ? "replaced" : "would be replaced") +
+                $" by the {report.PaintedOriginal:N0} original ones under them; " +
+                $"{report.TrianglesBefore:N0} -> {report.TrianglesAfter:N0} triangles " +
+                $"({(report.TrianglesAdded >= 0 ? "+" : "")}{report.TrianglesAdded:N0})." + source;
+
+            if (!apply)
+            {
+                SetBusy(false, summary + " Nothing changed yet.");
+                return;
+            }
+
+            // Index buffers only, same as a simplify pass - the original vertices are already there.
+            _history.BeginChange(touchesVertexData: false);
+            RegionRestorer.Apply(report, _model);
+
+            // The restored triangles take over the paint; a part the restore skipped keeps its own.
+            var keep = new Dictionary<(int, int), HashSet<int>>(selection);
+            foreach (var (key, restored) in report.NewSelection) keep[key] = restored;
+
+            SetBusy(false, summary + " Included the next time you save the merge.");
+            RecordHistory($"Restore painted detail ({(report.TrianglesAdded >= 0 ? "+" : "")}{report.TrianglesAdded:N0}"
+                + (report.ReferenceIndex == 0 ? "" : $", from step {report.ReferenceIndex + 1}") + ")", touchedVertexData: false);
+            ReloadPreview(keep);
+        }
+
+        private void FillRestoreGrid(RegionRestorer.Report report)
+        {
+            _grid.Rows.Clear();
+            foreach (var group in report.Primitives.Where(p => p.SkippedReason == null).GroupBy(p => p.MeshName))
+            {
+                int before = group.Sum(p => p.TrianglesBefore);
+                int after = group.Sum(p => p.TrianglesAfter);
+                int restored = group.Sum(p => p.PaintedOriginal);
+                _grid.Rows.Add(
+                    group.Key,
+                    before.ToString("N0"),
+                    after.ToString("N0"),
+                    $"{restored:N0} restored");
+            }
+
+            var skipped = report.Primitives.Where(p => p.SkippedReason != null).ToList();
+            _lblTotals.Text =
+                $"{report.TrianglesBefore:N0} -> {report.TrianglesAfter:N0} triangles in the painted mesh part(s)\n" +
+                $"worst re-simplification error {report.WorstError:0.0000} (relative to mesh size)" +
+                (skipped.Count > 0 ? $"\n{skipped.Count} mesh part(s) skipped: {skipped[0].SkippedReason}" : "");
+        }
+
+        // Drift is measured in UV units, which nobody thinks in; shown in texels when the model's
+        // textures give a scale, as a share of the texture otherwise. One scale for the whole
+        // report - the largest texture bound - so figures across meshes stay comparable.
+        private static string FormatUv(float uv, UvWarpRepair.Report report)
+        {
+            int texels = report.Primitives.Count == 0 ? 0 : report.Primitives.Max(p => p.TexelsPerUv);
+            return texels > 0 ? $"{uv * texels:0.0} px" : $"{uv * 100:0.00}% of texture";
+        }
+
+        private static string FormatUv(float uv, int texels) =>
+            texels > 0 ? $"{uv * texels:0.0} px" : $"{uv * 100:0.00}%";
+
+        private void FillUvGrid(UvWarpRepair.Report report)
+        {
+            _grid.Rows.Clear();
+            foreach (var group in report.Primitives.Where(p => p.SampledArea > 0).GroupBy(p => p.MeshName))
+            {
+                // Same area-weighted combination Report itself uses, per mesh.
+                double area = group.Sum(p => (double)p.SampledArea);
+                float before = (float)Math.Sqrt(group.Sum(p => (double)p.RmsBefore * p.RmsBefore * p.SampledArea) / area);
+                float after = (float)Math.Sqrt(group.Sum(p => (double)p.RmsAfter * p.RmsAfter * p.SampledArea) / area);
+                int texels = group.Max(p => p.TexelsPerUv);
+                _grid.Rows.Add(
+                    group.Key,
+                    FormatUv(before, texels),
+                    FormatUv(after, texels),
+                    before <= 1e-7f ? "-" : $"{100.0 * (before - after) / before:0.0}%");
+            }
+
+            var skipped = report.Primitives.Where(p => p.SkippedReason != null).ToList();
+            _lblTotals.Text =
+                $"{report.SamplesUsed:N0} surface points measured, {report.SamplesRejected:N0} skipped (off the original surface or across a seam)\n" +
+                $"{report.VerticesAdjusted:N0} vertex/vertices moved" +
+                (skipped.Count > 0 ? $"\n{skipped.Count} primitive(s) skipped: {skipped[0].SkippedReason}" : "");
         }
 
         private void RecordHistory(string label, bool touchedVertexData)
@@ -1090,6 +1496,10 @@ namespace GlbMerger
             _btnApplyCut.Enabled = !busy;
             _btnAnalyzeWatertight.Enabled = !busy;
             _btnApplyWatertight.Enabled = !busy;
+            _btnAnalyzeUv.Enabled = !busy;
+            _btnApplyUv.Enabled = !busy;
+            _btnAnalyzeRestore.Enabled = !busy;
+            _btnRestore.Enabled = !busy;
             // Restoring mid-run would have the pass write its result over the state just restored.
             _historyGrid.Enabled = !busy;
             Cursor = busy ? Cursors.WaitCursor : Cursors.Default;
@@ -1451,13 +1861,35 @@ namespace GlbMerger
                         });
                     }
 
+                    // While the brush disc is on the surface the pointer becomes a small dot, so
+                    // the disc reads as the brush and the arrow doesn't sit on top of it. The
+                    // element under the pointer is a canvas inside <model-viewer>'s shadow root
+                    // with its own 'grab' cursor, so a cursor on the host is not enough - a rule
+                    // is added inside the shadow root instead, switched by a class on the host.
+                    var dotCursorStyled = false;
+                    function ensureDotCursorStyle() {
+                        // Lazily, on first use: the shadow root only exists once the custom
+                        // element has upgraded, which need not be before this script ran.
+                        if (dotCursorStyled || !viewer.shadowRoot) return;
+                        var dot = ""url(\""data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='17' height='17'%3E%3Ccircle cx='8.5' cy='8.5' r='3' fill='white' stroke='black' stroke-width='1.5'/%3E%3C/svg%3E\"") 8 8, crosshair"";
+                        var style = document.createElement('style');
+                        style.textContent = ':host(.paint-dot), :host(.paint-dot) * { cursor: ' + dot + ' !important; }';
+                        viewer.shadowRoot.appendChild(style);
+                        dotCursorStyled = true;
+                    }
+
                     function showBrushCursor(point) {
                         brushDecalMaterial.uniforms.uCenter.value.copy(point);
                         brushDecalMaterial.uniforms.uRadius.value = brushRadius;
                         brushDecalGroup.visible = true;
+                        ensureDotCursorStyle();
+                        viewer.classList.add('paint-dot');
                     }
 
-                    function hideBrushCursor() { brushDecalGroup.visible = false; }
+                    function hideBrushCursor() {
+                        brushDecalGroup.visible = false;
+                        viewer.classList.remove('paint-dot');
+                    }
 
                     // Mirrors <model-viewer>'s own orbit camera every frame (theta/phi/radius
                     // around cameraTarget, its documented public API) so the overlay canvas lines
@@ -1701,6 +2133,40 @@ namespace GlbMerger
                         return result;
                     };
 
+                    // The inverse: .NET handing a selection back after a reload, in the reloaded
+                    // model's triangle indices. Only called once 'load' has rebuilt paintableMeshes,
+                    // and clamped to each mesh's actual triangle count so a stale index can't put
+                    // garbage into the overlay.
+                    // 'ready' (which is when .NET calls this) fires when <model-viewer> has the
+                    // model, but paintableMeshes is built by the separate hit-test parse that only
+                    // starts then - so the data is parked and applied by whichever comes second.
+                    var pendingSelectionData = null;
+                    window.setPaintSelection = function (data) {
+                        pendingSelectionData = data;
+                        if (paintableMeshes.length > 0) applyPendingSelection();
+                    };
+
+                    function applyPendingSelection() {
+                        var data = pendingSelectionData;
+                        if (!data) return;
+                        pendingSelectionData = null;
+                        selection = {};
+                        paintableMeshes.forEach(function (meshInfo) {
+                            var key = selectionKey(meshInfo);
+                            var tris = data[key];
+                            if (!tris || tris.length === 0) return;
+                            var index = meshInfo.object.geometry.index;
+                            var count = index ? index.count / 3 : meshInfo.object.geometry.attributes.position.count / 3;
+                            var set = new Set();
+                            for (var i = 0; i < tris.length; i++) {
+                                if (tris[i] >= 0 && tris[i] < count) set.add(tris[i]);
+                            }
+                            if (set.size > 0) selection[key] = set;
+                        });
+                        rebuildOverlay();
+                        pushSelectionCount();
+                    }
+
                     var lastOverlayUpdate = 0;
 
                     // <model-viewer>'s positionAndNormalFromPoint is the only pick API it exposes.
@@ -1906,6 +2372,7 @@ namespace GlbMerger
                             // which is earlier than this.
                             resolveBrushRadius();
                             rebuildWireframe();
+                            applyPendingSelection();
                         }, undefined, function (error) {
                             showError('Failed to load paint hit-test geometry: ' + (error && error.message ? error.message : error));
                         });
@@ -1924,6 +2391,7 @@ namespace GlbMerger
                         // deferred to the 'load' handler above (see the comment there for why).
                         paintableMeshes = [];
                         selection = {};
+                        pendingSelectionData = null;
                         modelBox = null;
                         rebuildOverlay();
                         rebuildDepthMask();
@@ -1990,16 +2458,24 @@ namespace GlbMerger
             return Path.GetFileName(_previewPath);
         }
 
-        private void ReloadPreview()
+        // keepSelection: a painted region to put back on the reloaded model, already expressed in
+        // the NEW triangle indices. Null (or empty) means the paint is gone, which is right for a
+        // delete or a cut, whose triangles it can no longer refer to.
+        private void ReloadPreview(Dictionary<(int MeshIndex, int PrimitiveIndex), HashSet<int>>? keepSelection = null)
         {
             if (_webView.CoreWebView2 == null) return;
 
             // The reloaded model may have different triangle indices than whatever the paint
             // selection was recorded against (that's the whole point of Apply), so the JS side
-            // throws its selection away on every reload - this just keeps the WinForms side in sync
-            // with that.
-            _lblSelection.Text = "0 triangles painted";
-            SetSelectionModeAvailable(false);
+            // throws its selection away on every reload. Where the operation has worked out the
+            // new indices, they go back on once the viewer says it is ready (see
+            // OnWebMessageReceived); otherwise this just keeps the WinForms side in sync.
+            _pendingSelection = keepSelection != null && keepSelection.Values.Any(s => s.Count > 0) ? keepSelection : null;
+            if (_pendingSelection == null)
+            {
+                _lblSelection.Text = "0 triangles painted";
+                SetSelectionModeAvailable(false);
+            }
 
             _viewerReady = false;
             string fileName = WritePreviewFile();
@@ -2028,6 +2504,7 @@ namespace GlbMerger
                 PushBrushRadius();
                 PushWireframe();
                 PushCutPlane();
+                PushPendingSelection();
                 return;
             }
 
@@ -2037,6 +2514,21 @@ namespace GlbMerger
                 _lblSelection.Text = count == 1 ? "1 triangle painted" : $"{count:N0} triangles painted";
                 SetSelectionModeAvailable(count > 0);
             }
+        }
+
+        // Puts a carried-over painted region onto the freshly loaded model. The viewer answers
+        // with selectionChanged, which is what updates the count and the ONLY/EXCEPT checkboxes.
+        private void PushPendingSelection()
+        {
+            var selection = _pendingSelection;
+            _pendingSelection = null;
+            if (selection == null || _webView.CoreWebView2 == null) return;
+
+            var payload = selection
+                .Where(kv => kv.Value.Count > 0)
+                .ToDictionary(kv => $"{kv.Key.MeshIndex}_{kv.Key.PrimitiveIndex}", kv => kv.Value.OrderBy(t => t).ToArray());
+            string json = JsonSerializer.Serialize(payload);
+            _ = _webView.CoreWebView2.ExecuteScriptAsync($"setPaintSelection({json});");
         }
 
         private void PushPaintMode()
@@ -2085,7 +2577,7 @@ namespace GlbMerger
         private void PushBrushRadius()
         {
             if (!_viewerReady || _webView.CoreWebView2 == null) return;
-            float fraction = _sliderBrush.Value / 100f;
+            float fraction = _sliderBrush.Value / 1000f;
             _ = _webView.CoreWebView2.ExecuteScriptAsync(
                 $"setBrushRadius({fraction.ToString(CultureInfo.InvariantCulture)});");
         }
