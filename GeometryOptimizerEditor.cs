@@ -64,11 +64,22 @@ namespace GlbMerger
         private TrackBar _sliderSkin = null!, _sliderRatio = null!;
         private Label _lblSkin = null!, _lblRatio = null!, _lblStatus = null!, _lblTotals = null!;
         private NumericUpDown _numError = null!;
-        private CheckBox _chkLockBorders = null!, _chkVertexOrder = null!, _chkWireframe = null!;
+        private CheckBox _chkLockBorders = null!, _chkVertexOrder = null!, _chkWireframe = null!, _chkRebakeTexture = null!;
+
+        // Bottom status bar: a progress bar for the texture rebuild, which is the one thing in
+        // this pane slow enough to need one - a 4K atlas is millions of closest-point queries.
+        private StatusStrip _statusStrip = null!;
+        private ToolStripStatusLabel _progressLabel = null!;
+        private ToolStripProgressBar _progressBar = null!;
         private Button _btnAnalyze = null!, _btnApply = null!;
         private DataGridView _grid = null!;
 
-        private CheckBox _chkPaintMode = null!, _chkRestrictSelection = null!, _chkExcludeSelection = null!;
+        private CheckBox _chkPaintMode = null!, _chkHidePaint = null!, _chkRestrictSelection = null!, _chkExcludeSelection = null!;
+
+        // The highlight colour the viewer draws painted triangles in. Swatch button opens the
+        // standard colour dialog; the choice lives for the session.
+        private Button _btnPaintColor = null!;
+        private System.Drawing.Color _paintColor = System.Drawing.Color.FromArgb(255, 238, 0);
 
         // Guards the two region checkboxes clearing each other: unticking one from the other's
         // handler raises CheckedChanged again, which would tick the first straight back on.
@@ -110,6 +121,7 @@ namespace GlbMerger
         // other, which would raise ValueChanged straight back without this.
         private bool _syncingCut;
         private Button _btnAnalyzeWatertight = null!, _btnApplyWatertight = null!;
+        private CheckBox _chkSealPlanar = null!;
 
         private NumericUpDown _numUvJump = null!;
         private Button _btnAnalyzeUv = null!, _btnApplyUv = null!;
@@ -173,6 +185,14 @@ namespace GlbMerger
             _lblStatus.ForeColor = darkMode
                 ? System.Drawing.Color.FromArgb(70, 170, 80)
                 : System.Drawing.Color.DarkGreen;
+
+            // The swatch shows the paint colour, not the theme's button colour.
+            _btnPaintColor.BackColor = _paintColor;
+
+            // ToolStrips aren't in ThemeManager's cases; painted to match the panel by hand.
+            _statusStrip.BackColor = darkMode ? ThemeManager.DarkPanel : System.Drawing.SystemColors.Control;
+            _statusStrip.ForeColor = darkMode ? ThemeManager.DarkFore : System.Drawing.SystemColors.ControlText;
+            _progressLabel.ForeColor = _statusStrip.ForeColor;
 
             _ = InitializeViewerAsync();
         }
@@ -249,6 +269,24 @@ namespace GlbMerger
             _chkVertexOrder = new CheckBox { Text = "Optimize vertex cache order", AutoSize = true, Checked = true, Margin = new Padding(3, 0, 3, 8) };
             simplifySettings.Controls.Add(_chkVertexOrder);
 
+            _chkRebakeTexture = new CheckBox
+            {
+                Text = "Rebuild texture after optimization",
+                AutoSize = true,
+                MaximumSize = new System.Drawing.Size(340, 0),
+                Margin = new Padding(3, 0, 3, 2),
+            };
+            simplifySettings.Controls.Add(_chkRebakeTexture);
+
+            simplifySettings.Controls.Add(HelpText(
+                "After the pass, every texel under a triangle that changed is looked up on the " +
+                "original surface and rewritten with what the original texture showed there, so " +
+                "the texture is pixel-accurate on the new triangles instead of stretched across " +
+                "them. Nothing is added to the geometry; what's genuinely lost (a flattened " +
+                "silhouette) stays lost. Texels that already match are left untouched, so nothing " +
+                "blurs. Every texture the model's materials use is rebuilt. Slow on a big atlas - " +
+                "watch the bar at the bottom of the window. Undone together with the pass in History."));
+
             _lblSkin = new Label { Text = SkinLabel(0), AutoSize = true, Margin = new Padding(3, 0, 3, 0) };
             _sliderSkin = new TrackBar
             {
@@ -270,15 +308,23 @@ namespace GlbMerger
                 Margin = new Padding(3, 4, 3, 4),
             });
 
+            // Paint mode and Hide paint side by side. Hiding only stops the highlight being drawn -
+            // the selection itself is untouched, so a painted region can be looked at without its
+            // overlay and still be operated on.
+            var paintRow = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = Padding.Empty };
             _chkPaintMode = new CheckBox
             {
-                Text = "Paint mode (drag to select, Ctrl or right-click to erase)",
+                Text = "Paint mode (drag; Ctrl or right-click erases)",
                 AutoSize = true,
-                MaximumSize = new System.Drawing.Size(340, 0),
-                Margin = new Padding(3, 0, 3, 4),
+                Margin = new Padding(3, 0, 8, 4),
             };
             _chkPaintMode.CheckedChanged += (s, e) => PushPaintMode();
-            paint.Controls.Add(_chkPaintMode);
+            paintRow.Controls.Add(_chkPaintMode);
+
+            _chkHidePaint = new CheckBox { Text = "Hide paint", AutoSize = true, Margin = new Padding(0, 0, 3, 4) };
+            _chkHidePaint.CheckedChanged += (s, e) => PushPaintVisible();
+            paintRow.Controls.Add(_chkHidePaint);
+            paint.Controls.Add(paintRow);
 
             // In tenths of a percent of the model's size: a window frame on a building or a
             // fingernail on a character wants a brush well under 1%.
@@ -291,6 +337,25 @@ namespace GlbMerger
             _sliderBrush.ValueChanged += (s, e) => { _lblBrush.Text = $"Brush size: {_sliderBrush.Value / 10.0:0.0}%"; PushBrushRadius(); };
             paint.Controls.Add(_lblBrush);
             paint.Controls.Add(_sliderBrush);
+
+            var colorRow = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = Padding.Empty };
+            colorRow.Controls.Add(new Label { Text = "Paint color:", AutoSize = true, Margin = new Padding(3, 6, 6, 4) });
+            _btnPaintColor = new Button
+            {
+                Width = 60, Height = 24, Margin = new Padding(0, 2, 3, 4),
+                BackColor = _paintColor, FlatStyle = FlatStyle.Flat, Text = "",
+            };
+            _btnPaintColor.FlatAppearance.BorderColor = System.Drawing.Color.Gray;
+            _btnPaintColor.Click += (s, e) =>
+            {
+                using var dlg = new ColorDialog { Color = _paintColor, FullOpen = true };
+                if (dlg.ShowDialog(this) != DialogResult.OK) return;
+                _paintColor = dlg.Color;
+                _btnPaintColor.BackColor = _paintColor;
+                PushPaintColor();
+            };
+            colorRow.Controls.Add(_btnPaintColor);
+            paint.Controls.Add(colorRow);
 
             _btnClearSelection = MakeButton("Clear Selection");
             _btnClearSelection.Click += (s, e) => ClearSelection();
@@ -452,6 +517,24 @@ namespace GlbMerger
                 "it and sample the fill from there, so the cap reads as a plain, unremarkable " +
                 "surface instead of a smear across unrelated texture. Where no such patch exists, " +
                 "the cap falls back to blending the hole's own edge colors."));
+
+            _chkSealPlanar = new CheckBox
+            {
+                Text = "Seal planar gaps (uncapped cut faces)",
+                AutoSize = true,
+                MaximumSize = new System.Drawing.Size(340, 0),
+                Checked = true,
+                Margin = new Padding(3, 0, 3, 2),
+            };
+            watertight.Controls.Add(_chkSealPlanar);
+
+            watertight.Controls.Add(HelpText(
+                "A cut that was left open and saved leaves a ring that runs through every mesh " +
+                "part the plane crossed, which the hole search above can't close part by part. " +
+                "This gathers every open edge lying on an X, Y or Z plane across the whole mesh, " +
+                "joins them into rings, and closes each with one flat polygon of as few triangles " +
+                "as possible - no centre vertex. Rings inside another on the same plane become " +
+                "holes in its cap."));
 
             _btnAnalyzeWatertight = MakeButton("Analyze Holes (dry run)");
             _btnAnalyzeWatertight.Click += async (s, e) => await RunWatertightAsync(apply: false);
@@ -625,6 +708,34 @@ namespace GlbMerger
             _webView = new WebView2 { Dock = DockStyle.Fill };
             Controls.Add(_webView);
             Controls.Add(controlPanel);
+
+            _progressLabel = new ToolStripStatusLabel { Text = "", Spring = true, TextAlign = System.Drawing.ContentAlignment.MiddleLeft };
+            _progressBar = new ToolStripProgressBar { Width = 260, Visible = false, Minimum = 0, Maximum = 100, Style = ProgressBarStyle.Continuous };
+            _statusStrip = new StatusStrip { Dock = DockStyle.Bottom, SizingGrip = false };
+            _statusStrip.Items.Add(_progressLabel);
+            _statusStrip.Items.Add(_progressBar);
+            // Added after the two panes so it is docked before them and runs the full width.
+            Controls.Add(_statusStrip);
+        }
+
+        // The status bar shows nothing while idle; during a rebuild it carries the bar and a line
+        // saying which texture is being worked on.
+        private void ShowProgress(TextureRebaker.Progress p)
+        {
+            if (IsDisposed) return;
+            _progressBar.Visible = true;
+            _progressBar.Maximum = Math.Max(1, p.Total);
+            _progressBar.Value = Math.Clamp(p.Done, 0, _progressBar.Maximum);
+            _progressLabel.Text = p.Stage == "done"
+                ? "Texture rebuild finished."
+                : $"Rebuilding texture ({p.Stage})... {100.0 * p.Done / Math.Max(1, p.Total):0}%";
+        }
+
+        private void HideProgress()
+        {
+            if (IsDisposed) return;
+            _progressBar.Visible = false;
+            _progressLabel.Text = "";
         }
 
         // One operation's worth of controls, laid out exactly as the parent flow lays out its own
@@ -701,6 +812,7 @@ namespace GlbMerger
             _numError.Enabled = false;
             _chkLockBorders.Enabled = false;
             _chkVertexOrder.Enabled = false;
+            _chkRebakeTexture.Enabled = false;
             _sliderSkin.Enabled = false;
             _btnAnalyze.Enabled = false;
             _btnApply.Enabled = false;
@@ -805,13 +917,67 @@ namespace GlbMerger
 
             // Simplification rewrites index buffers only, never vertex data - hence false here,
             // which is what lets the history keep this step for the price of the indices alone.
-            _history.BeginChange(touchesVertexData: false);
+            // A texture rebuild on top of it rewrites images, and those have to be captured
+            // before Apply the same way vertices are.
+            bool rebake = _chkRebakeTexture.Checked;
+            _history.BeginChange(touchesVertexData: false, touchesImages: rebake);
             GeometryOptimizer.Apply(report, _model);
 
-            SetBusy(false, $"Removed {report.TrianglesSaved:N0} triangles ({report.PercentSaved:0.00}%). " +
-                "Included the next time you save the merge.");
-            RecordHistory($"Simplify {_sliderRatio.Value}%{SelectionSuffix()}", touchedVertexData: false);
+            string outcome = $"Removed {report.TrianglesSaved:N0} triangles ({report.PercentSaved:0.00}%).";
+            string label = $"Simplify {_sliderRatio.Value}%{SelectionSuffix()}";
+
+            if (rebake)
+            {
+                var rebakeReport = await RunRebakeAsync();
+                if (IsDisposed) return;
+                if (rebakeReport != null)
+                {
+                    TextureRebaker.Apply(rebakeReport, _model);
+                    outcome += rebakeReport.HasChanges
+                        ? $" Texture rebuilt: {rebakeReport.TexelsRewritten:N0} texel(s) in {rebakeReport.ImagesRewritten} image(s) " +
+                          $"under {rebakeReport.TrianglesProcessed:N0} changed triangle(s)."
+                        : " Texture already matched everywhere - no texels rewritten.";
+                    if (rebakeReport.HasChanges) label += " + texture rebuild";
+                }
+                else
+                {
+                    outcome += " Texture rebuild failed - geometry kept, texture unchanged.";
+                }
+            }
+
+            SetBusy(false, outcome + " Included the next time you save the merge.");
+            RecordHistory(label, touchedVertexData: false, touchedImages: rebake);
             ReloadPreview(selection == null ? null : RemapSimplifiedSelection(report, selection, exclude));
+        }
+
+        // Runs the texture rebuild against the model's current geometry, with the status bar
+        // tracking it. Null when it failed (the user has been told); the caller decides what to
+        // do with the geometry it was meant to accompany.
+        private async Task<TextureRebaker.Report?> RunRebakeAsync()
+        {
+            var progress = new Progress<TextureRebaker.Progress>(ShowProgress);
+            ShowProgress(new TextureRebaker.Progress(0, 1, "preparing"));
+            _lblStatus.Text = "Rebuilding texture...";
+            try
+            {
+                return await Task.Run(() =>
+                {
+                    _uvReference ??= UvWarpRepair.BuildReference(_history);
+                    return TextureRebaker.Analyze(_model, _uvReference, _history.OriginalImages,
+                        new TextureRebaker.Options { MaxUvJump = (float)_numUvJump.Value / 100f }, progress);
+                });
+            }
+            catch (Exception ex)
+            {
+                if (!IsDisposed)
+                    MessageBox.Show(this, $"Texture rebuild failed: {ex.Message}",
+                        "Optimize Geometry", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return null;
+            }
+            finally
+            {
+                HideProgress();
+            }
         }
 
         // Where the painted region is after a simplify pass over (ONLY) or around (EXCEPT) it. The
@@ -1143,7 +1309,8 @@ namespace GlbMerger
             WatertightRepair.Report report;
             try
             {
-                report = await Task.Run(() => WatertightRepair.Analyze(_model));
+                bool sealPlanar = _chkSealPlanar.Checked;
+                report = await Task.Run(() => WatertightRepair.Analyze(_model, sealPlanar));
             }
             catch (Exception ex)
             {
@@ -1165,6 +1332,11 @@ namespace GlbMerger
 
             string summary = $"Found {report.HolesFound:N0} hole(s): {report.TrianglesAdded:N0} triangle(s) and " +
                 $"{report.VerticesAdded:N0} vertex/vertices would be added." +
+                (report.PlanarHolesSealed > 0
+                    ? $" {report.PlanarHolesSealed} of them lie on a flat plane and get a flat polygon cap" +
+                      (report.PlanarCornersDropped > 0 ? $" over the ring's corners only ({report.PlanarCornersDropped:N0} vertices on straight runs skipped)" : "") +
+                      (report.PlanarChainsClosed > 0 ? $" ({report.PlanarChainsClosed} open chain(s) closed across the plane)" : "") + "."
+                    : "") +
                 (report.PrimitivesUsingTexturePatch > 0
                     ? $" {report.PrimitivesUsingTexturePatch} mesh part(s) will texture their cap from a found blank spot in the atlas."
                     : "") +
@@ -1391,9 +1563,9 @@ namespace GlbMerger
                 (skipped.Count > 0 ? $"\n{skipped.Count} primitive(s) skipped: {skipped[0].SkippedReason}" : "");
         }
 
-        private void RecordHistory(string label, bool touchedVertexData)
+        private void RecordHistory(string label, bool touchedVertexData, bool touchedImages = false)
         {
-            _history.Record(label, touchedVertexData);
+            _history.Record(label, touchedVertexData, touchedImages);
             RefreshHistoryGrid();
         }
 
@@ -2111,6 +2283,16 @@ namespace GlbMerger
                         }
                     }
 
+                    // Hide paint: the overlay group is simply not drawn; the selection behind it
+                    // is untouched, and getPaintSelection still reports it.
+                    window.setPaintVisible = function (visible) {
+                        overlayGroup.visible = visible;
+                    };
+
+                    window.setPaintColor = function (hex) {
+                        highlightMaterial.color.setHex(hex);
+                    };
+
                     window.setPaintMode = function (enabled) {
                         paintMode = enabled;
                         if (!enabled) { painting = false; hideBrushCursor(); }
@@ -2502,6 +2684,8 @@ namespace GlbMerger
                 _viewerReady = true;
                 PushPaintMode();
                 PushBrushRadius();
+                PushPaintVisible();
+                PushPaintColor();
                 PushWireframe();
                 PushCutPlane();
                 PushPendingSelection();
@@ -2529,6 +2713,19 @@ namespace GlbMerger
                 .ToDictionary(kv => $"{kv.Key.MeshIndex}_{kv.Key.PrimitiveIndex}", kv => kv.Value.OrderBy(t => t).ToArray());
             string json = JsonSerializer.Serialize(payload);
             _ = _webView.CoreWebView2.ExecuteScriptAsync($"setPaintSelection({json});");
+        }
+
+        private void PushPaintVisible()
+        {
+            if (!_viewerReady || _webView.CoreWebView2 == null) return;
+            _ = _webView.CoreWebView2.ExecuteScriptAsync($"setPaintVisible({(_chkHidePaint.Checked ? "false" : "true")});");
+        }
+
+        private void PushPaintColor()
+        {
+            if (!_viewerReady || _webView.CoreWebView2 == null) return;
+            int hex = (_paintColor.R << 16) | (_paintColor.G << 8) | _paintColor.B;
+            _ = _webView.CoreWebView2.ExecuteScriptAsync($"setPaintColor({hex});");
         }
 
         private void PushPaintMode()

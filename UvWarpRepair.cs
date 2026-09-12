@@ -273,7 +273,7 @@ namespace GlbMerger
             foreach (var name in uvNames)
             {
                 var current = prim.VertexAccessors[name].AsVector2Array();
-                var fit = FitUvSet(name, current, samples, surface, options, out var stats);
+                var fit = FitUvSet(name, current, positions, samples, surface, options, out var stats);
                 rejectedSeam += stats.RejectedSeam;
                 rmsBeforeSq += stats.SumSqBefore;
                 rmsAfterSq += stats.SumSqAfter;
@@ -313,13 +313,16 @@ namespace GlbMerger
 
         // Solves one UV set. Returns the corrected per-vertex UVs, or null when the fit didn't
         // improve on what's there (in which case nothing should be written).
-        private static Vector2[]? FitUvSet(string name, IList<Vector2> current, List<Sample> samples,
+        private static Vector2[]? FitUvSet(string name, IList<Vector2> current, IList<Vector3> positions, List<Sample> samples,
             ReferenceSurface surface, Options options, out FitStats stats)
         {
             stats = default;
             int vertexCount = current.Count;
 
-            // Targets, gated on the seam jump. Everything below runs over `used` only.
+            // Targets, gated on the seam. Where the current triangle's corners are still original
+            // corners (always, after simplify passes alone) the gate is exact: the hit has to be
+            // in the same UV island. Otherwise it falls back to the distance in UV space.
+            // Everything below runs over `used` only.
             var used = new List<(Sample S, Vector2 Target)>(samples.Count);
             float maxJumpSq = options.MaxUvJump * options.MaxUvJump;
             foreach (var s in samples)
@@ -328,6 +331,9 @@ namespace GlbMerger
                 var now = current[s.A] * s.Bary.X + current[s.B] * s.Bary.Y + current[s.C] * s.Bary.Z;
                 float errSq = (target - now).LengthSquared();
                 if (errSq > maxJumpSq) { stats.RejectedSeam++; continue; }
+                int island = surface.IslandOfTriangle(positions[s.A], positions[s.B], positions[s.C],
+                    current[s.A], current[s.B], current[s.C], name);
+                if (island >= 0 && surface.IslandOf(s.RefTri, name) != island) { stats.RejectedSeam++; continue; }
 
                 used.Add((s, target));
                 stats.SumSqBefore += errSq * s.Weight;
@@ -495,6 +501,85 @@ namespace GlbMerger
             }
 
             public bool HasUvSet(string name) => _uvSets.ContainsKey(name);
+
+            public int TriangleCount => _triangleCount;
+
+            // UV islands, per UV set: the connected components of the original triangles when two
+            // triangles count as joined only where they share a corner at the same position AND
+            // the same UV. A seam is exactly where that fails - same position, different UV - so
+            // the two sides of a seam land in different islands, and a nearest-point hit on the
+            // far side is told apart from a genuine neighbour by island alone, with no distance
+            // threshold to tune. Built on first use per UV set.
+            private readonly Dictionary<string, (int[] IslandOfTriangle, Dictionary<CornerKey, int> IslandOfCorner)> _islands = new();
+
+            private readonly record struct CornerKey(long X, long Y, long Z, long U, long V)
+            {
+                public static CornerKey Of(Vector3 p, Vector2 uv) => new(
+                    (long)MathF.Round(p.X * 1e5f), (long)MathF.Round(p.Y * 1e5f), (long)MathF.Round(p.Z * 1e5f),
+                    (long)MathF.Round(uv.X * 1e5f), (long)MathF.Round(uv.Y * 1e5f));
+            }
+
+            private (int[] IslandOfTriangle, Dictionary<CornerKey, int> IslandOfCorner) Islands(string uvSet)
+            {
+                lock (_islands)
+                {
+                    if (_islands.TryGetValue(uvSet, out var cached)) return cached;
+
+                    var uvs = _uvSets[uvSet];
+                    var cornerId = new Dictionary<CornerKey, int>();
+                    var parent = new List<int>();
+                    int Find(int i) { while (parent[i] != i) { parent[i] = parent[parent[i]]; i = parent[i]; } return i; }
+                    void Union(int a, int b) { a = Find(a); b = Find(b); if (a != b) parent[a] = b; }
+                    int IdOf(int vertex)
+                    {
+                        var key = CornerKey.Of(_positions[vertex], uvs[vertex]);
+                        if (!cornerId.TryGetValue(key, out int id)) { id = parent.Count; parent.Add(id); cornerId[key] = id; }
+                        return id;
+                    }
+
+                    var triCorner = new int[_triangleCount];
+                    for (int t = 0; t < _triangleCount; t++)
+                    {
+                        int a = IdOf(_indices[t * 3]), b = IdOf(_indices[t * 3 + 1]), c = IdOf(_indices[t * 3 + 2]);
+                        Union(a, b); Union(b, c);
+                        triCorner[t] = a;
+                    }
+
+                    var islandOfTriangle = new int[_triangleCount];
+                    for (int t = 0; t < _triangleCount; t++) islandOfTriangle[t] = Find(triCorner[t]);
+                    var islandOfCorner = new Dictionary<CornerKey, int>(cornerId.Count);
+                    foreach (var (key, id) in cornerId) islandOfCorner[key] = Find(id);
+
+                    var built = (islandOfTriangle, islandOfCorner);
+                    _islands[uvSet] = built;
+                    return built;
+                }
+            }
+
+            public int IslandOf(int tri, string uvSet) => Islands(uvSet).IslandOfTriangle[tri];
+
+            // The island a current triangle belongs to, from its corners' position+UV - which are
+            // original corners after any number of simplify passes. -1 when a corner isn't one the
+            // original had (a fill or cut added it) or the corners disagree, in which case the
+            // caller has to fall back to its distance-based gate.
+            public int IslandOfTriangle(Vector3 a, Vector3 b, Vector3 c, Vector2 ua, Vector2 ub, Vector2 uc, string uvSet)
+            {
+                var corners = Islands(uvSet).IslandOfCorner;
+                if (!corners.TryGetValue(CornerKey.Of(a, ua), out int ia)) return -1;
+                if (!corners.TryGetValue(CornerKey.Of(b, ub), out int ib) || ib != ia) return -1;
+                if (!corners.TryGetValue(CornerKey.Of(c, uc), out int ic) || ic != ia) return -1;
+                return ia;
+            }
+
+            // One original triangle's corners, in position and in the named UV set - what
+            // TextureRebaker keys its "is this current triangle one the original already had"
+            // lookup on, so the texels under an untouched triangle are never resampled.
+            public (Vector3 A, Vector3 B, Vector3 C, Vector2 UvA, Vector2 UvB, Vector2 UvC) Triangle(int tri, string uvSet)
+            {
+                var uvs = _uvSets[uvSet];
+                int a = _indices[tri * 3], b = _indices[tri * 3 + 1], c = _indices[tri * 3 + 2];
+                return (_positions[a], _positions[b], _positions[c], uvs[a], uvs[b], uvs[c]);
+            }
 
             // True when the current index buffer is exactly the original one over the same number
             // of vertices - the mapping can't have changed.

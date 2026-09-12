@@ -242,7 +242,7 @@ namespace GlbMerger
         // Resolves a primitive's POSITION into world space through whichever node draws its mesh.
         // A mesh drawn by several nodes is measured through the first; one no node draws at all is
         // taken as already in world space.
-        private sealed class WorldPositionSource
+        internal sealed class WorldPositionSource
         {
             private readonly Dictionary<int, Node> _nodeByMesh = new();
 

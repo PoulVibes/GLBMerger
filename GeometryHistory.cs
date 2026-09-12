@@ -27,6 +27,11 @@ namespace GlbMerger
     //    actually touches them is about to run, and shared by reference with every later entry
     //    that leaves them alone. An entry with no vertex capture of its own means "same vertices
     //    as the nearest entry below that has one", which is what LookupVertexData resolves.
+    //  - A texture rebuild (TextureRebaker, run as part of a simplify pass) rewrites image bytes.
+    //    Same lazy, shared-by-reference scheme as the vertices: an image is only worth carrying
+    //    once something has changed one, and a rebuilt texture belongs to the mesh it was built
+    //    against - stepping back to before that pass has to bring the previous texture with it,
+    //    or the old mesh would be shown wearing a texture straightened for a different one.
     public sealed class GeometryHistory
     {
         // Beyond this the oldest entries are dropped (never the original, which has to stay
@@ -64,6 +69,10 @@ namespace GlbMerger
             internal List<int[]?> Indices { get; init; } = new();
 
             internal VertexState? VertexData { get; set; }
+
+            // Encoded bytes per LogicalImages index; null on an entry that shares the nearest
+            // capture below it, same as VertexData.
+            internal List<byte[]>? ImageData { get; set; }
         }
 
         private readonly ModelRoot _model;
@@ -81,6 +90,10 @@ namespace GlbMerger
         // index accessor apiece for nothing.
         private List<int[]?> _appliedIndices;
 
+        // And for the images, so a restore across steps that only moved triangles never re-encodes
+        // a texture into the model.
+        private List<byte[]>? _appliedImageData;
+
         public GeometryHistory(ModelRoot model, string originalLabel = "Original merge result")
         {
             _model = model;
@@ -97,24 +110,30 @@ namespace GlbMerger
         // Called immediately before an operation runs. An operation that rewrites vertex data has
         // to have the pre-operation vertices captured now, or there would be nothing to restore
         // them from afterwards.
-        public void BeginChange(bool touchesVertexData)
+        public void BeginChange(bool touchesVertexData, bool touchesImages = false)
         {
-            if (!touchesVertexData) return;
-
             // Nothing captured anywhere at or below the current entry means no vertex-touching
             // operation has run in this lineage, so the model's vertices are still exactly the
             // original ones - hence storing this capture on entry 0, where every entry's lookup
-            // can reach it, rather than on the current entry.
-            if (LookupVertexData(_current) != null) return;
+            // can reach it, rather than on the current entry. Images likewise.
+            if (touchesVertexData && LookupVertexData(_current) == null)
+            {
+                var state = CaptureVertexState();
+                _entries[0].VertexData = state;
+                _appliedVertexData = state;
+            }
 
-            var state = CaptureVertexState();
-            _entries[0].VertexData = state;
-            _appliedVertexData = state;
+            if (touchesImages && LookupImageData(_current) == null)
+            {
+                var images = CaptureImageState();
+                _entries[0].ImageData = images;
+                _appliedImageData = images;
+            }
         }
 
         // Records the model's state after an operation. touchedVertexData must match what was
         // passed to the preceding BeginChange call.
-        public Entry Record(string label, bool touchedVertexData)
+        public Entry Record(string label, bool touchedVertexData, bool touchedImages = false)
         {
             // Recording on top of a restored older entry drops what came after it.
             if (_current < _entries.Count - 1)
@@ -125,6 +144,11 @@ namespace GlbMerger
             {
                 entry.VertexData = CaptureVertexState();
                 _appliedVertexData = entry.VertexData;
+            }
+            if (touchedImages)
+            {
+                entry.ImageData = CaptureImageState();
+                _appliedImageData = entry.ImageData;
             }
 
             _entries.Add(entry);
@@ -171,8 +195,57 @@ namespace GlbMerger
                 prim.WithIndicesAccessor(PrimitiveType.TRIANGLES, indices);
             }
 
+            var imageData = LookupImageData(index);
+            if (imageData != null && !ReferenceEquals(imageData, _appliedImageData))
+            {
+                ApplyImageState(imageData);
+                _appliedImageData = imageData;
+            }
+
             _appliedIndices = entry.Indices;
             _current = index;
+        }
+
+        // The image bytes the model held at entry 0 - what a texture rebuild samples from, so a
+        // second rebuild never resamples the first's output. Null when nothing has ever changed
+        // an image, in which case the model's current images are the originals.
+        internal IReadOnlyList<byte[]>? OriginalImages => LookupImageData(0);
+
+        private List<byte[]>? LookupImageData(int index)
+        {
+            for (int i = index; i >= 0; i--)
+                if (_entries[i].ImageData != null) return _entries[i].ImageData;
+            return null;
+        }
+
+        // Shares an image's bytes with the previous capture when its content hasn't changed, so a
+        // rebuild that touched one atlas out of three carries one new copy, not three.
+        private List<byte[]> CaptureImageState()
+        {
+            var previous = _appliedImageData;
+            var result = new List<byte[]>(_model.LogicalImages.Count);
+            for (int i = 0; i < _model.LogicalImages.Count; i++)
+            {
+                var content = _model.LogicalImages[i].Content.Content;
+                var last = previous != null && i < previous.Count ? previous[i] : null;
+                if (last != null && content.Span.SequenceEqual(last))
+                {
+                    result.Add(last);
+                    continue;
+                }
+                result.Add(content.ToArray());
+            }
+            return result;
+        }
+
+        private void ApplyImageState(List<byte[]> state)
+        {
+            var applied = _appliedImageData;
+            for (int i = 0; i < state.Count && i < _model.LogicalImages.Count; i++)
+            {
+                if (applied != null && i < applied.Count && ReferenceEquals(applied[i], state[i])) continue;
+                _model.LogicalImages[i].Content = new SharpGLTF.Memory.MemoryImage(state[i]);
+            }
         }
 
         // One primitive's geometry as it stood at some entry, in that entry's own vertex numbering.
@@ -300,6 +373,8 @@ namespace GlbMerger
                 // unless that one has a capture of its own.
                 if (_entries[1].VertexData != null && _entries[2].VertexData == null)
                     _entries[2].VertexData = _entries[1].VertexData;
+                if (_entries[1].ImageData != null && _entries[2].ImageData == null)
+                    _entries[2].ImageData = _entries[1].ImageData;
                 _entries.RemoveAt(1);
                 _current--;
             }
