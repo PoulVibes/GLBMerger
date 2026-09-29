@@ -201,6 +201,9 @@ namespace GlbMerger
         //  - Orphaned buffer views. Each Apply calls WithIndicesAccessor, which mints a new accessor
         //    and leaves the old one in LogicalAccessors with nothing pointing at it. Six passes over
         //    a mesh leave six dead index buffers, all of them written out on save.
+        //  - Unreachable meshes and images. Flatten Model swaps a node's mesh for a new one and
+        //    SharpGLTF can't delete the old mesh, its material or its textures - a flattened
+        //    building would otherwise still carry every byte of the original.
         public sealed class CleanupEstimate
         {
             public int UnusedVertices { get; init; }
@@ -208,10 +211,31 @@ namespace GlbMerger
             public long UnusedVertexBytes { get; init; }
             public int OrphanedBufferViews { get; init; }
             public long OrphanedBytes { get; init; }
+            public int UnusedMeshes { get; init; }
+            public int UnusedImages { get; init; }
+            public long UnusedImageBytes { get; init; }
 
-            public long ReclaimableBytes => UnusedVertexBytes + OrphanedBytes;
-            public bool HasWaste => UnusedVertices > 0 || OrphanedBufferViews > 0;
+            public long ReclaimableBytes => UnusedVertexBytes + OrphanedBytes + UnusedImageBytes;
+            public bool HasWaste => UnusedVertices > 0 || OrphanedBufferViews > 0 || UnusedImages > 0;
         }
+
+        // Meshes some node actually draws. A mesh no node points at is never written by the
+        // cleanup rebuild, so it isn't counted as part of the model either.
+        public static HashSet<Mesh> ReachableMeshes(ModelRoot model) =>
+            model.LogicalNodes.Where(n => n.Mesh != null).Select(n => n.Mesh!).ToHashSet();
+
+        private static HashSet<Material> ReachableMaterials(ModelRoot model) =>
+            ReachableMeshes(model).SelectMany(m => m.Primitives).Where(p => p.Material != null).Select(p => p.Material!).ToHashSet();
+
+        private static HashSet<SharpGLTF.Schema2.Image> ReachableImages(ModelRoot model) =>
+            ReachableMaterials(model)
+                .SelectMany(m => m.Channels)
+                .Select(c => c.Texture)
+                .Where(t => t != null)
+                .SelectMany(t => new[] { t!.PrimaryImage, t.FallbackImage })
+                .Where(i => i != null)
+                .Select(i => i!)
+                .ToHashSet();
 
         public static CleanupEstimate EstimateCleanup(ModelRoot model)
         {
@@ -224,7 +248,10 @@ namespace GlbMerger
             int unused = 0, total = 0;
             long unusedBytes = 0;
 
-            foreach (var prim in model.LogicalMeshes.SelectMany(m => m.Primitives))
+            // Only meshes a node draws are live: an unreachable mesh's buffers then fall out as
+            // dead views below.
+            var reachable = ReachableMeshes(model);
+            foreach (var prim in reachable.SelectMany(m => m.Primitives))
             {
                 if (prim.IndexAccessor != null) liveIndices.Add(prim.IndexAccessor);
                 foreach (var accessor in prim.VertexAccessors.Values) liveVertices.Add(accessor);
@@ -274,6 +301,9 @@ namespace GlbMerger
                 deadBytes += view.Content.Count;
             }
 
+            var liveImages = ReachableImages(model);
+            var deadImages = model.LogicalImages.Where(i => !liveImages.Contains(i)).ToList();
+
             return new CleanupEstimate
             {
                 UnusedVertices = unused,
@@ -281,6 +311,9 @@ namespace GlbMerger
                 UnusedVertexBytes = unusedBytes,
                 OrphanedBufferViews = deadViews,
                 OrphanedBytes = deadBytes,
+                UnusedMeshes = model.LogicalMeshes.Count(m => !reachable.Contains(m)),
+                UnusedImages = deadImages.Count,
+                UnusedImageBytes = deadImages.Sum(i => (long)i.Content.Content.Length),
             };
         }
 
@@ -350,10 +383,14 @@ namespace GlbMerger
 
             if (after.LogicalSkins.Count < before.LogicalSkins.Count)
                 losses.Add($"skins: {before.LogicalSkins.Count} -> {after.LogicalSkins.Count}");
-            if (after.LogicalMaterials.Count < before.LogicalMaterials.Count)
-                losses.Add($"materials: {before.LogicalMaterials.Count} -> {after.LogicalMaterials.Count}");
-            if (after.LogicalImages.Count < before.LogicalImages.Count)
-                losses.Add($"textures: {before.LogicalImages.Count} -> {after.LogicalImages.Count}");
+            // Counted over what the scene reaches: anything else is exactly what the rebuild exists
+            // to drop, not a loss.
+            int matsBefore = ReachableMaterials(before).Count, matsAfter = ReachableMaterials(after).Count;
+            if (matsAfter < matsBefore)
+                losses.Add($"materials: {matsBefore} -> {matsAfter}");
+            int imagesBefore = ReachableImages(before).Count, imagesAfter = ReachableImages(after).Count;
+            if (imagesAfter < imagesBefore)
+                losses.Add($"textures: {imagesBefore} -> {imagesAfter}");
 
             int trisBefore = CountTriangles(before), trisAfter = CountTriangles(after);
             if (trisAfter != trisBefore)
@@ -369,7 +406,7 @@ namespace GlbMerger
                 .ToHashSet()!;
 
         private static int CountTriangles(ModelRoot model) =>
-            model.LogicalMeshes
+            ReachableMeshes(model)
                 .SelectMany(m => m.Primitives)
                 .Where(p => p.DrawPrimitiveType == PrimitiveType.TRIANGLES)
                 .Sum(p => p.GetTriangleIndices().Count());

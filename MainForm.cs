@@ -831,10 +831,30 @@ namespace GlbMerger
                 MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
             if (confirm != DialogResult.Yes) return;
 
+            // Same offer as Save: without it, a flattened model would be written back carrying
+            // every byte of the original meshes and textures it replaced.
+            var toSave = latestMergedModel;
+            var estimate = GeometryOptimizer.EstimateCleanup(latestMergedModel);
+            if (estimate.HasWaste)
+            {
+                var choice = MessageBox.Show(
+                    DescribeCleanup(estimate),
+                    "Clean up unused geometry?",
+                    MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+
+                if (choice == DialogResult.Cancel) return;
+                if (choice == DialogResult.Yes)
+                {
+                    var cleaned = BuildCleanedCopyChecked(latestMergedModel);
+                    if (cleaned == null) return;
+                    toSave = cleaned;
+                }
+            }
+
             try
             {
                 Cursor = Cursors.WaitCursor;
-                try { latestMergedModel.SaveGLB(targetPath); }
+                try { toSave.SaveGLB(targetPath); }
                 finally { Cursor = Cursors.Default; }
             }
             catch (Exception ex)
@@ -884,6 +904,11 @@ namespace GlbMerger
             {
                 lines.Add($"{estimate.OrphanedBufferViews} buffer(s) left behind by earlier optimizer passes "
                     + $"are still in the file ({FormatBytes(estimate.OrphanedBytes)}).");
+            }
+            if (estimate.UnusedMeshes > 0 || estimate.UnusedImages > 0)
+            {
+                lines.Add($"{estimate.UnusedMeshes} mesh(es) and {estimate.UnusedImages} texture(s) nothing draws any more "
+                    + $"(e.g. replaced by Flatten Model) are still in the file ({FormatBytes(estimate.UnusedImageBytes)} of textures).");
             }
 
             lines.Add("");

@@ -16,6 +16,18 @@ namespace GlbMerger
         public double Panel1SecondarySplitFraction { get; set; } = 0.4667;
         public double Panel2PrimarySplitFraction { get; set; } = 0.45;
         public double AnimationTrimPlaybackSpeed { get; set; } = 1.0;
+        public int FlattenStrength { get; set; } = 500;
+        public int FlattenMinSize { get; set; } = 40;
+        public bool FlattenKeepLeftovers { get; set; } = true;
+        public bool FlattenSideDetail { get; set; } = true;
+        public int FlattenSideMinSize { get; set; } = 40;
+        public int FlattenDetailBoost { get; set; } = 20;
+        public int FlattenDetailStrength { get; set; } = 35;
+        public int FlattenRecessDarkening { get; set; } = 30;
+        public bool FlattenTrimCorners { get; set; } = true;
+        public bool FlattenBakeNormals { get; set; } = true;
+        public bool FlattenBakeMetallicRoughness { get; set; } = true;
+        public int FlattenTriangleBudget { get; set; } = 500;
         public string AnimationLibraryDirectory { get; set; } = @"C:\Projects\FootballRoguelite\Graphics\Models\Players";
 
         private static string SettingsPath => Path.Combine(
