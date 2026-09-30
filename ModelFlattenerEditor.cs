@@ -47,13 +47,16 @@ namespace GlbMerger
         private CheckBox _chkKeepLeftovers = null!, _chkSideDetail = null!, _chkTrimCorners = null!, _chkBakeNormals = null!, _chkBakeMr = null!, _chkOutline = null!, _chkHighlight = null!;
         private NumericUpDown _numBudget = null!;
         private Button _btnFitBudget = null!;
-        private ComboBox _previewDropdown = null!;
+        private ComboBox _previewDropdown = null!, _cmbCurves = null!;
         private Button _btnBake = null!, _btnApply = null!, _btnRevert = null!;
         private Label _lblBake = null!;
         private PictureBox _picAtlas = null!;
         private readonly System.Windows.Forms.Timer _debounce = new() { Interval = 250 };
 
-        private ModelFlattener.FlattenInput? _input;
+        // The model as gathered, and (built on first use) the same with its curves swapped for
+        // simplified mesh; the result, bake source and bake always go with the input they came
+        // from.
+        private ModelFlattener.FlattenInput? _input, _curveMeshInput, _resultInput, _bakeSourceFor;
         private ModelFlattener.FlattenResult? _result;
         private CancellationTokenSource? _cts;
         private int _computeVersion;
@@ -96,7 +99,7 @@ namespace GlbMerger
             {
                 _lblStatus.Text = why;
                 _lblStatus.ForeColor = System.Drawing.Color.OrangeRed;
-                foreach (Control c in new Control[] { _sliderStrength, _sliderMinSize, _chkKeepLeftovers, _chkSideDetail, _sliderSideMinSize, _sliderDetailBoost, _sliderDetailStrength, _sliderRecess, _chkTrimCorners, _chkBakeNormals, _chkBakeMr, _numBudget, _btnFitBudget, _previewDropdown, _chkOutline, _chkHighlight, _btnBake, _btnApply })
+                foreach (Control c in new Control[] { _sliderStrength, _sliderMinSize, _chkKeepLeftovers, _chkSideDetail, _cmbCurves, _sliderSideMinSize, _sliderDetailBoost, _sliderDetailStrength, _sliderRecess, _chkTrimCorners, _chkBakeNormals, _chkBakeMr, _numBudget, _btnFitBudget, _previewDropdown, _chkOutline, _chkHighlight, _btnBake, _btnApply })
                     c.Enabled = false;
                 return;
             }
@@ -254,6 +257,23 @@ namespace GlbMerger
                 "Balcony side rails and stair stringers face sideways, so flattening them into the " +
                 "front billboard makes them vanish from any side view. With this on they get side-facing " +
                 "billboards of their own, down to this size."));
+
+            flow.Controls.Add(new Label { Text = "Curved walls (round bays, towers):", AutoSize = true, Margin = new Padding(3, 0, 3, 0) });
+            _cmbCurves = new ComboBox { Width = 330, DropDownStyle = ComboBoxStyle.DropDownList, Margin = new Padding(3, 0, 3, 4) };
+            _cmbCurves.Items.AddRange(new object[] { "Flat planes", "Curved billboards", "Keep as simplified mesh" });
+            _cmbCurves.SelectedIndex = Math.Clamp(_settings.FlattenCurves, 0, 2);
+            _cmbCurves.SelectedIndexChanged += (s, e) =>
+            {
+                _settings.FlattenCurves = _cmbCurves.SelectedIndex;
+                ScheduleCompute();
+            };
+            flow.Controls.Add(_cmbCurves);
+
+            flow.Controls.Add(HelpText(
+                "Flat planes: cheapest, but bands and cornices round a curve break into chevrons from " +
+                "below. Curved billboards: one billboard bent round each curve, a few dozen triangles, " +
+                "reads as round. Keep as simplified mesh: closest to the original, but thousands of " +
+                "triangles per curve."));
 
             _lblDetailStrength = new Label { AutoSize = true, Margin = new Padding(3, 0, 3, 0) };
             _sliderDetailStrength = new TrackBar
@@ -518,7 +538,24 @@ namespace GlbMerger
             SideMinArea = SideMinSizePercent / 100f * (_input?.TotalArea ?? 0f),
             DetailTolerance = _sliderDetailStrength.Value >= 100 ? 0f : Fraction(strength) * _sliderDetailStrength.Value / 100f * (_input?.Extent ?? 1f),
             DetailMinArea = MathF.Min(MinSizePercent, SideMinSizePercent) / 100f * (_input?.TotalArea ?? 0f),
+            Curves = CurveHandling,
         };
+
+        private ModelFlattener.CurveHandling CurveHandling => (ModelFlattener.CurveHandling)Math.Clamp(_cmbCurves.SelectedIndex, 0, 2);
+
+        // The input for the current curve setting. The simplified-mesh one reads the model, so
+        // it's built here on the UI thread, once.
+        private ModelFlattener.FlattenInput CurrentInput()
+        {
+            if (CurveHandling != ModelFlattener.CurveHandling.KeepAsMesh) return _input!;
+            if (_curveMeshInput == null)
+            {
+                Cursor = Cursors.WaitCursor;
+                try { _curveMeshInput = ModelFlattener.PrepareInput(_model, _input!, ModelFlattener.CurveHandling.KeepAsMesh); }
+                finally { Cursor = Cursors.Default; }
+            }
+            return _curveMeshInput;
+        }
 
         private void UpdateLabels()
         {
@@ -555,7 +592,7 @@ namespace GlbMerger
             _cts?.Cancel();
             var cts = _cts = new CancellationTokenSource();
             int version = ++_computeVersion;
-            var input = _input;
+            var input = CurrentInput();
             var settings = CurrentSettings();
 
             _lblStatus.Text = "Computing billboards...";
@@ -575,6 +612,7 @@ namespace GlbMerger
             if (IsDisposed || version != _computeVersion) return;
 
             _result = result;
+            _resultInput = input;
             ShowStats(result, sw.Elapsed);
             PushResult();
             UpdateButtons();
@@ -588,7 +626,7 @@ namespace GlbMerger
         {
             if (_input == null) return;
             int budget = (int)_numBudget.Value;
-            var input = _input;
+            var input = CurrentInput();
             var settingsAt = Enumerable.Range(0, 1001).Select(SettingsAt).ToArray();
 
             _btnFitBudget.Enabled = false;
@@ -646,7 +684,7 @@ namespace GlbMerger
         private async Task<bool> BakeAsync(ModelFlattener.FlattenResult flat)
         {
             int version = ++_bakeVersion;
-            var input = _input!;
+            var input = _resultInput!;
             var bakeSettings = new BillboardBaker.BakeSettings
             {
                 DetailBoost = DetailBoost,
@@ -663,10 +701,10 @@ namespace GlbMerger
             {
                 // Read from the model on the UI thread: it's shared with the rest of the app, and
                 // this is the only read of it the bake needs.
-                if (_bakeSource == null)
+                if (_bakeSource == null || !ReferenceEquals(_bakeSourceFor, input))
                 {
                     Cursor = Cursors.WaitCursor;
-                    try { _bakeSource = BillboardBaker.ExtractSource(_model, input); }
+                    try { _bakeSource = BillboardBaker.ExtractSource(_model, input); _bakeSourceFor = input; }
                     finally { Cursor = Cursors.Default; }
                 }
                 var source = _bakeSource;
@@ -822,7 +860,18 @@ namespace GlbMerger
             using (var fs = new FileStream(_resultPath, FileMode.Create, FileAccess.Write))
             using (var w = new BinaryWriter(fs))
             {
-                foreach (int a in r.Assignment) w.Write(a);
+                // The preview shows the gathered model; a rebuilt input (curves kept as simplified
+                // mesh) is mapped back onto it, the replaced triangles showing as kept mesh.
+                var gathered = _resultInput?.GatheredIndex ?? Array.Empty<int>();
+                if (gathered.Length == 0)
+                    foreach (int a in r.Assignment) w.Write(a);
+                else
+                {
+                    var assignment = Enumerable.Repeat(ModelFlattener.FlattenResult.Kept, _input!.TriangleCount).ToArray();
+                    for (int t = 0; t < gathered.Length; t++)
+                        if (gathered[t] >= 0) assignment[gathered[t]] = r.Assignment[t];
+                    foreach (int a in assignment) w.Write(a);
+                }
                 foreach (var bb in r.Billboards)
                     for (int i = 0; i < 4; i++)
                     {

@@ -43,6 +43,7 @@ namespace GlbMerger
             public bool OptimizeVertexOrder { get; set; } = true;
 
             public float WeldTolerance { get; set; } = 1e-6f;
+
             public float UvTolerance { get; set; } = 1e-4f;
 
             /// <summary>How hard meshopt tries to preserve normals and UVs relative to position error.</summary>
@@ -667,6 +668,21 @@ namespace GlbMerger
             public readonly int A, B, C;
             public Tri(int a, int b, int c) { A = a; B = b; C = c; }
             public int this[int corner] => corner == 0 ? A : corner == 1 ? B : C;
+        }
+
+        // Simplifies just `selection` (indices into `triangles`, one primitive's triangle list)
+        // and returns the triangles that replace it, as vertex indices into the same primitive -
+        // or null when meshopt couldn't do anything. The rest of the primitive isn't touched, and
+        // every vertex the selection shares with it is pinned, so the two still meet exactly.
+        // `error` is meshopt's resulting error relative to the primitive's scale.
+        internal static int[]? SimplifySubset(IList<Vector3> positions, IList<Vector3>? normals, IList<Vector2>? uvs,
+            IReadOnlyList<(int A, int B, int C)> triangles, HashSet<int> selection, SimplifyOptions options, out float error)
+        {
+            var tris = triangles.Select(t => new Tri(t.A, t.B, t.C)).ToArray();
+            var result = new PrimitiveResult();
+            var indices = MeshoptSimplifier.Run(tris, positions, normals, uvs, null, null, options, selection, result, acceptNoReduction: true);
+            error = result.SimplifyError;
+            return indices == null ? null : indices.Take(result.PassthroughStart * 3).ToArray();
         }
 
         // Drives meshopt_simplifyWithAttributes.

@@ -73,6 +73,10 @@ namespace GlbMerger
         private const int BandRows = 64;        // texel rows rasterized at a time, to bound memory
         private const int SmallHoleTexels = 24; // enclosed holes up to this size are filled
         private const float MaskCutoff = 0.5f;
+        // Viewing angles from below the sweep fill covers (see RenderBillboard).
+        private static readonly float[] SweepTangents = new[] { 10f, 20f, 30f }.Select(a => MathF.Tan(a * MathF.PI / 180f)).ToArray();
+        public static float MaxSweepTangent => SweepTangents.Max();
+        public static bool Sweeps(ModelFlattener.Billboard bb) => !bb.Detail && !bb.Part && !bb.Backdrop && MathF.Abs(bb.Normal.Y) < 0.3f;
         private const int MinTrimTexels = 64 * 64;     // smallest corner cut worth a triangle
 
         public sealed class SourceTexture
@@ -291,6 +295,7 @@ namespace GlbMerger
             public float ChartScale;            // atlas texels per source texel
 
             public bool Detail;                 // gets DetailBoost x the base density
+            public float Scale = 1f;            // and this on top (a backdrop's fraction)
             public float SourceDensity;         // ceiling: its own source texels per world unit
         }
 
@@ -307,7 +312,9 @@ namespace GlbMerger
                 var bb = flat.Billboards[i];
                 float own = SourceDensity(input, src, bb.Triangles.Where(t => Vector3.Dot(input.Normals[t], bb.Normal) > 0.2f));
                 // Side billboards are seen at a slant, so they don't get the boost either.
-                items.Add(new Item { Billboard = i, Detail = !bb.Side && bb.Coverage < ModelFlattener.DetailCoverage, SourceDensity = own > 0 ? own : globalDensity });
+                // A curved billboard gets the boost too: rails and grilles in front of its
+                // windows are drawn on it, and at the base density they wash out into the glass.
+                items.Add(new Item { Billboard = i, Detail = !bb.Side && !bb.Backdrop && (bb.Coverage < ModelFlattener.DetailCoverage || bb.Curve != null), Scale = bb.DensityScale, SourceDensity = own > 0 ? own : globalDensity });
             }
             items.AddRange(BuildCharts(input, flat, src));
 
@@ -494,7 +501,7 @@ namespace GlbMerger
 
         private static float ItemDensity(Item item, float baseDensity, float detailBoost)
         {
-            float d = baseDensity * (item.Detail ? detailBoost : 1f);
+            float d = baseDensity * (item.Detail ? detailBoost : 1f) * item.Scale;
             return item.SourceDensity > 0 ? MathF.Min(d, item.SourceDensity) : d;
         }
 
@@ -653,19 +660,25 @@ namespace GlbMerger
 
             RasterTri Project(int t)
             {
+                var curve = bb.Curve;
                 Vector2 P(int k)
                 {
                     var p = input.Corners[t * 3 + k];
-                    return new Vector2((Vector3.Dot(p, bb.AxisU) - bb.Min.X) * sx, (bb.Max.Y - Vector3.Dot(p, bb.AxisV)) * sy);
+                    var q = curve != null ? curve.Project(p) : new Vector2(Vector3.Dot(p, bb.AxisU), Vector3.Dot(p, bb.AxisV));
+                    return new Vector2((q.X - bb.Min.X) * sx, (bb.Max.Y - q.Y) * sy);
                 }
-                return new RasterTri(P(0), P(1), P(2),
-                    Vector3.Dot(input.Corners[t * 3], bb.Normal), Vector3.Dot(input.Corners[t * 3 + 1], bb.Normal),
-                    Vector3.Dot(input.Corners[t * 3 + 2], bb.Normal), t);
+                float Z(int k) => curve != null ? curve.Depth(input.Corners[t * 3 + k]) : Vector3.Dot(input.Corners[t * 3 + k], bb.Normal);
+                return new RasterTri(P(0), P(1), P(2), Z(0), Z(1), Z(2), t);
             }
 
             var own = new List<RasterTri>(bb.Triangles.Count);
             foreach (int t in bb.Triangles)
             {
+                // A piece of detail shows only what faces it: what it holds edge-on (the top of a
+                // coping on a strip of trim) draws as a thin line a little in front of where the
+                // real edge is, and seen from below that line floats above the roofline. Fire-
+                // escape parts draw everything in their box - the tread edges on a stair's side.
+                if (bb.Detail && !bb.Part && Vector3.Dot(input.Normals[t], bb.Normal) < 0.5f) continue;
                 var rt = Project(t);
                 if (MathF.Abs(rt.Area2) > 1e-9f) own.Add(rt);
             }
@@ -680,7 +693,7 @@ namespace GlbMerger
             var fill = new List<RasterTri>();
             float behind = -input.Extent * 0.1f;
             float reach = flat.Tolerance * 2f;
-            bool backfill = !bb.Side && !bb.Detail && bb.Coverage >= 0.5f;
+            bool backfill = !bb.Side && !bb.Detail && !bb.Backdrop && bb.Curve == null && bb.Coverage >= 0.5f;
             for (int t = 0; backfill && t < input.TriangleCount; t++)
             {
                 int a = flat.Assignment[t];
@@ -697,12 +710,37 @@ namespace GlbMerger
                 fill.Add(rt);
             }
 
+            // Seen from below, what stands a little in front of the plane shows higher up than
+            // where it's drawn and what's a little behind it lower down (a camera looking up at
+            // a cornice sees its crown above the roofline drawn on the facade, and the moulding
+            // under it through the slot between two layers of the front). So an upright
+            // surface's own triangles are drawn again, shifted up by their depth in front of the
+            // plane times the tangent of a few viewing angles from below (down, if behind it),
+            // and those copies fill whatever the surface itself leaves empty. Not see-through
+            // detail - its gaps are real.
+            var sweep = new List<RasterTri>();
+            if (Sweeps(bb))
+            {
+                float tiny = input.Extent * 1e-3f;
+                foreach (var rt in own)
+                {
+                    float da = rt.Za - bb.Offset, db = rt.Zb - bb.Offset, dc = rt.Zc - bb.Offset;
+                    if (MathF.Max(MathF.Abs(da), MathF.Max(MathF.Abs(db), MathF.Abs(dc))) < tiny) continue;
+                    foreach (float tan in SweepTangents)
+                        sweep.Add(new RasterTri(rt.A - new Vector2(0, da * tan * sy), rt.B - new Vector2(0, db * tan * sy),
+                            rt.C - new Vector2(0, dc * tan * sy), rt.Za, rt.Zb, rt.Zc, rt.Tri));
+                }
+            }
+
             // Per texel: own colour/sample count, and backfill colour/count from samples no own
             // triangle reached.
             var color = new byte[w * h * 4];
             var hits = new byte[w * h];
             var fillColor = new byte[w * h * 4];
             var fillHits = new byte[w * h];
+            var sweepColor = new byte[w * h * 4];
+            var sweepHits = new byte[w * h];
+            var sweepL = ExtraLayers(input, src, bb, atlas, w * h);
             var depth = new float[w * h];   // mean depth of the own samples; NaN where none
             var layers = ExtraLayers(input, src, bb, atlas, w * h);
 
@@ -710,6 +748,7 @@ namespace GlbMerger
             int bands = (h + BandRows - 1) / BandRows;
             var ownBuckets = Bucket(own, bands);
             var fillBuckets = Bucket(fill, bands);
+            var sweepBuckets = Bucket(sweep, bands);
 
             // Bands write disjoint rows, so they run in parallel - a card-sized billboard is one
             // item but hundreds of bands.
@@ -720,6 +759,8 @@ namespace GlbMerger
                 int sRow0 = row0 * SS, sRows = rows * SS;
                 var ownTri = RasterBand(own, ownBuckets[band], sw, sRow0, sRows);
                 var fillTri = fill.Count > 0 ? RasterBand(fill, fillBuckets[band], sw, sRow0, sRows) : null;
+                var sweepTri = sweep.Count > 0 ? RasterBand(sweep, sweepBuckets[band], sw, sRow0, sRows) : null;
+                var sumSweepL = new Vector4[layers.Count];
                 var sumOwnL = new Vector4[layers.Count];
                 var sumFillL = new Vector4[layers.Count];
 
@@ -729,10 +770,12 @@ namespace GlbMerger
                     {
                         var sumOwn = Vector4.Zero;
                         var sumFill = Vector4.Zero;
+                        var sumSweep = Vector4.Zero;
                         Array.Clear(sumOwnL);
                         Array.Clear(sumFillL);
+                        Array.Clear(sumSweepL);
                         float sumDepth = 0;
-                        int nOwn = 0, nFill = 0;
+                        int nOwn = 0, nFill = 0, nSweep = 0;
                         for (int j = 0; j < SS; j++)
                             for (int k = 0; k < SS; k++)
                             {
@@ -747,6 +790,13 @@ namespace GlbMerger
                                     nOwn++;
                                     continue;
                                 }
+                                int sweepI = sweepTri == null ? -1 : sweepTri[syI * sw + sxI];
+                                if (sweepI >= 0)
+                                {
+                                    sumSweep += ShadeSample(src, sweep[sweepI], p);
+                                    for (int l = 0; l < layers.Count; l++) sumSweepL[l] += layers[l].Sample(sweep[sweepI], p);
+                                    nSweep++;
+                                }
                                 int f = fillTri == null ? -1 : fillTri[syI * sw + sxI];
                                 if (f >= 0)
                                 {
@@ -759,10 +809,12 @@ namespace GlbMerger
                         depth[o] = nOwn > 0 ? sumDepth / nOwn : float.NaN;
                         if (nOwn > 0) { Store(color, o, sumOwn / nOwn); hits[o] = (byte)nOwn; }
                         if (nFill > 0) { Store(fillColor, o, sumFill / nFill); fillHits[o] = (byte)nFill; }
+                        if (nSweep > 0) { Store(sweepColor, o, sumSweep / nSweep); sweepHits[o] = (byte)nSweep; }
                         for (int l = 0; l < layers.Count; l++)
                         {
                             layers[l].Store(layers[l].Own, o, sumOwnL[l], nOwn);
                             layers[l].Store(layers[l].Fill, o, sumFillL[l], nFill);
+                            sweepL[l].Store(sweepL[l].Own, o, sumSweepL[l], nSweep);
                         }
                     }
             });
@@ -799,7 +851,41 @@ namespace GlbMerger
                 }
             }
 
+            // What the surface leaves empty takes the copies seen from below.
+            for (int i = 0; i < w * h && sweep.Count > 0; i++)
+            {
+                if (solid[i] || sweepHits[i] == 0) continue;
+                int n = hits[i] + sweepHits[i];
+                for (int c = 0; c < 4; c++)
+                {
+                    color[i * 4 + c] = (byte)((color[i * 4 + c] * hits[i] + sweepColor[i * 4 + c] * sweepHits[i]) / n);
+                    for (int l = 0; l < layers.Count; l++)
+                        layers[l].Own[i * 4 + c] = (byte)((layers[l].Own[i * 4 + c] * hits[i] + sweepL[l].Own[i * 4 + c] * sweepHits[i]) / n);
+                }
+                hits[i] = (byte)Math.Min(n, SS * SS);
+                alpha[i] = (byte)(hits[i] * color[i * 4 + 3] / (SS * SS));
+                solid[i] = alpha[i] >= MaskCutoff * 255;
+            }
+
             FillCracksAndPinholes(solid, alpha, w, h);
+
+            // A backdrop is cut to the model's cross-section at its depth (Billboard.Clip). An
+            // upright one only across: the front's cornice and parapet stand higher than the
+            // building further back, and the backdrop has to reach up behind them.
+            if (bb.Clip != null)
+            {
+                bool upright = MathF.Abs(bb.Normal.Y) < 0.5f;
+                for (int y = 0; y < h; y++)
+                {
+                    float pv = bb.Max.Y - (y + 0.5f) / h * sizeV;
+                    for (int x = 0; x < w; x++)
+                        if (!bb.Clip.Contains(bb.Min.X + (x + 0.5f) / w * sizeU, pv, upright))
+                        {
+                            alpha[y * w + x] = 0;
+                            solid[y * w + x] = false;
+                        }
+                }
+            }
 
             // A grating floor is baked solid inside its outline (see Billboard.FillHoles); the
             // holes take the colour bled in from the slats around them.
@@ -816,8 +902,19 @@ namespace GlbMerger
             // real model has the reveal, not sky.
             if (bb.Recessed && bb.Coverage >= 0.5f)
             {
-                Array.Fill(alpha, (byte)255);
-                Array.Fill(solid, true);
+                for (int y = 0; y < h; y++)
+                {
+                    float pv = bb.Max.Y - (y + 0.5f) / h * sizeV;
+                    for (int x = 0; x < w; x++)
+                    {
+                        float pu = bb.Min.X + (x + 0.5f) / w * sizeU;
+                        if (bb.RecessedBehind == null || bb.RecessedBehind.Any(f => f.Near(pu, pv)))
+                        {
+                            alpha[y * w + x] = 255;
+                            solid[y * w + x] = true;
+                        }
+                    }
+                }
             }
 
             if (settings.RecessDarkening > 0)
@@ -988,10 +1085,19 @@ namespace GlbMerger
             int x1 = Math.Clamp((int)MathF.Ceiling((bb.ContentMax.X - bb.Min.X) * w / sizeU) - 1, x0, w - 1);
             int y0 = Math.Clamp((int)MathF.Floor((bb.Max.Y - bb.ContentMax.Y) * h / sizeV), 0, h - 1);
             int y1 = Math.Clamp((int)MathF.Ceiling((bb.Max.Y - bb.ContentMin.Y) * h / sizeV) - 1, y0, h - 1);
-            if (x0 == 0 && y0 == 0 && x1 == w - 1 && y1 == h - 1) return;
+            // Only out to the welded rectangle - past it is room for the sweep fill.
+            int wx0 = 0, wx1 = w - 1, wy0 = 0, wy1 = h - 1;
+            if (bb.WeldedMin is Vector2 wmin && bb.WeldedMax is Vector2 wmax)
+            {
+                wx0 = Math.Clamp((int)MathF.Floor((wmin.X - bb.Min.X) * w / sizeU), 0, w - 1);
+                wx1 = Math.Clamp((int)MathF.Ceiling((wmax.X - bb.Min.X) * w / sizeU) - 1, wx0, w - 1);
+                wy0 = Math.Clamp((int)MathF.Floor((bb.Max.Y - wmax.Y) * h / sizeV), 0, h - 1);
+                wy1 = Math.Clamp((int)MathF.Ceiling((bb.Max.Y - wmin.Y) * h / sizeV) - 1, wy0, h - 1);
+            }
+            if (x0 <= wx0 && y0 <= wy0 && x1 >= wx1 && y1 >= wy1) return;
 
-            for (int y = 0; y < h; y++)
-                for (int x = 0; x < w; x++)
+            for (int y = wy0; y <= wy1; y++)
+                for (int x = wx0; x <= wx1; x++)
                 {
                     if (x >= x0 && x <= x1 && y >= y0 && y <= y1) continue;
                     int d = y * w + x, s = Math.Clamp(y, y0, y1) * w + Math.Clamp(x, x0, x1);
@@ -1371,6 +1477,44 @@ namespace GlbMerger
                     int w = item.W - Pad * 2, h = item.H - Pad * 2;
                     float left = item.X + Pad, top = item.Y + Pad;
                     float sizeU = bb.Max.X - bb.Min.X, sizeV = bb.Max.Y - bb.Min.Y;
+
+                    // A curved billboard is a strip of flat pieces round its cylinder, the image
+                    // laid along it by arc length.
+                    if (bb.Curve is ModelFlattener.CurveFrame curve)
+                    {
+                        Vector3 At(Vector2 t) => curve.At(bb.Min.X + t.X / w * sizeU, bb.Max.Y - t.Y / h * sizeV);
+                        void Emit(Vector2 a, Vector2 b, Vector2 c)
+                        {
+                            var pa = At(a);
+                            var outward = curve.Outward(bb.Min.X + (a.X + b.X + c.X) / 3f / w * sizeU);
+                            var face = Vector3.Cross(At(b) - pa, At(c) - pa);
+                            var corners = Vector3.Dot(face, outward) >= 0 ? new[] { a, b, c } : new[] { a, c, b };
+                            foreach (var t in corners)
+                            {
+                                float arc = bb.Min.X + t.X / w * sizeU;
+                                result.Positions.Add(At(t));
+                                result.Normals.Add(curve.Outward(arc));
+                                result.Tangents.Add(new Vector4(Vector3.Cross(Vector3.UnitY, curve.Outward(arc)), 1f));
+                                result.Uvs.Add(new Vector2(left + t.X, top + t.Y) / atlasSize);
+                            }
+                            result.TriangleBillboard.Add(item.Billboard);
+                        }
+                        // Pieces break at the outline's corners inside the billboard's span.
+                        var breaks = new List<float> { 0f };
+                        for (int k = 1; k + 1 < curve.Points.Count; k++)
+                        {
+                            float x = (curve.ArcAt(k) - bb.Min.X) / sizeU * w;
+                            if (x > 0.5f && x < w - 0.5f) breaks.Add(x);
+                        }
+                        breaks.Add(w);
+                        for (int i = 0; i + 1 < breaks.Count; i++)
+                        {
+                            float x0 = breaks[i], x1 = breaks[i + 1];
+                            Emit(new Vector2(x0, h), new Vector2(x1, h), new Vector2(x1, 0));
+                            Emit(new Vector2(x0, h), new Vector2(x1, 0), new Vector2(x0, 0));
+                        }
+                        continue;
+                    }
 
                     // Outline in texel coordinates (y down), counter-clockwise seen from the
                     // front: bottom-left, bottom-right, top-right, top-left - V points up the

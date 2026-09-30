@@ -21,6 +21,8 @@ namespace GlbMerger
         public bool FlattenKeepLeftovers { get; set; } = true;
         public bool FlattenSideDetail { get; set; } = true;
         public int FlattenSideMinSize { get; set; } = 40;
+        // ModelFlattener.CurveHandling: 0 = planes, 1 = curved billboards, 2 = keep as mesh.
+        public int FlattenCurves { get; set; } = 1;
         public int FlattenDetailBoost { get; set; } = 20;
         public int FlattenDetailStrength { get; set; } = 35;
         public int FlattenRecessDarkening { get; set; } = 30;
