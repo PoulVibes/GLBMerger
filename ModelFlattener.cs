@@ -241,6 +241,21 @@ namespace GlbMerger
         }
 
 
+        // A yes/no per square cell over a billboard's plane: cell (c, r) spans
+        // U0 + c * Step .. + Step across and V0 + r * Step .. + Step up. Outside the grid is no.
+        public sealed class CellMask
+        {
+            public float U0, V0, Step;
+            public int Cols, Rows;
+            public bool[] Cells = Array.Empty<bool>();
+
+            public bool Contains(float u, float v)
+            {
+                int c = (int)MathF.Floor((u - U0) / Step), r = (int)MathF.Floor((v - V0) / Step);
+                return c >= 0 && r >= 0 && c < Cols && r < Rows && Cells[r * Cols + c];
+            }
+        }
+
         public sealed class Billboard
         {
             public Vector3 Normal;
@@ -282,6 +297,8 @@ namespace GlbMerger
             // The model's own cross-section at a backdrop's depth, which its baked texture is cut
             // to (null = no cut).
             public ClipRows? Clip;
+            // Where a backdrop lies inside the building's skin (see SkinMask); cut away elsewhere.
+            public CellMask? Inside;
 
             // A curved billboard (CurvedRegions): a strip round an upright cylinder instead of a
             // flat rectangle. Its (U, V) are (arc length round the axis, height), Offset is the
@@ -1335,7 +1352,7 @@ namespace GlbMerger
                         // stair tower rising over the roof) drawn forward onto it would stand
                         // up out of the building's outline.
                         var inFront = tris.Where(t => Depth(t) >= depth - behind).ToList();
-                        result.Billboards.Add(MakeBackdrop(n, u, v, MathF.Max(depth - behind, inside), inFront));
+                        result.Billboards.Add(MakeBackdrop(n, u, v, MathF.Max(depth - behind, inside), inFront, keepInside: Vector3.Dot(n, _in.FrameZ) < 0));
                         // Mouldings turned down toward the street and standing well out in front
                         // (the cornice round a bay's foot) are layered as well: seen from below
                         // through a gap in them, the deep backdrop shows the building a long way
@@ -1544,7 +1561,7 @@ namespace GlbMerger
                 return b >= 0 && Vector3.Dot(result.Billboards[b].Normal, _in.Normals[t]) > 0.95f;
             }
 
-            private Billboard MakeBackdrop(Vector3 n, Vector3 u, Vector3 v, float offset, List<int> tris)
+            private Billboard MakeBackdrop(Vector3 n, Vector3 u, Vector3 v, float offset, List<int> tris, bool keepInside = false)
             {
                 var bb = new Billboard { Normal = n, Offset = offset, AxisU = u, AxisV = v, Triangles = tris, PlaneIndex = -1, Backdrop = true, DensityScale = 0.35f };
                 var min = new Vector2(float.MaxValue);
@@ -1560,7 +1577,95 @@ namespace GlbMerger
                 bb.Max = bb.ContentMax = max;
                 bb.Coverage = CoverageGrid(bb).Fraction;
                 bb.Clip = CrossSection(n, u, v, offset);
+                if (keepInside) bb.Inside = SkinMask(n, u, v, offset, bb.Min, bb.Max);
                 return bb;
+            }
+
+            // Where a deep front or back backdrop stays inside the building: for each cell across
+            // it, the building's outer skin on the far side (the way it faces away from) has to be
+            // at least as far out as the backdrop is. The deep one facing back sits by the rearmost
+            // faces turned that way, and some of those are near the front - it stood out in front of a storefront
+            // recessed under the floors above, where it faced away from the street and so never
+            // showed, but the game's shadow pass draws both sides and it threw shadows across the
+            // shop fronts. Columns with nothing of the building in them are outside too. Only the
+            // back one (the models face +Z): the front one has to reach up behind a front cornice
+            // standing above a lower roof, where there's nothing of the building behind it. Not for
+            // the layered ones: each is just behind its own patch already, and the gaps they fill
+            // (between a cornice's brackets, with no roof deck above the soffit - the models are
+            // shells) have nothing further out, so the test cut them away and the sky showed.
+            private CellMask SkinMask(Vector3 n, Vector3 u, Vector3 v, float offset, Vector2 min, Vector2 max)
+            {
+                var skin = SkinFacingAway(n, u, v);
+                float margin = _in.Extent * 0.005f, depth = -offset;
+                int c0 = Math.Max(0, (int)MathF.Floor((min.X - skin.U0) / skin.Step) - 1);
+                int r0 = Math.Max(0, (int)MathF.Floor((min.Y - skin.V0) / skin.Step) - 1);
+                int c1 = Math.Min(skin.Cols - 1, (int)MathF.Floor((max.X - skin.U0) / skin.Step) + 1);
+                int r1 = Math.Min(skin.Rows - 1, (int)MathF.Floor((max.Y - skin.V0) / skin.Step) + 1);
+                var mask = new CellMask
+                {
+                    U0 = skin.U0 + c0 * skin.Step, V0 = skin.V0 + r0 * skin.Step, Step = skin.Step,
+                    Cols = Math.Max(0, c1 - c0 + 1), Rows = Math.Max(0, r1 - r0 + 1),
+                };
+                mask.Cells = new bool[mask.Cols * mask.Rows];
+                for (int r = 0; r < mask.Rows; r++)
+                    for (int c = 0; c < mask.Cols; c++)
+                        mask.Cells[r * mask.Cols + c] = skin.Depth[(r + r0) * skin.Cols + c + c0] >= depth - margin;
+                return mask;
+            }
+
+            // The building's outer skin seen from the side n faces away from: per cell across the
+            // plane (u, v), the furthest any of it reaches that way (-n), over the cell and its
+            // neighbours (sampling can miss a cell a thin piece only grazes); float.MinValue where
+            // there is none of it. Per direction, over the whole model, so the backdrops facing
+            // one way share it.
+            private readonly Dictionary<Vector3, (float U0, float V0, float Step, int Cols, int Rows, float[] Depth)> _skins = new();
+
+            private (float U0, float V0, float Step, int Cols, int Rows, float[] Depth) SkinFacingAway(Vector3 n, Vector3 u, Vector3 v)
+            {
+                if (_skins.TryGetValue(n, out var cached)) return cached;
+                float step = _in.Extent * 0.005f;
+                var lo = new Vector2(float.MaxValue);
+                var hi = new Vector2(float.MinValue);
+                foreach (var p in _in.Corners)
+                {
+                    var q = new Vector2(Vector3.Dot(p, u), Vector3.Dot(p, v));
+                    lo = Vector2.Min(lo, q);
+                    hi = Vector2.Max(hi, q);
+                }
+                float u0 = lo.X - step, v0 = lo.Y - step;
+                int cols = (int)MathF.Ceiling((hi.X - lo.X) / step) + 3, rows = (int)MathF.Ceiling((hi.Y - lo.Y) / step) + 3;
+                var raw = new float[cols * rows];
+                Array.Fill(raw, float.MinValue);
+                float spacing = step * 0.5f;
+                for (int t = 0; t < _in.TriangleCount; t++)
+                {
+                    if (_in.Areas[t] <= _degenerateArea) continue;
+                    Vector3 a = _in.Corners[t * 3], b = _in.Corners[t * 3 + 1], c = _in.Corners[t * 3 + 2];
+                    // A grid of barycentric samples fine enough to land in every cell it crosses.
+                    int k = Math.Clamp((int)MathF.Ceiling(MathF.Max(Vector3.Distance(a, b), MathF.Max(Vector3.Distance(b, c), Vector3.Distance(c, a))) / spacing), 1, 400);
+                    for (int i = 0; i <= k; i++)
+                        for (int j = 0; i + j <= k; j++)
+                        {
+                            var p = a + (b - a) * ((float)i / k) + (c - a) * ((float)j / k);
+                            int cc = (int)MathF.Floor((Vector3.Dot(p, u) - u0) / step), rr = (int)MathF.Floor((Vector3.Dot(p, v) - v0) / step);
+                            if (cc < 0 || rr < 0 || cc >= cols || rr >= rows) continue;
+                            raw[rr * cols + cc] = MathF.Max(raw[rr * cols + cc], -Vector3.Dot(p, n));
+                        }
+                }
+                var depthMap = new float[cols * rows];
+                for (int r = 0; r < rows; r++)
+                    for (int c = 0; c < cols; c++)
+                    {
+                        float best = float.MinValue;
+                        for (int dr = -1; dr <= 1; dr++)
+                            for (int dc = -1; dc <= 1; dc++)
+                            {
+                                int rr = r + dr, cc = c + dc;
+                                if (rr >= 0 && cc >= 0 && rr < rows && cc < cols) best = MathF.Max(best, raw[rr * cols + cc]);
+                            }
+                        depthMap[r * cols + c] = best;
+                    }
+                return _skins[n] = (u0, v0, step, cols, rows, depthMap);
             }
 
             // The model's cross-section by the plane dot(p, n) = offset, as the span it covers

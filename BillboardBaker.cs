@@ -886,6 +886,20 @@ namespace GlbMerger
                         }
                 }
             }
+            // ...and to where it lies inside the building's skin (Billboard.Inside).
+            if (bb.Inside != null)
+            {
+                for (int y = 0; y < h; y++)
+                {
+                    float pv = bb.Max.Y - (y + 0.5f) / h * sizeV;
+                    for (int x = 0; x < w; x++)
+                        if (!bb.Inside.Contains(bb.Min.X + (x + 0.5f) / w * sizeU, pv))
+                        {
+                            alpha[y * w + x] = 0;
+                            solid[y * w + x] = false;
+                        }
+                }
+            }
 
             // A grating floor is baked solid inside its outline (see Billboard.FillHoles); the
             // holes take the colour bled in from the slats around them.
