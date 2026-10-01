@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Numerics;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -49,6 +50,11 @@ namespace GlbMerger
         private Button _btnFitBudget = null!;
         private ComboBox _previewDropdown = null!, _cmbCurves = null!;
         private Button _btnBake = null!, _btnApply = null!, _btnRevert = null!;
+        private CheckBox _chkPaintDelete = null!;
+        private Button _btnUndoStroke = null!, _btnRestoreDeleted = null!, _btnDeleteHighlighted = null!, _btnClearHighlight = null!;
+        // What's painted red in the preview, as indices into the result it was painted on (tag).
+        private List<int> _highlighted = new();
+        private int _highlightTag;
         private Label _lblBake = null!;
         private PictureBox _picAtlas = null!;
         private readonly System.Windows.Forms.Timer _debounce = new() { Interval = 250 };
@@ -57,8 +63,18 @@ namespace GlbMerger
         // simplified mesh; the result, bake source and bake always go with the input they came
         // from.
         private ModelFlattener.FlattenInput? _input, _curveMeshInput, _resultInput, _bakeSourceFor;
-        private ModelFlattener.FlattenResult? _result;
+        // _rawResult is what the flattener computed; _result is it with the painted-out billboards
+        // removed, and is what's shown, baked and applied.
+        private ModelFlattener.FlattenResult? _rawResult, _result;
         private CancellationTokenSource? _cts;
+
+        // Billboards painted out in the preview, one list per brush stroke (for Undo). Kept as
+        // where the billboard was rather than its index, so a deletion survives a recompute
+        // with other settings: whatever billboard of the new result sits in the same place is
+        // deleted too.
+        private readonly record struct DeletedBillboard(Vector3 Normal, Vector3 Center, float Size);
+        private readonly List<List<DeletedBillboard>> _deletedStrokes = new();
+        private int _pushTag;
         private int _computeVersion;
 
         private bool _viewerReady;
@@ -99,7 +115,7 @@ namespace GlbMerger
             {
                 _lblStatus.Text = why;
                 _lblStatus.ForeColor = System.Drawing.Color.OrangeRed;
-                foreach (Control c in new Control[] { _sliderStrength, _sliderMinSize, _chkKeepLeftovers, _chkSideDetail, _cmbCurves, _sliderSideMinSize, _sliderDetailBoost, _sliderDetailStrength, _sliderRecess, _chkTrimCorners, _chkBakeNormals, _chkBakeMr, _numBudget, _btnFitBudget, _previewDropdown, _chkOutline, _chkHighlight, _btnBake, _btnApply })
+                foreach (Control c in new Control[] { _sliderStrength, _sliderMinSize, _chkKeepLeftovers, _chkSideDetail, _cmbCurves, _sliderSideMinSize, _sliderDetailBoost, _sliderDetailStrength, _sliderRecess, _chkTrimCorners, _chkBakeNormals, _chkBakeMr, _numBudget, _btnFitBudget, _previewDropdown, _chkOutline, _chkHighlight, _chkPaintDelete, _btnBake, _btnApply })
                     c.Enabled = false;
                 return;
             }
@@ -429,6 +445,61 @@ namespace GlbMerger
                 "Highlighted (orange) billboards cover less than 95% of their rectangle - " +
                 "the gaps become transparent once textured."));
 
+            _chkPaintDelete = new CheckBox
+            {
+                Text = "Click to select billboards for deleting",
+                AutoSize = true,
+                Margin = new Padding(3, 0, 3, 0),
+            };
+            _chkPaintDelete.CheckedChanged += (s, e) =>
+            {
+                if (!_chkPaintDelete.Checked) ClearHighlight();
+                PushPaintState();
+            };
+            flow.Controls.Add(_chkPaintDelete);
+
+            var highlightRow = new FlowLayoutPanel
+            {
+                FlowDirection = FlowDirection.LeftToRight, WrapContents = false,
+                AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Margin = new Padding(0, 0, 0, 0),
+            };
+            _btnDeleteHighlighted = new Button { Text = "Delete Selected", AutoSize = true, Enabled = false, Margin = new Padding(3, 3, 6, 3) };
+            _btnDeleteHighlighted.Click += (s, e) => DeleteHighlighted();
+            highlightRow.Controls.Add(_btnDeleteHighlighted);
+            _btnClearHighlight = new Button { Text = "Clear Selection", AutoSize = true, Enabled = false, Margin = new Padding(0, 3, 3, 3) };
+            _btnClearHighlight.Click += (s, e) => ClearHighlight();
+            highlightRow.Controls.Add(_btnClearHighlight);
+            flow.Controls.Add(highlightRow);
+
+            var deleteRow = new FlowLayoutPanel
+            {
+                FlowDirection = FlowDirection.LeftToRight, WrapContents = false,
+                AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Margin = new Padding(0, 0, 0, 4),
+            };
+            _btnUndoStroke = new Button { Text = "Undo Last Delete", AutoSize = true, Enabled = false, Margin = new Padding(3, 3, 6, 3) };
+            _btnUndoStroke.Click += (s, e) =>
+            {
+                if (_deletedStrokes.Count == 0) return;
+                _deletedStrokes.RemoveAt(_deletedStrokes.Count - 1);
+                RefilterResult();
+            };
+            deleteRow.Controls.Add(_btnUndoStroke);
+            _btnRestoreDeleted = new Button { Text = "Restore All", AutoSize = true, Enabled = false, Margin = new Padding(0, 3, 3, 3) };
+            _btnRestoreDeleted.Click += (s, e) =>
+            {
+                _deletedStrokes.Clear();
+                RefilterResult();
+            };
+            deleteRow.Controls.Add(_btnRestoreDeleted);
+            flow.Controls.Add(deleteRow);
+
+            flow.Controls.Add(HelpText(
+                "Click a billboard in the preview to select it (red); click the same spot again to " +
+                "step to the next billboard behind it, round to the front again. Dragging still " +
+                "orbits. Delete Selected (or the Delete key in the preview) removes it and drops its " +
+                "triangles - works in every preview but Original. Deletions carry over when you " +
+                "change settings, onto whatever billboard lands in the same place."));
+
             _lblStats = new Label
             {
                 AutoSize = true, MaximumSize = new System.Drawing.Size(340, 0),
@@ -611,9 +682,90 @@ namespace GlbMerger
             }
             if (IsDisposed || version != _computeVersion) return;
 
-            _result = result;
+            _rawResult = result;
             _resultInput = input;
-            ShowStats(result, sw.Elapsed);
+            _result = WithoutDeleted(result);
+            ShowStats(_result, sw.Elapsed);
+            PushResult();
+            UpdateButtons();
+            if (Mode == PreviewMode.Baked) _ = RunBakeAsync();
+        }
+
+        // --- painted-out billboards ------------------------------------------------------------
+
+        private static DeletedBillboard Mark(ModelFlattener.Billboard bb)
+        {
+            var c0 = bb.Corner(0);
+            var c2 = bb.Corner(2);
+            return new DeletedBillboard(bb.Normal, (c0 + bb.Corner(1) + c2 + bb.Corner(3)) / 4f, Vector3.Distance(c0, c2));
+        }
+
+        // The same billboard, or near enough: facing the same way, about the same size, and
+        // centred within a fifth of its size of where the deleted one was - close enough to
+        // follow a billboard through a settings change, not so loose it takes the next window
+        // along with it.
+        private static bool IsDeleted(ModelFlattener.Billboard bb, IEnumerable<DeletedBillboard> deleted, float slack)
+        {
+            var mark = Mark(bb);
+            foreach (var d in deleted)
+            {
+                if (Vector3.Dot(d.Normal, mark.Normal) < 0.95f) continue;
+                float big = MathF.Max(d.Size, mark.Size), small = MathF.Min(d.Size, mark.Size);
+                if (small < big * 0.5f) continue;
+                if (Vector3.Distance(d.Center, mark.Center) <= big * 0.2f + slack) return true;
+            }
+            return false;
+        }
+
+        private int DeletedCount => (_rawResult?.Billboards.Count ?? 0) - (_result?.Billboards.Count ?? 0);
+
+        private ModelFlattener.FlattenResult WithoutDeleted(ModelFlattener.FlattenResult raw) =>
+            WithoutDeleted(raw, _deletedStrokes.SelectMany(s => s).ToList(), (_input?.Extent ?? 1f) * 1e-3f);
+
+        private static ModelFlattener.FlattenResult WithoutDeleted(ModelFlattener.FlattenResult raw, List<DeletedBillboard> deleted, float slack)
+        {
+            if (deleted.Count == 0) return raw;
+            var remove = new HashSet<int>();
+            for (int i = 0; i < raw.Billboards.Count; i++)
+                if (IsDeleted(raw.Billboards[i], deleted, slack)) remove.Add(i);
+            return raw.Without(remove);
+        }
+
+        // The viewer reports its highlight after every stroke; nothing is deleted until the
+        // Delete Selected button.
+        private void SetHighlighted(int tag, List<int> indices)
+        {
+            _highlightTag = tag;
+            _highlighted = indices;
+            UpdateButtons();
+        }
+
+        // Indices are into the result the viewer was last sent (tag), which is _result unless a
+        // newer one has gone out since - then the highlight is of billboards that no longer exist
+        // (the viewer has already cleared it).
+        private void DeleteHighlighted()
+        {
+            if (_result == null || _highlightTag != _pushTag) return;
+            var stroke = _highlighted.Where(i => i >= 0 && i < _result.Billboards.Count)
+                .Distinct().Select(i => Mark(_result.Billboards[i])).ToList();
+            if (stroke.Count == 0) return;
+            _deletedStrokes.Add(stroke);
+            RefilterResult();
+        }
+
+        private void ClearHighlight()
+        {
+            SetHighlighted(_pushTag, new List<int>());
+            if (_viewerReady && _webView.CoreWebView2 != null)
+                _ = _webView.CoreWebView2.ExecuteScriptAsync("clearHighlight();");
+        }
+
+        private void RefilterResult()
+        {
+            if (_rawResult == null) return;
+            _result = WithoutDeleted(_rawResult);
+            ShowStats(_result, TimeSpan.Zero);
+            _lblStatus.Text = DeletedCount > 0 ? $"{DeletedCount:N0} billboard(s) deleted." : "All deleted billboards restored.";
             PushResult();
             UpdateButtons();
             if (Mode == PreviewMode.Baked) _ = RunBakeAsync();
@@ -628,6 +780,8 @@ namespace GlbMerger
             int budget = (int)_numBudget.Value;
             var input = CurrentInput();
             var settingsAt = Enumerable.Range(0, 1001).Select(SettingsAt).ToArray();
+            var deleted = _deletedStrokes.SelectMany(s => s).ToList();
+            float slack = _input.Extent * 1e-3f;
 
             _btnFitBudget.Enabled = false;
             _lblStatus.Text = $"Searching for a Strength that fits {budget:N0} triangles...";
@@ -635,7 +789,7 @@ namespace GlbMerger
             {
                 var (strength, triangles) = await Task.Run(() =>
                 {
-                    int Count(int v) => ModelFlattener.Compute(input, settingsAt[v], CancellationToken.None).OutputTriangles;
+                    int Count(int v) => WithoutDeleted(ModelFlattener.Compute(input, settingsAt[v], CancellationToken.None), deleted, slack).OutputTriangles;
                     int atMax = Count(1000);
                     if (atMax > budget) return (-1, atMax);
                     int lo = 0, hi = 1000, best = atMax;
@@ -819,6 +973,11 @@ namespace GlbMerger
             bool baking = _bakeTask != null;
             _btnBake.Enabled = !baking && _result != null;
             _btnApply.Enabled = !baking && _result != null;
+            bool anyHighlighted = _highlighted.Count > 0 && _highlightTag == _pushTag;
+            _btnDeleteHighlighted.Enabled = anyHighlighted;
+            _btnClearHighlight.Enabled = anyHighlighted;
+            _btnUndoStroke.Enabled = _deletedStrokes.Count > 0;
+            _btnRestoreDeleted.Enabled = _deletedStrokes.Count > 0;
         }
 
         private void ShowStats(ModelFlattener.FlattenResult r, TimeSpan elapsed)
@@ -833,7 +992,8 @@ namespace GlbMerger
                 $"Triangles: {before:N0} -> {after:N0}{pct}\n" +
                 $"Billboards: {r.Billboards.Count:N0} quads ({r.Billboards.Count * 2:N0} tris) on {r.PlaneCount:N0} planes\n" +
                 $"Kept as mesh: {r.KeptTriangles:N0} tris    Dropped: {r.DroppedTriangles:N0} tris\n" +
-                $"Will need transparency: {needAlpha:N0} billboard(s)";
+                $"Will need transparency: {needAlpha:N0} billboard(s)" +
+                (DeletedCount > 0 ? $"\nDeleted by painting: {DeletedCount:N0} billboard(s)" : "");
             _lblStatus.Text = $"Computed in {elapsed.TotalSeconds:0.00} s.";
         }
 
@@ -914,7 +1074,14 @@ namespace GlbMerger
             if (!_viewerReady || _result == null || _webView.CoreWebView2 == null) return;
             string file = WriteResultFile(_result);
             _ = _webView.CoreWebView2.ExecuteScriptAsync(
-                $"showResult('https://appassets.local/{EscapeJs(file)}', {_result.Billboards.Count});");
+                $"showResult('https://appassets.local/{EscapeJs(file)}', {_result.Billboards.Count}, {++_pushTag});");
+        }
+
+        private void PushPaintState()
+        {
+            if (!_viewerReady || _webView.CoreWebView2 == null) return;
+            _ = _webView.CoreWebView2.ExecuteScriptAsync(
+                $"setPaintState({(_chkPaintDelete.Checked ? "true" : "false")});");
         }
 
         private void PushBaked()
@@ -958,10 +1125,16 @@ namespace GlbMerger
         private void OnWebMessageReceived(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
         {
             string? action;
+            int tag = 0;
+            var indices = new List<int>();
             try
             {
                 using var doc = JsonDocument.Parse(e.TryGetWebMessageAsString());
-                action = doc.RootElement.TryGetProperty("action", out var a) ? a.GetString() : null;
+                var root = doc.RootElement;
+                action = root.TryGetProperty("action", out var a) ? a.GetString() : null;
+                if (root.TryGetProperty("tag", out var tg)) tag = tg.GetInt32();
+                if (root.TryGetProperty("indices", out var idx))
+                    foreach (var i in idx.EnumerateArray()) indices.Add(i.GetInt32());
             }
             catch { return; }
 
@@ -970,9 +1143,14 @@ namespace GlbMerger
             {
                 _viewerReady = true;
                 PushViewState();
+                PushPaintState();
                 PushResult();
                 PushBaked();
             }
+            else if (action == "highlight")
+                SetHighlighted(tag, indices);
+            else if (action == "deleteSelected")
+                DeleteHighlighted();
         }
 
         private static string EscapeJs(string s) => s.Replace("\\", "\\\\").Replace("'", "\\'");
@@ -1005,6 +1183,10 @@ namespace GlbMerger
                 <style>
                     body, html { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #23272a; }
                     #viewport { width: 100%; height: 100%; display: block; }
+                    #pickInfo {
+                        position: absolute; right: 10px; bottom: 10px; color: #ff9a9a;
+                        font-family: Segoe UI, sans-serif; font-size: 12px; pointer-events: none;
+                    }
                     #info {
                         position: absolute; left: 10px; bottom: 10px; color: #ccc;
                         font-family: Segoe UI, sans-serif; font-size: 12px; pointer-events: none;
@@ -1019,6 +1201,7 @@ namespace GlbMerger
             </head>
             <body>
                 <canvas id='viewport'></canvas>
+                <div id='pickInfo'></div>
                 <div id='info'></div>
                 <div id='error-overlay'></div>
                 <script>
@@ -1189,9 +1372,14 @@ namespace GlbMerger
                             applyVisibility();
                         };
 
-                        window.showResult = function (url, count) {
+                        window.showResult = function (url, count, tag) {
                             fetch(url).then(function (r) { return r.arrayBuffer(); }).then(function (buf) {
+                                // Results can arrive out of order; only the newest is the one
+                                // the host's indices refer to.
+                                if (tag < resultTag) return;
+                                resultTag = tag;
                                 quadCount = count;
+                                clearPending();
                                 assignment = new Int32Array(buf, 0, triCount);
                                 quads = new Float32Array(buf, triCount * 4, count * 12);
                                 coverage = new Float32Array(buf, triCount * 4 + count * 48, count);
@@ -1246,6 +1434,119 @@ namespace GlbMerger
                                 showError('Failed to load original model: ' + (error && error.message ? error.message : error));
                             });
                         };
+
+                        // --- selecting billboards to delete --------------------------------------
+                        // A click (press and release without dragging, so orbiting still works)
+                        // selects the nearest billboard under the cursor, drawn red. Billboards
+                        // stack - a facade, the window layer behind it, a backdrop behind them all -
+                        // so clicking the same spot again steps to the next billboard along the
+                        // ray, and round to the front again after the last. The selection goes to
+                        // the host, which deletes it on its Delete button (or the Delete key here)
+                        // and sends back the new result, which clears the selection.
+                        var pickInfo = document.querySelector('#pickInfo');
+                        var paintMode = false, downAt = null, lastClick = null;
+                        var resultTag = 0, pending = new Set(), pendingMesh = null;
+                        var raycaster = new THREE.Raycaster();
+                        var pendingMaterial = new THREE.MeshBasicMaterial({
+                            color: 0xff3030, transparent: true, opacity: 0.7, side: THREE.DoubleSide,
+                            depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2,
+                        });
+
+                        window.setPaintState = function (enabled) {
+                            paintMode = enabled;
+                            canvas.style.cursor = enabled ? 'crosshair' : '';
+                        };
+
+                        function postSelection() {
+                            if (window.chrome && window.chrome.webview) {
+                                window.chrome.webview.postMessage(JSON.stringify({
+                                    action: 'highlight', tag: resultTag, indices: Array.from(pending),
+                                }));
+                            }
+                        }
+
+                        function clearPending() {
+                            pending.clear();
+                            lastClick = null;
+                            pickInfo.textContent = '';
+                            rebuildPending();
+                        }
+                        window.clearHighlight = clearPending;
+
+                        function rebuildPending() {
+                            disposeObject(pendingMesh);
+                            pendingMesh = null;
+                            if (pending.size === 0) return;
+                            var pos = new Float32Array(pending.size * 18), w = 0;
+                            var order = [0, 1, 2, 0, 2, 3];
+                            pending.forEach(function (q) {
+                                for (var k = 0; k < 6; k++)
+                                    for (var a = 0; a < 3; a++) pos[w++] = quads[q * 12 + order[k] * 3 + a];
+                            });
+                            var geo = new THREE.BufferGeometry();
+                            geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+                            pendingMesh = new THREE.Mesh(geo, pendingMaterial);
+                            pendingMesh.renderOrder = 10;
+                            scene.add(pendingMesh);
+                        }
+
+                        // Every billboard a ray through this pixel passes through, nearest first.
+                        // Works off the billboard (or source) geometry even while it's hidden, so
+                        // it also picks in the baked preview, which is drawn from the same quads.
+                        var _ndc = new THREE.Vector2();
+                        function billboardsAt(x, y) {
+                            var rect = canvas.getBoundingClientRect();
+                            _ndc.set((x - rect.left) / rect.width * 2 - 1, -((y - rect.top) / rect.height) * 2 + 1);
+                            raycaster.setFromCamera(_ndc, camera);
+                            var stack = [];
+                            function add(q) { if (q >= 0 && q < quadCount && stack.indexOf(q) < 0) stack.push(q); }
+                            if (mode === 'source') {
+                                if (srcMesh) raycaster.intersectObject(srcMesh, false).forEach(function (h) { add(assignment[h.faceIndex]); });
+                                return stack;
+                            }
+                            var targets = [bbFront, bbBack].filter(function (o) { return o; });
+                            raycaster.intersectObjects(targets, false).forEach(function (h) { add(Math.floor(h.faceIndex / 2)); });
+                            return stack;
+                        }
+
+                        function selectAt(x, y) {
+                            var stack = billboardsAt(x, y);
+                            var index = 0;
+                            // Same spot as last time: the next one back from what's selected.
+                            if (lastClick && Math.abs(x - lastClick.x) <= 4 && Math.abs(y - lastClick.y) <= 4 && pending.size === 1) {
+                                var current = stack.indexOf(pending.values().next().value);
+                                if (current >= 0) index = (current + 1) % stack.length;
+                            }
+                            pending.clear();
+                            if (stack.length > 0) pending.add(stack[index]);
+                            lastClick = { x: x, y: y };
+                            pickInfo.textContent = stack.length === 0 ? '' :
+                                'Billboard ' + (index + 1) + ' of ' + stack.length + ' here' +
+                                (stack.length > 1 ? ' - click again for the one behind' : '');
+                            rebuildPending();
+                            postSelection();
+                        }
+
+                        canvas.addEventListener('pointerdown', function (event) {
+                            downAt = event.button === 0 ? { x: event.clientX, y: event.clientY } : null;
+                        });
+                        canvas.addEventListener('pointerup', function (event) {
+                            var start = downAt;
+                            downAt = null;
+                            if (!paintMode || !start || event.button !== 0 || !assignment || mode === 'original') return;
+                            // A drag is an orbit, not a click.
+                            if (Math.abs(event.clientX - start.x) + Math.abs(event.clientY - start.y) > 4) return;
+                            selectAt(event.clientX, event.clientY);
+                        });
+                        window.addEventListener('keydown', function (event) {
+                            if (!paintMode || pending.size === 0) return;
+                            if (event.key === 'Delete' && window.chrome && window.chrome.webview) {
+                                window.chrome.webview.postMessage(JSON.stringify({ action: 'deleteSelected' }));
+                            } else if (event.key === 'Escape') {
+                                clearPending();
+                                postSelection();
+                            }
+                        });
 
                         // --- startup ------------------------------------------------------------
                         fetch('https://appassets.local/" + sourceFile + @"')

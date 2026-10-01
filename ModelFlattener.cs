@@ -426,6 +426,39 @@ namespace GlbMerger
             public float Tolerance;           // the epsilon it was flattened with
             // A curved billboard is two triangles per strip segment.
             public int OutputTriangles => Billboards.Sum(b => b.Curve != null ? 2 * b.Curve.Segments : 2) + KeptTriangles;
+
+            // A copy without the given billboards (by index); their triangles are dropped. The
+            // billboards themselves are shared with this result, not copied.
+            public FlattenResult Without(ICollection<int> remove)
+            {
+                if (remove.Count == 0) return this;
+                var result = new FlattenResult
+                {
+                    Assignment = new int[Assignment.Length],
+                    PlaneCount = PlaneCount,
+                    KeptTriangles = KeptTriangles,
+                    DroppedTriangles = DroppedTriangles,
+                    Tolerance = Tolerance,
+                };
+                var newIndex = new int[Billboards.Count];
+                for (int i = 0; i < Billboards.Count; i++)
+                {
+                    if (remove.Contains(i)) { newIndex[i] = Dropped; continue; }
+                    newIndex[i] = result.Billboards.Count;
+                    result.Billboards.Add(Billboards[i]);
+                }
+                for (int t = 0; t < Assignment.Length; t++)
+                {
+                    int a = Assignment[t];
+                    if (a >= 0)
+                    {
+                        a = newIndex[a];
+                        if (a == Dropped) result.DroppedTriangles++;
+                    }
+                    result.Assignment[t] = a;
+                }
+                return result;
+            }
         }
 
         // Null when the model can be flattened; otherwise why not.
