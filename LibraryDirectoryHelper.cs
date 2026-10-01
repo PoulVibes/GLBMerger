@@ -5,7 +5,7 @@ using System.Linq;
 
 namespace GlbMerger
 {
-    // Shared by every "animation library" dropdown (MainForm's Model 2 panel, Ball Anchor editor,
+    // Shared by every "animation library" dropdown (MainForm's Additional Models panel, Ball Anchor editor,
     // Stiff Arm Poses editor) so they all list a folder's .glb files, and display them in a
     // ComboBox, the same way.
     internal static class LibraryDirectoryHelper

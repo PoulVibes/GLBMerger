@@ -11,9 +11,10 @@ namespace GlbMerger
 {
     public class MainForm : Form
     {
-        private Button btnFile1, btnClear, btnMerge, btnSave, btnSaveModel1, btnEditModel, btnSetHeight;
+        private Button btnLoadModel, btnClear, btnMerge, btnSave, btnSaveModel, btnEditModel, btnSetHeight;
         private NumericUpDown numModelHeightIn;
         private Label lblStatus;
+        private FileDetailsPanel fileDetails;
         private const float InchesToMeters = 0.0254f;
         private GlbInfoPanel panel1, panel2;
         private CheckBox chkDarkMode;
@@ -24,6 +25,7 @@ namespace GlbMerger
         private List<FbxAnimationSource> fbxAnimsList2 = new(); // slot 2 accumulates any number of dropped FBX sources
         private List<GlbAnimationSource> libraryAnimsList2 = new(); // slot 2 also accumulates any number of GLBs added from the animation library dropdown
         private SharpGLTF.Schema2.ModelRoot? latestMergedModel; // in-memory result of the last "Process Merge" - not yet saved anywhere the user chose
+        private bool cleanupDeclined; // the user kept latestMergedModel's unused geometry when the editor closed, so Save doesn't ask again
 
         public MainForm()
         {
@@ -58,6 +60,9 @@ namespace GlbMerger
             // needs, which is what used to push the last button (Set Height) off the right edge at
             // the default window width.
             toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            // The file details sit in their own column on the right, beside both rows.
+            toolbar.ColumnCount = 2;
+            toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
 
             var buttonRow = new FlowLayoutPanel
             {
@@ -80,11 +85,11 @@ namespace GlbMerger
                 Text = text,
                 Enabled = enabled
             };
-            btnFile1 = MakeToolbarButton("Load Model 1");
+            btnLoadModel = MakeToolbarButton("Load Model");
             btnClear = MakeToolbarButton("Clear");
             btnMerge = MakeToolbarButton("Process Merge", enabled: false);
-            btnSave = MakeToolbarButton("Save...", enabled: false);
-            btnSaveModel1 = MakeToolbarButton("Save Model 1", enabled: false);
+            btnSave = MakeToolbarButton("Save As...", enabled: false);
+            btnSaveModel = MakeToolbarButton("Save Model", enabled: false);
             btnEditModel = MakeToolbarButton("🖥️ Open Model Editor", enabled: false);
 
             var lblHeight = new Label
@@ -117,12 +122,15 @@ namespace GlbMerger
             };
             heightGroup.Controls.AddRange(new Control[] { lblHeight, numModelHeightIn, btnSetHeight });
 
-            buttonRow.Controls.AddRange(new Control[] { btnFile1, btnClear, btnMerge, btnSave, btnSaveModel1, btnEditModel, heightGroup });
+            buttonRow.Controls.AddRange(new Control[] { btnLoadModel, btnClear, btnMerge, btnSave, btnSaveModel, btnEditModel, heightGroup });
 
             lblStatus = new Label { AutoSize = false, Width = 700, Height = 20, Margin = new Padding(0, 6, 0, 0), AutoEllipsis = true };
 
             toolbar.Controls.Add(buttonRow, 0, 0);
             toolbar.Controls.Add(lblStatus, 0, 1);
+            fileDetails = new FileDetailsPanel { Anchor = AnchorStyles.Top | AnchorStyles.Right };
+            toolbar.Controls.Add(fileDetails, 1, 0);
+            toolbar.SetRowSpan(fileDetails, 2);
 
             // Bottom-right dark mode toggle, in its own strip so it stays clear of the resizable
             // boxes above it. Positioned manually (not just Anchor) so it tracks the right edge
@@ -154,12 +162,12 @@ namespace GlbMerger
             // Width - Panel2MinSize".
 
             panel1 = new GlbInfoPanel { Dock = DockStyle.Fill, ShowAnimationCheckboxes = true };
-            panel1.UpdateTitle("Model 1 (geometry, materials, animations)");
+            panel1.UpdateTitle("Model (geometry, materials, animations)");
             panel1.SettingsChanged += OnPanelSettingsChanged;
 
             panel2 = new GlbInfoPanel(showGeometryBox: false, defaultFixBoneLength: true, defaultFixHipRotation: true) { Dock = DockStyle.Fill, ShowAnimationCheckboxes = true };
             panel2.SettingsChanged += OnPanelSettingsChanged;
-            panel2.UpdateTitle("Model 2 - drop a GLB onto Materials, FBX file(s) onto Animations");
+            panel2.UpdateTitle("Additional Models - drop a GLB onto Materials, FBX file(s) onto Animations");
             panel2.EnableDropTargets();
             panel2.GlbFileDropped += async path => await LoadGlbIntoSlot2(path);
             panel2.FbxFilesDropped += async paths => await LoadFbxFilesIntoSlot2(paths);
@@ -187,11 +195,11 @@ namespace GlbMerger
                 SplitterFractionPersistence.ApplyFraction(splitter, _settings.MainSplitFraction);
             };
 
-            btnFile1.Click += async (s, e) => await PickModel1();
+            btnLoadModel.Click += async (s, e) => await PickModel();
             btnClear.Click += (s, e) => ClearAll();
             btnMerge.Click += OnProcessMerge;
             btnSave.Click += OnSave;
-            btnSaveModel1.Click += async (s, e) => await OnSaveModel1();
+            btnSaveModel.Click += async (s, e) => await OnSaveModel();
 
             // Every mode of the editor (joint corrections, ball anchor, stiff-arm poses, animation
             // trimming) edits latestMergedModel in place, so closing it needs no extra "commit"
@@ -203,6 +211,9 @@ namespace GlbMerger
                 editor.ShowDialog(this);
                 _settings.Save();
                 lblStatus.Text = "Model editor closed - use Save to write the result out.";
+                // Asked now rather than at Save, so the file details show what cleanup leaves.
+                OfferCleanup(beforeSave: false);
+                fileDetails.ShowModel(latestMergedModel);
             };
 
             btnSetHeight.Click += (s, e) => OnSetModelHeight();
@@ -244,22 +255,23 @@ namespace GlbMerger
             libraryAnimsList2 = new List<GlbAnimationSource>();
             latestMergedModel = null;
 
-            panel1.Reset("Model 1 (geometry, materials, animations)");
-            panel2.Reset("Model 2 - drop a GLB onto Materials, FBX file(s) onto Animations");
+            panel1.Reset("Model (geometry, materials, animations)");
+            panel2.Reset("Additional Models - drop a GLB onto Materials, FBX file(s) onto Animations");
 
             btnMerge.Enabled = false;
             btnSave.Enabled = false;
-            btnSaveModel1.Enabled = false;
+            btnSaveModel.Enabled = false;
             btnEditModel.Enabled = false;
             btnSetHeight.Enabled = false;
             numModelHeightIn.Value = 70m;
+            fileDetails.ShowModel(null);
 
             lblStatus.Text = "Cleared.";
         }
 
         // Slot 1 is always a single GLB or FBX picked via dialog, and always supplies the merged
         // output's geometry - so loading a new file here is exclusive, same as before.
-        private async Task PickModel1()
+        private async Task PickModel()
         {
             using var dlg = new OpenFileDialog { Filter = "3D Models|*.glb;*.fbx|GLB Files|*.glb|FBX Files|*.fbx" };
             if (dlg.ShowDialog() != DialogResult.OK) return;
@@ -277,7 +289,7 @@ namespace GlbMerger
 
                     path1 = null;
                     fbxAnims1 = renamed;
-                    panel1.UpdateTitle($"Model 1: {Path.GetFileName(dlg.FileName)} (FBX - animation only)");
+                    panel1.UpdateTitle($"Model: {Path.GetFileName(dlg.FileName)} (FBX - animation only)");
                     panel1.LoadFbxAnimations(renamed.Clips.Select(c => (c.Name, GlbMergeService.ComputeAnimationFrameCount(c))).ToList());
                 }
                 else
@@ -286,7 +298,7 @@ namespace GlbMerger
                     await Task.Run(() => { }); // keep the busy indicator visible for at least one yield
                     path1 = glbPath;
                     fbxAnims1 = null;
-                    panel1.UpdateTitle($"Model 1: {Path.GetFileName(dlg.FileName)}");
+                    panel1.UpdateTitle($"Model: {Path.GetFileName(dlg.FileName)}");
                     panel1.LoadModel(glbPath);
                     UpdateHeightBoxFromGlb(glbPath);
                 }
@@ -318,7 +330,7 @@ namespace GlbMerger
                 path2 = glbPath;
                 UpdateSlot2Title();
                 panel2.LoadMaterialsFromGlb(glbPath);
-                lblStatus.Text = $"Loaded {Path.GetFileName(glbPath)} into Model 2 materials";
+                lblStatus.Text = $"Loaded {Path.GetFileName(glbPath)} into Additional Models materials";
             }
             catch (Exception ex)
             {
@@ -354,7 +366,7 @@ namespace GlbMerger
 
                 UpdateSlot2Title();
                 panel2.AddSupplementalFbxAnimations(newlyAddedClips);
-                lblStatus.Text = $"Loaded {fbxPaths.Count} FBX file(s) into Model 2 animations";
+                lblStatus.Text = $"Loaded {fbxPaths.Count} FBX file(s) into Additional Models animations";
             }
             catch (Exception ex)
             {
@@ -374,8 +386,8 @@ namespace GlbMerger
             if (fbxAnimsList2.Count > 0) parts.Add($"{fbxAnimsList2.Count} FBX animation source(s)");
             if (libraryAnimsList2.Count > 0) parts.Add($"{libraryAnimsList2.Count} library animation source(s)");
             panel2.UpdateTitle(parts.Count > 0
-                ? "Model 2: " + string.Join(" + ", parts)
-                : "Model 2 - drop a GLB onto Materials, FBX file(s) onto Animations");
+                ? "Additional Models: " + string.Join(" + ", parts)
+                : "Additional Models - drop a GLB onto Materials, FBX file(s) onto Animations");
         }
 
         // Lets the user repoint the animation-library dropdown at a different folder (e.g. a
@@ -447,7 +459,7 @@ namespace GlbMerger
 
                 UpdateSlot2Title();
                 panel2.AddSupplementalFbxAnimations(displayInfo);
-                lblStatus.Text = $"Added {Path.GetFileName(glbPath)} to Model 2 animations";
+                lblStatus.Text = $"Added {Path.GetFileName(glbPath)} to Additional Models animations";
             }
             catch (Exception ex)
             {
@@ -506,17 +518,21 @@ namespace GlbMerger
 
         private void SetBusy(bool busy, string? statusText)
         {
-            btnFile1.Enabled = !busy;
+            btnLoadModel.Enabled = !busy;
             btnMerge.Enabled = !busy && CanMerge();
             // Loading a new file invalidates whatever was last processed, so Save/Edit shouldn't
             // offer up a stale result while busy - once done, they stay off until Process Merge
             // runs again.
-            if (busy) { btnSave.Enabled = false; btnSaveModel1.Enabled = false; btnEditModel.Enabled = false; btnSetHeight.Enabled = false; }
+            if (busy)
+            {
+                btnSave.Enabled = false; btnSaveModel.Enabled = false; btnEditModel.Enabled = false; btnSetHeight.Enabled = false;
+                if (latestMergedModel != null) fileDetails.ShowModel(null, "out of date - Process Merge");
+            }
             Cursor = busy ? Cursors.WaitCursor : Cursors.Default;
             if (statusText != null) lblStatus.Text = statusText;
         }
 
-        // Model 1 always supplies geometry, so it's the only thing strictly required to merge.
+        // The loaded model always supplies geometry, so it's the only thing strictly required to merge.
         private bool CanMerge() => path1 != null;
 
         // Fired by either panel's SettingsChanged whenever the user edits a per-item setting
@@ -530,13 +546,14 @@ namespace GlbMerger
             if (latestMergedModel == null) return;
 
             btnSave.Enabled = false;
-            btnSaveModel1.Enabled = false;
+            btnSaveModel.Enabled = false;
             btnEditModel.Enabled = false;
             btnSetHeight.Enabled = false;
+            fileDetails.ShowModel(null, "out of date - Process Merge");
             lblStatus.Text = "Settings changed since last merge - click Process Merge to update before saving.";
         }
 
-        // Builds the merge in memory, without asking where to save it - "Save..." handles that as
+        // Builds the merge in memory, without asking where to save it - "Save As..." handles that as
         // its own separate step, and the editor works off the same in-memory result.
         private void OnProcessMerge(object? sender, EventArgs e)
         {
@@ -600,9 +617,11 @@ namespace GlbMerger
                     loopFrameByName1: loopFrameAnims1, loopFrameByName2: loopFrameAnims2);
 
                 btnSave.Enabled = true;
-                btnSaveModel1.Enabled = true;
+                btnSaveModel.Enabled = true;
                 btnEditModel.Enabled = true;
                 btnSetHeight.Enabled = true;
+                cleanupDeclined = false;
+                fileDetails.ShowModel(latestMergedModel);
                 lblStatus.Text = "Merge processed - use Open Model Editor or Save.";
             }
             catch (Exception ex)
@@ -610,9 +629,10 @@ namespace GlbMerger
                 lblStatus.Text = "Error: " + ex.Message;
                 latestMergedModel = null;
                 btnSave.Enabled = false;
-                btnSaveModel1.Enabled = false;
+                btnSaveModel.Enabled = false;
                 btnEditModel.Enabled = false;
                 btnSetHeight.Enabled = false;
+                fileDetails.ShowModel(null);
                 MessageBox.Show(ex.ToString(), "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
@@ -655,6 +675,7 @@ namespace GlbMerger
                     node.LocalMatrix = node.LocalMatrix * Matrix4x4.CreateScale(factor);
                 }
 
+                fileDetails.ShowModel(latestMergedModel);
                 lblStatus.Text = $"Model rescaled to {numModelHeightIn.Value} in (x{factor:0.###}).";
             }
             catch (Exception ex)
@@ -741,7 +762,7 @@ namespace GlbMerger
             return any ? (max - min) : 0f;
         }
 
-        // Loads Model 1's freshly-picked GLB a second time (separately from panel1.LoadModel's
+        // Loads the freshly-picked model GLB a second time (separately from panel1.LoadModel's
         // own internal load, which doesn't expose the ModelRoot it reads) purely to measure its
         // rest-pose height and seed the box with it - so the field starts at "what this model
         // actually is" instead of always defaulting to 70". Best-effort: a measurement failure
@@ -774,32 +795,10 @@ namespace GlbMerger
 
             try
             {
-                var toSave = latestMergedModel;
-
-                // Optimizing rewrites indices only, so a model that has been through the geometry
-                // optimizer carries the vertices its triangles stopped referencing plus a dead index
-                // buffer per pass. Both are only reclaimable by rebuilding, which produces a new
-                // ModelRoot - fine here, because this saves a copy and leaves the session's model
-                // alone, but it's a real change to the file, so it's offered rather than assumed.
-                var estimate = GeometryOptimizer.EstimateCleanup(latestMergedModel);
-                if (estimate.HasWaste)
-                {
-                    var choice = MessageBox.Show(
-                        DescribeCleanup(estimate),
-                        "Clean up unused geometry?",
-                        MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
-
-                    if (choice == DialogResult.Cancel) return;
-                    if (choice == DialogResult.Yes)
-                    {
-                        var cleaned = BuildCleanedCopyChecked(latestMergedModel);
-                        if (cleaned == null) return;
-                        toSave = cleaned;
-                    }
-                }
+                if (!OfferCleanup(beforeSave: true)) return;
 
                 Cursor = Cursors.WaitCursor;
-                try { toSave.SaveGLB(dlg.FileName); }
+                try { latestMergedModel.SaveGLB(dlg.FileName); }
                 finally { Cursor = Cursors.Default; }
 
                 long written = new FileInfo(dlg.FileName).Length;
@@ -812,13 +811,13 @@ namespace GlbMerger
             }
         }
 
-        // Bakes the last processed merge back into Model 1's own file, then refreshes the session
-        // around that new file: clears everything, reloads the just-saved GLB into slot 1, and
+        // Save Model: bakes the last processed merge back into the loaded model's own file, then
+        // refreshes the session around that new file: clears everything, reloads the just-saved GLB, and
         // re-runs Process Merge - so a round of edits (Model Editor, height, etc.) becomes the new
         // starting point for the next round instead of something that has to be manually
         // saved-as/reloaded/reprocessed each time. Overwrites path1 on disk, so it's confirmed
         // first.
-        private async Task OnSaveModel1()
+        private async Task OnSaveModel()
         {
             if (latestMergedModel == null || path1 == null) return;
 
@@ -826,35 +825,17 @@ namespace GlbMerger
 
             var confirm = MessageBox.Show(
                 $"This will overwrite '{Path.GetFileName(targetPath)}' with the current processed result, "
-                + "then clear and reload it as Model 1 and re-run Process Merge.\n\nContinue?",
-                "Save Model 1",
+                + "then clear and reload it and re-run Process Merge.\n\nContinue?",
+                "Save Model",
                 MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
             if (confirm != DialogResult.Yes) return;
 
-            // Same offer as Save: without it, a flattened model would be written back carrying
-            // every byte of the original meshes and textures it replaced.
-            var toSave = latestMergedModel;
-            var estimate = GeometryOptimizer.EstimateCleanup(latestMergedModel);
-            if (estimate.HasWaste)
-            {
-                var choice = MessageBox.Show(
-                    DescribeCleanup(estimate),
-                    "Clean up unused geometry?",
-                    MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
-
-                if (choice == DialogResult.Cancel) return;
-                if (choice == DialogResult.Yes)
-                {
-                    var cleaned = BuildCleanedCopyChecked(latestMergedModel);
-                    if (cleaned == null) return;
-                    toSave = cleaned;
-                }
-            }
+            if (!OfferCleanup(beforeSave: true)) return;
 
             try
             {
                 Cursor = Cursors.WaitCursor;
-                try { toSave.SaveGLB(targetPath); }
+                try { latestMergedModel.SaveGLB(targetPath); }
                 finally { Cursor = Cursors.Default; }
             }
             catch (Exception ex)
@@ -872,7 +853,7 @@ namespace GlbMerger
                 await Task.Run(() => { });
                 path1 = targetPath;
                 fbxAnims1 = null;
-                panel1.UpdateTitle($"Model 1: {Path.GetFileName(targetPath)}");
+                panel1.UpdateTitle($"Model: {Path.GetFileName(targetPath)}");
                 panel1.LoadModel(targetPath);
                 UpdateHeightBoxFromGlb(targetPath);
             }
@@ -888,10 +869,49 @@ namespace GlbMerger
             }
 
             OnProcessMerge(this, EventArgs.Empty);
-            lblStatus.Text = $"Saved Model 1, reloaded, and reprocessed {Path.GetFileName(targetPath)}.";
+            lblStatus.Text = $"Saved, reloaded, and reprocessed {Path.GetFileName(targetPath)}.";
         }
 
-        private static string DescribeCleanup(GeometryOptimizer.CleanupEstimate estimate)
+        // Optimizing rewrites indices only, so a model that has been through the geometry optimizer
+        // carries the vertices its triangles stopped referencing plus a dead index buffer per pass,
+        // and Flatten Model leaves the meshes and textures it replaced. All of it is only
+        // reclaimable by rebuilding into a new ModelRoot, which is a real change to the model, so
+        // it's offered rather than assumed - when the editor closes (the only place any of it is
+        // made, and the first moment the reference can be swapped, since every editor mode shares
+        // the model while it's open), and again at Save only if it was never answered. Returns
+        // false when the user cancelled the save.
+        private bool OfferCleanup(bool beforeSave)
+        {
+            if (latestMergedModel == null || (beforeSave && cleanupDeclined)) return true;
+
+            var estimate = GeometryOptimizer.EstimateCleanup(latestMergedModel);
+            if (!estimate.HasWaste) return true;
+
+            var choice = MessageBox.Show(this,
+                DescribeCleanup(estimate, beforeSave),
+                "Clean up unused geometry?",
+                beforeSave ? MessageBoxButtons.YesNoCancel : MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+
+            if (choice == DialogResult.Cancel) return false;
+            if (choice == DialogResult.No)
+            {
+                cleanupDeclined = true;
+                return true;
+            }
+
+            var cleaned = BuildCleanedCopyChecked(latestMergedModel);
+            if (cleaned == null) return !beforeSave;
+            // The loss check can also choose to keep the model as it was.
+            cleanupDeclined = ReferenceEquals(cleaned, latestMergedModel);
+            if (cleanupDeclined) return true;
+            latestMergedModel = cleaned;
+            // The editor's close refreshes the details itself once this returns.
+            if (beforeSave) fileDetails.ShowModel(latestMergedModel);
+            lblStatus.Text = $"Cleaned up unused geometry (about {FormatBytes(estimate.ReclaimableBytes)}).";
+            return true;
+        }
+
+        private static string DescribeCleanup(GeometryOptimizer.CleanupEstimate estimate, bool beforeSave)
         {
             var lines = new List<string>();
 
@@ -913,16 +933,17 @@ namespace GlbMerger
 
             lines.Add("");
             lines.Add($"Cleaning up rebuilds the model and reclaims about {FormatBytes(estimate.ReclaimableBytes)}. "
-                + "It changes only what gets written to disk - the model open in this session is left as it is.");
+                + "What it removes is gone for the rest of this session too, the same as it would be from a saved file.");
             lines.Add("");
-            lines.Add("Clean up before saving?");
+            lines.Add(beforeSave ? "Clean up before saving?" : "Clean up now?");
 
             return string.Join(Environment.NewLine, lines);
         }
 
         // The rebuild re-emits the scene rather than editing it, so it is checked against the
         // original before anything is written - the BallAnchor/StiffArm markers are empty nodes and
-        // are the likeliest thing to be dropped. Returns null when the save should be abandoned.
+        // are the likeliest thing to be dropped. Returns null when the user cancelled: no cleanup,
+        // and no save.
         private ModelRoot? BuildCleanedCopyChecked(ModelRoot model)
         {
             ModelRoot cleaned;
@@ -936,7 +957,7 @@ namespace GlbMerger
             var proceed = MessageBox.Show(
                 "The rebuild did not carry everything across:" + Environment.NewLine + Environment.NewLine
                 + losses + Environment.NewLine + Environment.NewLine
-                + "Save the original model uncleaned instead? (No saves the cleaned model anyway.)",
+                + "Keep the original model uncleaned instead? (No uses the cleaned model anyway.)",
                 "Cleanup would lose data",
                 MessageBoxButtons.YesNoCancel, MessageBoxIcon.Warning);
 
@@ -948,11 +969,6 @@ namespace GlbMerger
             };
         }
 
-        private static string FormatBytes(long bytes) => bytes switch
-        {
-            >= 1L << 20 => $"{bytes / (double)(1L << 20):N1} MB",
-            >= 1L << 10 => $"{bytes / (double)(1L << 10):N1} KB",
-            _ => $"{bytes:N0} bytes",
-        };
+        private static string FormatBytes(long bytes) => FileDetailsPanel.FormatBytes(bytes);
     }
 }

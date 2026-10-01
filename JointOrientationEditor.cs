@@ -24,7 +24,7 @@ namespace GlbMerger
     // One of the four modes hosted by ModelEditorForm (see EditorMode there), which owns the
     // window chrome - the title, the sizing, and the single "Done" button shared by all four -
     // so this control only contributes its own left-hand controls and 3D preview.
-    public class JointOrientationEditor : UserControl
+    public class JointOrientationEditor : UserControl, IUnappliedChanges
     {
         private readonly ModelRoot _model;
 
@@ -62,6 +62,12 @@ namespace GlbMerger
         // values (not a quaternion) so re-selecting a bone can restore the sliders exactly,
         // rather than trying to decompose a quaternion back into Euler angles.
         private readonly Dictionary<string, (int X, int Y, int Z)> _pendingOffsets = new();
+
+        // Moved since the last Save. (The pending offsets stay after a save - they're what the
+        // sliders show - so they can't say whether anything is unsaved.)
+        private bool _unsaved;
+        public bool HasUnappliedChanges => _unsaved;
+        public string UnappliedChangesDescription => "joint adjustments";
 
         // Bone name -> not-yet-saved position offset in meters, one entry per axis - the
         // translation counterpart to _pendingOffsets above. Kept separate (rather than folded
@@ -1167,6 +1173,7 @@ namespace GlbMerger
         {
             if (_suppressSliderEvents) return;
             if (_boneDropdown.SelectedItem is not string boneName) return;
+            _unsaved = true;
 
             bool isStaticPose = _animDropdown.SelectedIndex <= 0;
             Animation? anim = isStaticPose ? null : _model.LogicalAnimations.First(a => a.Name == (string)_animDropdown.SelectedItem!);
@@ -1383,6 +1390,7 @@ namespace GlbMerger
             // animations swaps them for whatever that animation has saved (see OnAnimationSelected
             // / LoadOffsetsForSelectedAnimation), since a correction is only ever meaningful
             // relative to the one animation (or bind pose) it was computed against.
+            _unsaved = false;
             _lblStatus.Text = isStaticPose
                 ? "Saved to bind (static) pose."
                 : applyToAll

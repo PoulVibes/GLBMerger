@@ -33,14 +33,18 @@ namespace GlbMerger
     // WriteResultFile) so a slider change never has to re-save a 60 MB model.
     //
     // One of the modes hosted by ModelEditorForm (see EditorMode there).
-    public class ModelFlattenerEditor : UserControl
+    public class ModelFlattenerEditor : UserControl, IUnappliedChanges
     {
+        // Each setting's description, shown on hover (see HelpTips).
+        private readonly HelpTips _help;
+
         // Billboards whose triangles cover less than this much of their rectangle will need
         // transparency once textured.
         private const float TransparencyCoverage = 0.95f;
 
         private readonly ModelRoot _model;
         private readonly AppSettings _settings;
+        private readonly bool _darkMode;
 
         private WebView2 _webView = null!;
         private TrackBar _sliderStrength = null!, _sliderMinSize = null!, _sliderSideMinSize = null!, _sliderDetailBoost = null!, _sliderDetailStrength = null!, _sliderRecess = null!;
@@ -50,6 +54,8 @@ namespace GlbMerger
         private NumericUpDown _numBudget = null!;
         private Button _btnFitBudget = null!;
         private ComboBox _previewDropdown = null!, _cmbCurves = null!;
+        private ComboBox _cmbConfig = null!;
+        private Button _btnSaveConfig = null!, _btnDeleteConfig = null!;
         private Button _btnBake = null!, _btnApply = null!, _btnRevert = null!;
         private CheckBox _chkPaintDelete = null!;
         private Button _btnUndoStroke = null!, _btnRestoreDeleted = null!, _btnDeleteHighlighted = null!, _btnClearHighlight = null!;
@@ -57,6 +63,19 @@ namespace GlbMerger
         private List<int> _highlighted = new();
         private int _highlightTag;
         private Label _lblBake = null!;
+        // The status bar along the bottom: what's running (flattening, fitting the budget,
+        // baking) and how far it's got. Several can overlap (a slider moved mid-bake); the one
+        // started last is shown, and when it ends the bar goes back to the one before.
+        private StatusStrip _statusStrip = null!;
+        private ToolStripStatusLabel _progressLabel = null!;
+        private ToolStripProgressBar _progressBar = null!;
+        private sealed class Activity
+        {
+            public string Name = "";
+            public double Fraction;
+            public string Stage = "";
+        }
+        private readonly List<Activity> _activities = new();
         private PictureBox _picAtlas = null!;
         private readonly System.Windows.Forms.Timer _debounce = new() { Interval = 250 };
 
@@ -72,8 +91,9 @@ namespace GlbMerger
         // Billboards painted out in the preview, one list per brush stroke (for Undo). Kept as
         // where the billboard was rather than its index, so a deletion survives a recompute
         // with other settings: whatever billboard of the new result sits in the same place is
-        // deleted too.
-        private readonly record struct DeletedBillboard(Vector3 Normal, Vector3 Center, float Size);
+        // deleted too. Kind keeps a facade from being matched by the backdrop or detail layer
+        // stacked behind it, which faces the same way and is about the same size.
+        private readonly record struct DeletedBillboard(Vector3 Normal, Vector3 Center, float Size, int Kind);
         private readonly List<List<DeletedBillboard>> _deletedStrokes = new();
         private int _pushTag;
         private int _computeVersion;
@@ -88,7 +108,8 @@ namespace GlbMerger
         private BillboardBaker.BakeResult? _bake;
         private ModelFlattener.FlattenResult? _bakedFrom, _pendingBakeOf;
         private Task<bool>? _bakeTask;
-        private string? _bakePath;
+        private string? _bakePath, _bakeMapPath;
+        private int _bakeTag;   // _pushTag of the result the current bake was made from
         private int _bakeVersion;
 
         // Every mesh node's original mesh, taken on first Apply - Revert restores these. The
@@ -100,12 +121,17 @@ namespace GlbMerger
 
         public ModelFlattenerEditor(ModelRoot model, bool darkMode = false, AppSettings? settings = null)
         {
+            _help = new HelpTips(this);
             _model = model;
             _settings = settings ?? new AppSettings();
+            _darkMode = darkMode;
 
             Dock = DockStyle.Fill;
 
             BuildUi();
+            HoldWhileDragging(this);
+            TrackConfigurationEdits();
+            _uiReady = true;
 
             ThemeManager.Apply(this, darkMode);
             UpdateBackgroundButton();   // the theme repaints buttons; keep the colour swatch
@@ -117,7 +143,7 @@ namespace GlbMerger
             {
                 _lblStatus.Text = why;
                 _lblStatus.ForeColor = System.Drawing.Color.OrangeRed;
-                foreach (Control c in new Control[] { _sliderStrength, _sliderMinSize, _chkKeepLeftovers, _chkSideDetail, _cmbCurves, _sliderSideMinSize, _sliderDetailBoost, _sliderDetailStrength, _sliderRecess, _chkTrimCorners, _chkBakeNormals, _chkBakeMr, _numBudget, _btnFitBudget, _previewDropdown, _chkOutline, _chkHighlight, _chkPaintDelete, _btnBake, _btnApply })
+                foreach (Control c in new Control[] { _cmbConfig, _btnSaveConfig, _btnDeleteConfig, _sliderStrength, _sliderMinSize, _chkKeepLeftovers, _chkSideDetail, _cmbCurves, _sliderSideMinSize, _sliderDetailBoost, _sliderDetailStrength, _sliderRecess, _chkTrimCorners, _chkBakeNormals, _chkBakeMr, _numBudget, _btnFitBudget, _previewDropdown, _chkOutline, _chkHighlight, _chkPaintDelete, _btnBake, _btnApply })
                     c.Enabled = false;
                 return;
             }
@@ -158,9 +184,31 @@ namespace GlbMerger
                 Margin = new Padding(3, 0, 3, 8),
             });
 
-            flow.Controls.Add(HelpText(
+            _help.Add(flow, 
                 "Replaces the model with flat, textured billboards, for static models like buildings. " +
-                "Each billboard's texture is the model seen straight on from its front."));
+                "Each billboard's texture is the model seen straight on from its front.");
+
+            flow.Controls.Add(new Label { Text = "Configuration:", AutoSize = true, Margin = new Padding(3, 0, 3, 0) });
+            _cmbConfig = new ComboBox { Width = 330, DropDownStyle = ComboBoxStyle.DropDownList, Margin = new Padding(3, 0, 3, 4) };
+            _cmbConfig.SelectedIndexChanged += (s, e) => OnConfigurationSelected();
+            flow.Controls.Add(_cmbConfig);
+            var configButtons = new FlowLayoutPanel
+            {
+                FlowDirection = FlowDirection.LeftToRight, WrapContents = false,
+                AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Margin = new Padding(0, 0, 0, 4),
+            };
+            _btnSaveConfig = new Button { Text = "Save Configuration...", AutoSize = true, Margin = new Padding(3, 0, 6, 3) };
+            _btnSaveConfig.Click += (s, e) => SaveConfiguration();
+            _btnDeleteConfig = new Button { Text = "Delete", AutoSize = true, Margin = new Padding(0, 0, 3, 3) };
+            _btnDeleteConfig.Click += (s, e) => DeleteConfiguration();
+            configButtons.Controls.Add(_btnSaveConfig);
+            configButtons.Controls.Add(_btnDeleteConfig);
+            flow.Controls.Add(configButtons);
+
+            _help.Add(flow,
+                "Saved sets of every setting below. Picking one loads its settings; changing any " +
+                "setting afterwards switches this back to Custom Configuration. Save Configuration " +
+                "stores the current settings under a name (an existing name is replaced).");
 
             _lblStrength = new Label { AutoSize = true, Margin = new Padding(3, 0, 3, 0) };
             _sliderStrength = new TrackBar
@@ -178,9 +226,9 @@ namespace GlbMerger
             flow.Controls.Add(_lblStrength);
             flow.Controls.Add(_sliderStrength);
 
-            flow.Controls.Add(HelpText(
+            _help.Add(flow, 
                 "How far any point of the surface may move to land on its billboard. Low flattens " +
-                "brick grooves, medium flattens window wells, max flattens the whole model into a card."));
+                "brick grooves, medium flattens window wells, max flattens the whole model into a card.");
 
             var budgetRow = new FlowLayoutPanel
             {
@@ -201,9 +249,9 @@ namespace GlbMerger
             budgetRow.Controls.Add(_btnFitBudget);
             flow.Controls.Add(budgetRow);
 
-            flow.Controls.Add(HelpText(
+            _help.Add(flow, 
                 "Fit Strength finds the lowest Strength (most detail) whose result fits the budget, " +
-                "with every other setting as it is. Trimmed corners can add a few triangles on top."));
+                "with every other setting as it is. Trimmed corners can add a few triangles on top.");
 
             _lblMinSize = new Label { AutoSize = true, Margin = new Padding(3, 0, 3, 0) };
             _sliderMinSize = new TrackBar
@@ -235,9 +283,9 @@ namespace GlbMerger
             };
             flow.Controls.Add(_chkKeepLeftovers);
 
-            flow.Controls.Add(HelpText(
+            _help.Add(flow, 
                 "Surface patches smaller than this don't get a billboard of their own - awnings, " +
-                "AC units, curved or noisy bits. Kept, they stay as real triangles; dropped, they vanish."));
+                "AC units, curved or noisy bits. Kept, they stay as real triangles; dropped, they vanish.");
 
             _chkSideDetail = new CheckBox
             {
@@ -271,10 +319,10 @@ namespace GlbMerger
             flow.Controls.Add(_lblSideMinSize);
             flow.Controls.Add(_sliderSideMinSize);
 
-            flow.Controls.Add(HelpText(
+            _help.Add(flow, 
                 "Balcony side rails and stair stringers face sideways, so flattening them into the " +
                 "front billboard makes them vanish from any side view. With this on they get side-facing " +
-                "billboards of their own, down to this size."));
+                "billboards of their own, down to this size.");
 
             flow.Controls.Add(new Label { Text = "Curved walls (round bays, towers):", AutoSize = true, Margin = new Padding(3, 0, 3, 0) });
             _cmbCurves = new ComboBox { Width = 330, DropDownStyle = ComboBoxStyle.DropDownList, Margin = new Padding(3, 0, 3, 4) };
@@ -287,11 +335,11 @@ namespace GlbMerger
             };
             flow.Controls.Add(_cmbCurves);
 
-            flow.Controls.Add(HelpText(
+            _help.Add(flow, 
                 "Flat planes: cheapest, but bands and cornices round a curve break into chevrons from " +
                 "below. Curved billboards: one billboard bent round each curve, a few dozen triangles, " +
                 "reads as round. Keep as simplified mesh: closest to the original, but thousands of " +
-                "triangles per curve."));
+                "triangles per curve.");
 
             _lblDetailStrength = new Label { AutoSize = true, Margin = new Padding(3, 0, 3, 0) };
             _sliderDetailStrength = new TrackBar
@@ -309,10 +357,10 @@ namespace GlbMerger
             flow.Controls.Add(_lblDetailStrength);
             flow.Controls.Add(_sliderDetailStrength);
 
-            flow.Controls.Add(HelpText(
+            _help.Add(flow, 
                 "See-through structures (fire escapes, railings) are flattened with this share of the " +
                 "Strength instead, so a stair's front and wall-side stringers stay separate layers and " +
-                "still read as stairs from an angle. 100% = same as everything else."));
+                "still read as stairs from an angle. 100% = same as everything else.");
 
             _lblRecess = new Label { AutoSize = true, Margin = new Padding(3, 0, 3, 0) };
             _sliderRecess = new TrackBar
@@ -330,9 +378,9 @@ namespace GlbMerger
             flow.Controls.Add(_lblRecess);
             flow.Controls.Add(_sliderRecess);
 
-            flow.Controls.Add(HelpText(
+            _help.Add(flow, 
                 "Darkens what sat deeper than the surface around it (window glass, grooves), to keep " +
-                "a hint of the depth that flattening removed."));
+                "a hint of the depth that flattening removed.");
 
             _chkTrimCorners = new CheckBox
             {
@@ -348,9 +396,9 @@ namespace GlbMerger
             };
             flow.Controls.Add(_chkTrimCorners);
 
-            flow.Controls.Add(HelpText(
+            _help.Add(flow, 
                 "Cuts a billboard's empty corners off diagonally (a stepped roofline, a stair flight): " +
-                "one more triangle per corner, but less see-through area for the game to alpha-test."));
+                "one more triangle per corner, but less see-through area for the game to alpha-test.");
 
             _chkBakeNormals = new CheckBox
             {
@@ -366,10 +414,10 @@ namespace GlbMerger
             };
             flow.Controls.Add(_chkBakeNormals);
 
-            flow.Controls.Add(HelpText(
+            _help.Add(flow, 
                 "A second atlas with the original surface's normals (vertex normals plus the source " +
                 "normal map), so flattened grooves and ornament still shade. Written as the material's " +
-                "normal texture - the game doesn't read it yet."));
+                "normal texture - the game doesn't read it yet.");
 
             _chkBakeMr = new CheckBox
             {
@@ -385,10 +433,10 @@ namespace GlbMerger
             };
             flow.Controls.Add(_chkBakeMr);
 
-            flow.Controls.Add(HelpText(
+            _help.Add(flow, 
                 "A third atlas with the source's metallic/roughness texture, same layout. Without a " +
                 "source texture (or with this off) the source material's factors are used as constants. " +
-                "The game doesn't read it yet."));
+                "The game doesn't read it yet.");
 
             _lblDetailBoost = new Label { AutoSize = true, Margin = new Padding(3, 0, 3, 0) };
             _sliderDetailBoost = new TrackBar
@@ -406,10 +454,10 @@ namespace GlbMerger
             flow.Controls.Add(_lblDetailBoost);
             flow.Controls.Add(_sliderDetailBoost);
 
-            flow.Controls.Add(HelpText(
+            _help.Add(flow, 
                 "Extra texture resolution for small see-through billboards (rails, fire escapes), " +
                 "relative to the big walls - never beyond the source texture's own. The game caps " +
-                "textures at 2048, so this trades against the walls' resolution."));
+                "textures at 2048, so this trades against the walls' resolution.");
 
             flow.Controls.Add(new Label { Text = "Preview", AutoSize = true, Margin = new Padding(3, 4, 3, 4) });
 
@@ -453,10 +501,10 @@ namespace GlbMerger
             _chkHighlight.CheckedChanged += (s, e) => PushViewState();
             flow.Controls.Add(_chkHighlight);
 
-            flow.Controls.Add(HelpText(
+            _help.Add(flow, 
                 "Back faces show dark grey: billboards are one-sided, like the game draws them. " +
                 "Highlighted (orange) billboards cover less than 95% of their rectangle - " +
-                "the gaps become transparent once textured."));
+                "the gaps become transparent once textured.");
 
             _chkPaintDelete = new CheckBox
             {
@@ -494,6 +542,7 @@ namespace GlbMerger
             {
                 if (_deletedStrokes.Count == 0) return;
                 _deletedStrokes.RemoveAt(_deletedStrokes.Count - 1);
+                _changedSinceApply = true;
                 RefilterResult();
             };
             deleteRow.Controls.Add(_btnUndoStroke);
@@ -501,17 +550,18 @@ namespace GlbMerger
             _btnRestoreDeleted.Click += (s, e) =>
             {
                 _deletedStrokes.Clear();
+                _changedSinceApply = true;
                 RefilterResult();
             };
             deleteRow.Controls.Add(_btnRestoreDeleted);
             flow.Controls.Add(deleteRow);
 
-            flow.Controls.Add(HelpText(
+            _help.Add(flow, 
                 "Click a billboard in the preview to select it (red); click the same spot again to " +
                 "step to the next billboard behind it, round to the front again. Dragging still " +
                 "orbits. Delete Selected (or the Delete key in the preview) removes it and drops its " +
                 "triangles - works in every preview but Original. Deletions carry over when you " +
-                "change settings, onto whatever billboard lands in the same place."));
+                "change settings, onto whatever billboard lands in the same place.");
 
             _lblStats = new Label
             {
@@ -538,10 +588,10 @@ namespace GlbMerger
             _btnRevert.Click += (s, e) => Revert();
             flow.Controls.Add(_btnRevert);
 
-            flow.Controls.Add(HelpText(
+            _help.Add(flow, 
                 "Apply replaces every mesh in the model with the flattened one (one material, one " +
                 $"atlas of up to {BillboardBaker.MaxAtlasSize}x{BillboardBaker.MaxAtlasSize}). The original " +
-                "meshes and textures are dropped from the file when you save with cleanup."));
+                "meshes and textures are dropped from the file when you save with cleanup.");
 
             _lblBake = new Label
             {
@@ -573,6 +623,14 @@ namespace GlbMerger
             _webView = new WebView2 { Dock = DockStyle.Fill };
             Controls.Add(_webView);
             Controls.Add(controlPanel);
+
+            _progressLabel = new ToolStripStatusLabel { Text = "", Spring = true, TextAlign = System.Drawing.ContentAlignment.MiddleLeft };
+            _progressBar = new ToolStripProgressBar { Width = 260, Visible = false, Minimum = 0, Maximum = 1000, Style = ProgressBarStyle.Continuous };
+            _statusStrip = new StatusStrip { Dock = DockStyle.Bottom, SizingGrip = false };
+            _statusStrip.Items.Add(_progressLabel);
+            _statusStrip.Items.Add(_progressBar);
+            // Added after the two panes so it is docked before them and runs the full width.
+            Controls.Add(_statusStrip);
         }
 
         private static Button MakeButton(string text) => new Button
@@ -584,14 +642,6 @@ namespace GlbMerger
             Margin = new Padding(3, 3, 3, 3),
         };
 
-        private static Label HelpText(string text) => new Label
-        {
-            Text = text,
-            AutoSize = true,
-            MaximumSize = new System.Drawing.Size(340, 0),
-            Margin = new Padding(3, 0, 3, 12),
-            ForeColor = System.Drawing.Color.Gray,
-        };
 
         // --- settings --------------------------------------------------------------------------
 
@@ -629,11 +679,12 @@ namespace GlbMerger
 
         // The input for the current curve setting. The simplified-mesh one reads the model, so
         // it's built here on the UI thread, once.
-        private ModelFlattener.FlattenInput CurrentInput()
+        private ModelFlattener.FlattenInput CurrentInput(Activity? activity = null)
         {
             if (CurveHandling != ModelFlattener.CurveHandling.KeepAsMesh) return _input!;
             if (_curveMeshInput == null)
             {
+                if (activity != null) ShowStage(activity, 0, "Simplifying curved walls");
                 Cursor = Cursors.WaitCursor;
                 try { _curveMeshInput = ModelFlattener.PrepareInput(_model, _input!, ModelFlattener.CurveHandling.KeepAsMesh); }
                 finally { Cursor = Cursors.Default; }
@@ -662,11 +713,200 @@ namespace GlbMerger
 
         // --- computing -------------------------------------------------------------------------
 
+        // Settings changed or billboards deleted since the editor opened or the last Apply /
+        // Revert. Only once it's up: building the panel sets every control from the saved settings.
+        private bool _changedSinceApply, _uiReady;
+        public bool HasUnappliedChanges => _changedSinceApply;
+        public string UnappliedChangesDescription => "flatten settings or deleted billboards not yet applied";
+
         private void ScheduleCompute()
         {
+            if (_uiReady) _changedSinceApply = true;
             if (_input == null) return;
             _debounce.Stop();
+            // While a slider is being dragged only its label follows; the flatten waits for the
+            // release (HoldWhileDragging) rather than starting over at every step of the drag.
+            if (_draggingSlider) { _computeOnRelease = true; return; }
             _debounce.Start();
+        }
+
+        private const string CustomConfiguration = "Custom Configuration";
+        private bool _applyingConfiguration, _listingConfigurations;
+
+        // Fills the Configuration dropdown: Custom first, then the saved ones by name, with the
+        // one the settings match selected. checkMatch (on opening) drops the remembered name if
+        // the settings no longer match it.
+        private void RefreshConfigurations(bool checkMatch = false)
+        {
+            var saved = _settings.FlattenConfigurations;
+            var current = saved.Find(c => c.Name == _settings.FlattenConfigurationName);
+            if (checkMatch && current != null && !current.SameSettingsAs(CaptureConfiguration(current.Name)))
+                current = null;
+            _settings.FlattenConfigurationName = current?.Name;
+
+            _listingConfigurations = true;
+            try
+            {
+                _cmbConfig.Items.Clear();
+                _cmbConfig.Items.Add(CustomConfiguration);
+                foreach (var c in saved) _cmbConfig.Items.Add(c.Name);
+                _cmbConfig.SelectedIndex = current == null ? 0 : saved.IndexOf(current) + 1;
+            }
+            finally { _listingConfigurations = false; }
+            _btnDeleteConfig.Enabled = current != null;
+        }
+
+        private void OnConfigurationSelected()
+        {
+            if (_listingConfigurations) return;
+            int i = _cmbConfig.SelectedIndex;
+            _btnDeleteConfig.Enabled = i > 0;
+            // Custom keeps whatever the settings are now.
+            if (i <= 0) { _settings.FlattenConfigurationName = null; return; }
+
+            var config = _settings.FlattenConfigurations[i - 1];
+            ApplyConfiguration(config);
+            _settings.FlattenConfigurationName = config.Name;
+        }
+
+        private FlattenConfiguration CaptureConfiguration(string name) => new()
+        {
+            Name = name,
+            Strength = _sliderStrength.Value,
+            TriangleBudget = (int)_numBudget.Value,
+            MinSize = _sliderMinSize.Value,
+            KeepLeftovers = _chkKeepLeftovers.Checked,
+            SideDetail = _chkSideDetail.Checked,
+            SideMinSize = _sliderSideMinSize.Value,
+            Curves = _cmbCurves.SelectedIndex,
+            DetailStrength = _sliderDetailStrength.Value,
+            RecessDarkening = _sliderRecess.Value,
+            TrimCorners = _chkTrimCorners.Checked,
+            BakeNormals = _chkBakeNormals.Checked,
+            BakeMetallicRoughness = _chkBakeMr.Checked,
+            DetailBoost = _sliderDetailBoost.Value,
+        };
+
+        // Sets every control, whose own handlers then update the saved settings and recompute
+        // exactly as if each had been changed by hand - just without dropping back to Custom.
+        private void ApplyConfiguration(FlattenConfiguration c)
+        {
+            static int Clamp(int v, TrackBar t) => Math.Clamp(v, t.Minimum, t.Maximum);
+            _applyingConfiguration = true;
+            try
+            {
+                _sliderStrength.Value = Clamp(c.Strength, _sliderStrength);
+                _numBudget.Value = Math.Clamp(c.TriangleBudget, _numBudget.Minimum, _numBudget.Maximum);
+                _sliderMinSize.Value = Clamp(c.MinSize, _sliderMinSize);
+                _chkKeepLeftovers.Checked = c.KeepLeftovers;
+                _chkSideDetail.Checked = c.SideDetail;
+                _sliderSideMinSize.Value = Clamp(c.SideMinSize, _sliderSideMinSize);
+                _cmbCurves.SelectedIndex = Math.Clamp(c.Curves, 0, _cmbCurves.Items.Count - 1);
+                _sliderDetailStrength.Value = Clamp(c.DetailStrength, _sliderDetailStrength);
+                _sliderRecess.Value = Clamp(c.RecessDarkening, _sliderRecess);
+                _chkTrimCorners.Checked = c.TrimCorners;
+                _chkBakeNormals.Checked = c.BakeNormals;
+                _chkBakeMr.Checked = c.BakeMetallicRoughness;
+                _sliderDetailBoost.Value = Clamp(c.DetailBoost, _sliderDetailBoost);
+            }
+            finally { _applyingConfiguration = false; }
+        }
+
+        // Fills the dropdown once every setting exists, then drops back to Custom whenever one is
+        // changed by hand (or by Fit Strength) and so no longer matches the saved configuration.
+        private void TrackConfigurationEdits()
+        {
+            RefreshConfigurations(checkMatch: true);
+
+            void Edited(object? s, EventArgs e)
+            {
+                if (_applyingConfiguration || _listingConfigurations || _cmbConfig.SelectedIndex <= 0) return;
+                _listingConfigurations = true;
+                try { _cmbConfig.SelectedIndex = 0; }
+                finally { _listingConfigurations = false; }
+                _settings.FlattenConfigurationName = null;
+                _btnDeleteConfig.Enabled = false;
+            }
+
+            foreach (var t in new[] { _sliderStrength, _sliderMinSize, _sliderSideMinSize, _sliderDetailStrength, _sliderRecess, _sliderDetailBoost })
+                t.ValueChanged += Edited;
+            foreach (var c in new[] { _chkKeepLeftovers, _chkSideDetail, _chkTrimCorners, _chkBakeNormals, _chkBakeMr })
+                c.CheckedChanged += Edited;
+            _cmbCurves.SelectedIndexChanged += Edited;
+            _numBudget.ValueChanged += Edited;
+        }
+
+        private void SaveConfiguration()
+        {
+            string initial = _settings.FlattenConfigurationName ?? "";
+            string? name = NamePrompt.Show(this, "Save Configuration", "Name for the current flatten settings:", initial, _darkMode);
+            if (name == null) return;
+            if (string.Equals(name, CustomConfiguration, StringComparison.OrdinalIgnoreCase))
+            {
+                MessageBox.Show(this, $"\"{CustomConfiguration}\" is reserved for unsaved settings - choose another name.",
+                    "Save Configuration", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            // Re-saving the selected configuration updates it without asking; any other existing
+            // name is confirmed first.
+            var saved = _settings.FlattenConfigurations;
+            int existing = saved.FindIndex(c => string.Equals(c.Name, name, StringComparison.OrdinalIgnoreCase));
+            if (existing >= 0 && saved[existing].Name != _settings.FlattenConfigurationName
+                && MessageBox.Show(this, $"A configuration called \"{saved[existing].Name}\" already exists. Replace it?",
+                    "Save Configuration", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
+                return;
+
+            if (existing >= 0) saved.RemoveAt(existing);
+            saved.Add(CaptureConfiguration(name));
+            saved.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.CurrentCultureIgnoreCase));
+            _settings.FlattenConfigurationName = name;
+            _settings.Save();
+            RefreshConfigurations();
+        }
+
+        private void DeleteConfiguration()
+        {
+            var current = _settings.FlattenConfigurations.Find(c => c.Name == _settings.FlattenConfigurationName);
+            if (current == null) return;
+            if (MessageBox.Show(this, $"Delete the saved configuration \"{current.Name}\"? The current settings stay as they are.",
+                    "Delete Configuration", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
+                return;
+
+            _settings.FlattenConfigurations.Remove(current);
+            _settings.FlattenConfigurationName = null;
+            _settings.Save();
+            RefreshConfigurations();
+        }
+
+        private bool _draggingSlider, _computeOnRelease;
+
+        // Every slider in the panel: mouse down on it holds recomputing until the button comes up
+        // again. Keyboard and mouse-wheel steps aren't drags and recompute as they always did.
+        private void HoldWhileDragging(Control root)
+        {
+            foreach (Control c in root.Controls)
+            {
+                if (c is TrackBar slider)
+                {
+                    slider.MouseDown += (s, e) => { if (e.Button == MouseButtons.Left) _draggingSlider = true; };
+                    slider.MouseUp += (s, e) => ReleaseSlider();
+                    // Released somewhere the slider doesn't hear about (focus stolen mid-drag).
+                    slider.MouseCaptureChanged += (s, e) => { if (Control.MouseButtons == MouseButtons.None) ReleaseSlider(); };
+                }
+                HoldWhileDragging(c);
+            }
+        }
+
+        private void ReleaseSlider()
+        {
+            if (!_draggingSlider) return;
+            _draggingSlider = false;
+            if (_computeOnRelease)
+            {
+                _computeOnRelease = false;
+                ScheduleCompute();
+            }
         }
 
         private async void RunCompute()
@@ -676,16 +916,17 @@ namespace GlbMerger
             _cts?.Cancel();
             var cts = _cts = new CancellationTokenSource();
             int version = ++_computeVersion;
-            var input = CurrentInput();
-            var settings = CurrentSettings();
-
-            _lblStatus.Text = "Computing billboards...";
-            var sw = Stopwatch.StartNew();
-
+            var activity = BeginActivity("Flattening");
             ModelFlattener.FlattenResult result;
+            ModelFlattener.FlattenInput input;
+            var sw = Stopwatch.StartNew();
             try
             {
-                result = await Task.Run(() => ModelFlattener.Compute(input, settings, cts.Token), cts.Token);
+                input = CurrentInput(activity);
+                var settings = CurrentSettings();
+                _lblStatus.Text = "Computing billboards...";
+                var progress = ProgressFor(activity);
+                result = await Task.Run(() => ModelFlattener.Compute(input, settings, cts.Token, progress), cts.Token);
             }
             catch (OperationCanceledException) { return; }
             catch (Exception ex)
@@ -693,6 +934,7 @@ namespace GlbMerger
                 if (!IsDisposed && version == _computeVersion) _lblStatus.Text = "Flatten failed: " + ex.Message;
                 return;
             }
+            finally { EndActivity(activity); }
             if (IsDisposed || version != _computeVersion) return;
 
             _rawResult = result;
@@ -710,24 +952,26 @@ namespace GlbMerger
         {
             var c0 = bb.Corner(0);
             var c2 = bb.Corner(2);
-            return new DeletedBillboard(bb.Normal, (c0 + bb.Corner(1) + c2 + bb.Corner(3)) / 4f, Vector3.Distance(c0, c2));
+            int kind = (bb.Backdrop ? 1 : 0) | (bb.Part ? 2 : 0) | (bb.Side ? 4 : 0) | (bb.Detail ? 8 : 0)
+                | (bb.Recessed ? 16 : 0) | (bb.Curve != null ? 32 : 0);
+            return new DeletedBillboard(bb.Normal, (c0 + bb.Corner(1) + c2 + bb.Corner(3)) / 4f, Vector3.Distance(c0, c2), kind);
         }
 
-        // The same billboard, or near enough: facing the same way, about the same size, and
-        // centred within a fifth of its size of where the deleted one was - close enough to
-        // follow a billboard through a settings change, not so loose it takes the next window
-        // along with it.
-        private static bool IsDeleted(ModelFlattener.Billboard bb, IEnumerable<DeletedBillboard> deleted, float slack)
+        // How far this billboard is from being the deleted one, or null if it can't be: the same
+        // kind, facing the same way, about the same size, and centred within a fifth of its size
+        // of where the deleted one was - close enough to follow a billboard through a settings
+        // change. Distance along the normal counts double, since parallel layers
+        // (a facade and the backdrop behind it) differ mostly in depth.
+        private static float? MatchDistance(DeletedBillboard d, DeletedBillboard mark, float slack)
         {
-            var mark = Mark(bb);
-            foreach (var d in deleted)
-            {
-                if (Vector3.Dot(d.Normal, mark.Normal) < 0.95f) continue;
-                float big = MathF.Max(d.Size, mark.Size), small = MathF.Min(d.Size, mark.Size);
-                if (small < big * 0.5f) continue;
-                if (Vector3.Distance(d.Center, mark.Center) <= big * 0.2f + slack) return true;
-            }
-            return false;
+            if (d.Kind != mark.Kind || Vector3.Dot(d.Normal, mark.Normal) < 0.95f) return null;
+            float big = MathF.Max(d.Size, mark.Size), small = MathF.Min(d.Size, mark.Size);
+            if (small < big * 0.5f) return null;
+            var delta = mark.Center - d.Center;
+            float depth = MathF.Abs(Vector3.Dot(delta, d.Normal));
+            float across = (delta - d.Normal * Vector3.Dot(delta, d.Normal)).Length();
+            float distance = across + 2f * depth;
+            return distance <= big * 0.2f + slack ? distance : null;
         }
 
         private int DeletedCount => (_rawResult?.Billboards.Count ?? 0) - (_result?.Billboards.Count ?? 0);
@@ -738,9 +982,18 @@ namespace GlbMerger
         private static ModelFlattener.FlattenResult WithoutDeleted(ModelFlattener.FlattenResult raw, List<DeletedBillboard> deleted, float slack)
         {
             if (deleted.Count == 0) return raw;
+            // Each deletion takes exactly one billboard - its closest match - and each billboard
+            // answers to one deletion, so deleting one billboard can never take its neighbours.
+            var marks = raw.Billboards.Select(Mark).ToList();
+            var pairs = new List<(float Distance, int Deleted, int Billboard)>();
+            for (int d = 0; d < deleted.Count; d++)
+                for (int i = 0; i < marks.Count; i++)
+                    if (MatchDistance(deleted[d], marks[i], slack) is float distance) pairs.Add((distance, d, i));
+
             var remove = new HashSet<int>();
-            for (int i = 0; i < raw.Billboards.Count; i++)
-                if (IsDeleted(raw.Billboards[i], deleted, slack)) remove.Add(i);
+            var used = new HashSet<int>();
+            foreach (var (_, d, i) in pairs.OrderBy(p => p.Distance))
+                if (!used.Contains(d) && !remove.Contains(i)) { used.Add(d); remove.Add(i); }
             return raw.Without(remove);
         }
 
@@ -763,6 +1016,7 @@ namespace GlbMerger
                 .Distinct().Select(i => Mark(_result.Billboards[i])).ToList();
             if (stroke.Count == 0) return;
             _deletedStrokes.Add(stroke);
+            _changedSinceApply = true;
             RefilterResult();
         }
 
@@ -791,7 +1045,9 @@ namespace GlbMerger
         {
             if (_input == null) return;
             int budget = (int)_numBudget.Value;
-            var input = CurrentInput();
+            var activity = BeginActivity("Fitting Strength to the budget");
+            var input = CurrentInput(activity);
+            var progress = ProgressFor(activity);
             var settingsAt = Enumerable.Range(0, 1001).Select(SettingsAt).ToArray();
             var deleted = _deletedStrokes.SelectMany(s => s).ToList();
             float slack = _input.Extent * 1e-3f;
@@ -802,7 +1058,16 @@ namespace GlbMerger
             {
                 var (strength, triangles) = await Task.Run(() =>
                 {
-                    int Count(int v) => WithoutDeleted(ModelFlattener.Compute(input, settingsAt[v], CancellationToken.None), deleted, slack).OutputTriangles;
+                    // A binary search over 0..1000: the first try plus at most 10 halvings. Each
+                    // flatten gets its own slice of the bar.
+                    const int Tries = 11;
+                    int tried = 0;
+                    int Count(int v)
+                    {
+                        int k = tried++;
+                        var slice = new SliceProgress(progress, (double)k / Tries, (double)(k + 1) / Tries, $"try {k + 1} of up to {Tries} (Strength {v / 10.0:0.#}%)");
+                        return WithoutDeleted(ModelFlattener.Compute(input, settingsAt[v], CancellationToken.None, slice), deleted, slack).OutputTriangles;
+                    }
                     int atMax = Count(1000);
                     if (atMax > budget) return (-1, atMax);
                     int lo = 0, hi = 1000, best = atMax;
@@ -827,6 +1092,7 @@ namespace GlbMerger
             }
             finally
             {
+                EndActivity(activity);
                 if (!IsDisposed) _btnFitBudget.Enabled = true;
             }
         }
@@ -863,6 +1129,8 @@ namespace GlbMerger
             _lblBake.Text = "Baking textures...";
             UpdateButtons();
             var sw = Stopwatch.StartNew();
+            var activity = BeginActivity("Baking textures");
+            var progress = ProgressFor(activity);
 
             try
             {
@@ -870,27 +1138,35 @@ namespace GlbMerger
                 // this is the only read of it the bake needs.
                 if (_bakeSource == null || !ReferenceEquals(_bakeSourceFor, input))
                 {
+                    ShowStage(activity, 0, "Reading the source textures");
                     Cursor = Cursors.WaitCursor;
                     try { _bakeSource = BillboardBaker.ExtractSource(_model, input); _bakeSourceFor = input; }
                     finally { Cursor = Cursors.Default; }
                 }
                 var source = _bakeSource;
                 string path = Path.Combine(Path.GetTempPath(), $"glbmerger_flatten_bake_{_sessionTag}_{version}.glb");
+                string mapPath = Path.Combine(Path.GetTempPath(), $"glbmerger_flatten_bakemap_{_sessionTag}_{version}.bin");
                 var bake = await Task.Run(() =>
                 {
-                    var b = BillboardBaker.Bake(input, flat, source, bakeSettings, CancellationToken.None);
+                    var b = BillboardBaker.Bake(input, flat, source, bakeSettings, CancellationToken.None, progress);
+                    progress.Report(new ModelFlattener.StageProgress(BillboardBaker.PngDone, "Writing the preview"));
                     BillboardBaker.SavePreview(b, path);
+                    WriteBakeMap(b, mapPath);
                     return b;
                 });
                 if (IsDisposed) return false;
                 if (version != _bakeVersion || !ReferenceEquals(flat, _result))
                 {
                     TryDelete(path);
+                    TryDelete(mapPath);
                     return false;
                 }
 
                 TryDelete(_bakePath);
+                TryDelete(_bakeMapPath);
                 _bakePath = path;
+                _bakeMapPath = mapPath;
+                _bakeTag = _pushTag;
                 _bake = bake;
                 _bakedFrom = flat;
                 ShowBake(bake, sw.Elapsed);
@@ -904,9 +1180,72 @@ namespace GlbMerger
             }
             finally
             {
+                EndActivity(activity);
                 if (version == _bakeVersion) { _bakeTask = null; _pendingBakeOf = null; }
                 if (!IsDisposed) UpdateButtons();
             }
+        }
+
+        // --- status bar ---------------------------------------------------------------------------
+
+        private Activity BeginActivity(string name)
+        {
+            var a = new Activity { Name = name };
+            _activities.Add(a);
+            ShowActivity();
+            return a;
+        }
+
+        private void EndActivity(Activity a)
+        {
+            _activities.Remove(a);
+            if (!IsDisposed) ShowActivity();
+        }
+
+        // Posts back to the UI thread (made there). Ignored once the activity has ended - its last
+        // posts can land after that - and never backwards: reports from parallel work can arrive
+        // a step out of order.
+        private IProgress<ModelFlattener.StageProgress> ProgressFor(Activity a) =>
+            new Progress<ModelFlattener.StageProgress>(p =>
+            {
+                if (IsDisposed || !_activities.Contains(a) || p.Fraction < a.Fraction) return;
+                a.Fraction = p.Fraction;
+                a.Stage = p.Stage;
+                ShowActivity();
+            });
+
+        // For work done right here on the UI thread: shown straight away, since nothing repaints
+        // until it's finished.
+        private void ShowStage(Activity a, double fraction, string stage)
+        {
+            a.Fraction = fraction;
+            a.Stage = stage;
+            ShowActivity();
+            _statusStrip.Refresh();
+        }
+
+        private void ShowActivity()
+        {
+            if (_activities.Count == 0)
+            {
+                _progressBar.Visible = false;
+                _progressLabel.Text = "";
+                return;
+            }
+            var a = _activities[^1];
+            _progressBar.Visible = true;
+            _progressBar.Value = Math.Clamp((int)(a.Fraction * 1000), 0, 1000);
+            _progressLabel.Text = a.Stage.Length > 0
+                ? $"{a.Name}: {a.Stage}... {a.Fraction * 100:0}%"
+                : $"{a.Name}...";
+        }
+
+        // One run's progress mapped into a slice of a longer job's bar (the budget search's tries).
+        private sealed class SliceProgress(IProgress<ModelFlattener.StageProgress> outer, double from, double to, string label)
+            : IProgress<ModelFlattener.StageProgress>
+        {
+            public void Report(ModelFlattener.StageProgress p) =>
+                outer.Report(new ModelFlattener.StageProgress(from + (to - from) * p.Fraction, $"{label} - {p.Stage}"));
         }
 
         private void ShowBake(BillboardBaker.BakeResult bake, TimeSpan elapsed)
@@ -963,6 +1302,7 @@ namespace GlbMerger
             host.Mesh = mesh;
 
             _btnRevert.Enabled = true;
+            _changedSinceApply = false;
             _lblStatus.Text = $"Applied: the model is now {_bake.TriangleCount:N0} triangles. " +
                 "Save with cleanup to drop the original meshes and textures from the file.";
         }
@@ -973,6 +1313,7 @@ namespace GlbMerger
             RestoreOriginalMeshes();
             _originalMeshes = null;
             _btnRevert.Enabled = false;
+            _changedSinceApply = false;
             _lblStatus.Text = "Flatten reverted - the original meshes are back.";
         }
 
@@ -1075,6 +1416,7 @@ namespace GlbMerger
                 TryDelete(_resultPath);
                 TryDelete(_originalPath);
                 TryDelete(_bakePath);
+                TryDelete(_bakeMapPath);
                 _picAtlas.Image?.Dispose();
             }
             base.Dispose(disposing);
@@ -1099,9 +1441,23 @@ namespace GlbMerger
 
         private void PushBaked()
         {
-            if (!_viewerReady || _bakePath == null || _webView.CoreWebView2 == null) return;
+            if (!_viewerReady || _bakePath == null || _bakeMapPath == null || _webView.CoreWebView2 == null) return;
             _ = _webView.CoreWebView2.ExecuteScriptAsync(
-                $"loadBaked('https://appassets.local/{EscapeJs(Path.GetFileName(_bakePath))}');");
+                $"loadBaked('https://appassets.local/{EscapeJs(Path.GetFileName(_bakePath))}', " +
+                $"'https://appassets.local/{EscapeJs(Path.GetFileName(_bakeMapPath))}', {_bakeTag});");
+        }
+
+        // Which billboard each baked triangle belongs to, with its positions and atlas UVs, so the
+        // preview can paint a selected billboard's visible texture - what deleting it removes.
+        // Layout: count, then per triangle its billboard (-1 = kept mesh), then 9 position floats
+        // per triangle, then 6 UV floats per triangle.
+        private static void WriteBakeMap(BillboardBaker.BakeResult bake, string path)
+        {
+            using var w = new BinaryWriter(new FileStream(path, FileMode.Create, FileAccess.Write));
+            w.Write(bake.TriangleCount);
+            for (int t = 0; t < bake.TriangleCount; t++) w.Write(bake.TriangleBillboard[t]);
+            foreach (var p in bake.Positions) { w.Write(p.X); w.Write(p.Y); w.Write(p.Z); }
+            foreach (var uv in bake.Uvs) { w.Write(uv.X); w.Write(uv.Y); }
         }
 
         private static readonly System.Drawing.Color DefaultBackground = System.Drawing.Color.FromArgb(0x1A, 0x1C, 0x1E);
@@ -1428,6 +1784,8 @@ namespace GlbMerger
                             var recolor = h !== highlight;
                             mode = m; outline = o; highlight = h; alphaThreshold = threshold;
                             if (recolor && assignment) { updateSourceColors(); buildBillboards(); }
+                            // The pink comes from the bake only in the baked preview.
+                            if (pending.size > 0) rebuildPending();
                             applyVisibility();
                         };
 
@@ -1451,7 +1809,17 @@ namespace GlbMerger
 
                         // The baked result is drawn the way the game will draw it: one-sided and
                         // alpha-tested - GLTFLoader sets both from the file's own material.
-                        window.loadBaked = function (url) {
+                        window.loadBaked = function (url, mapUrl, tag) {
+                            fetch(mapUrl).then(function (r) { return r.arrayBuffer(); }).then(function (buf) {
+                                var n = new Int32Array(buf, 0, 1)[0];
+                                bakeMap = {
+                                    tag: tag,
+                                    billboard: new Int32Array(buf, 4, n),
+                                    positions: new Float32Array(buf, 4 + n * 4, n * 9),
+                                    uvs: new Float32Array(buf, 4 + n * 40, n * 6),
+                                };
+                                rebuildPending();
+                            }).catch(function () { bakeMap = null; });
                             new THREE.GLTFLoader().load(url, function (gltf) {
                                 if (bakedRoot) {
                                     scene.remove(bakedRoot);
@@ -1461,7 +1829,12 @@ namespace GlbMerger
                                     });
                                 }
                                 bakedRoot = gltf.scene;
+                                bakedAtlas = null;
+                                bakedRoot.traverse(function (obj) {
+                                    if (!bakedAtlas && obj.isMesh && obj.material && obj.material.map) bakedAtlas = obj.material.map;
+                                });
                                 scene.add(bakedRoot);
+                                rebuildPending();
                                 applyVisibility();
                             }, undefined, function (error) {
                                 showError('Failed to load baked result: ' + (error && error.message ? error.message : error));
@@ -1496,7 +1869,10 @@ namespace GlbMerger
 
                         // --- selecting billboards to delete --------------------------------------
                         // A click (press and release without dragging, so orbiting still works)
-                        // selects the nearest billboard under the cursor, drawn red. Billboards
+                        // selects the nearest billboard under the cursor: its whole quad drawn red,
+                        // and what of it is actually visible - the texture the delete takes away -
+                        // neon pink. Both show through whatever is in front, so a billboard picked
+                        // from behind the front ones is still plain to see. Billboards
                         // stack - a facade, the window layer behind it, a backdrop behind them all -
                         // so clicking the same spot again steps to the next billboard along the
                         // ray, and round to the front again after the last. The selection goes to
@@ -1507,8 +1883,20 @@ namespace GlbMerger
                         var resultTag = 0, pending = new Set(), pendingMesh = null;
                         var raycaster = new THREE.Raycaster();
                         var pendingMaterial = new THREE.MeshBasicMaterial({
-                            color: 0xff3030, transparent: true, opacity: 0.7, side: THREE.DoubleSide,
-                            depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2,
+                            color: 0xff3030, transparent: true, opacity: 0.45, side: THREE.DoubleSide,
+                            depthTest: false, depthWrite: false,
+                        });
+                        var bakeMap = null, bakedAtlas = null, pendingTexMesh = null;
+                        // The baked atlas's own alpha cut-out, in solid pink.
+                        var pendingTexMaterial = new THREE.ShaderMaterial({
+                            uniforms: { map: { value: null } },
+                            vertexShader: 'varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+                            fragmentShader: 'uniform sampler2D map; varying vec2 vUv; void main() { if (texture2D(map, vUv).a < 0.5) discard; gl_FragColor = vec4(1.0, 0.063, 0.941, 0.9); }',
+                            transparent: true, side: THREE.DoubleSide, depthTest: false, depthWrite: false,
+                        });
+                        var pendingSrcMaterial = new THREE.MeshBasicMaterial({
+                            color: 0xff10f0, transparent: true, opacity: 0.9, side: THREE.DoubleSide,
+                            depthTest: false, depthWrite: false,
                         });
 
                         window.setPaintState = function (enabled) {
@@ -1534,8 +1922,11 @@ namespace GlbMerger
 
                         function rebuildPending() {
                             disposeObject(pendingMesh);
-                            pendingMesh = null;
+                            disposeObject(pendingTexMesh);
+                            pendingMesh = pendingTexMesh = null;
                             if (pending.size === 0) return;
+                            pendingTexMesh = buildPendingTexture();
+                            if (pendingTexMesh) { pendingTexMesh.renderOrder = 11; scene.add(pendingTexMesh); }
                             var pos = new Float32Array(pending.size * 18), w = 0;
                             var order = [0, 1, 2, 0, 2, 3];
                             pending.forEach(function (q) {
@@ -1547,6 +1938,35 @@ namespace GlbMerger
                             pendingMesh = new THREE.Mesh(geo, pendingMaterial);
                             pendingMesh.renderOrder = 10;
                             scene.add(pendingMesh);
+                        }
+
+                        // The selected billboards' visible texture. From the bake when it was made
+                        // from this result (the indices match); otherwise the source triangles the
+                        // billboards were made from, which is what their texture will show.
+                        function buildPendingTexture() {
+                            var geo = new THREE.BufferGeometry();
+                            if (mode === 'baked' && bakeMap && bakedAtlas && bakeMap.tag === resultTag) {
+                                var tris = [];
+                                for (var t = 0; t < bakeMap.billboard.length; t++) if (pending.has(bakeMap.billboard[t])) tris.push(t);
+                                if (tris.length === 0) return null;
+                                var pos = new Float32Array(tris.length * 9), uv = new Float32Array(tris.length * 6);
+                                tris.forEach(function (t, k) {
+                                    pos.set(bakeMap.positions.subarray(t * 9, t * 9 + 9), k * 9);
+                                    uv.set(bakeMap.uvs.subarray(t * 6, t * 6 + 6), k * 6);
+                                });
+                                geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+                                geo.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+                                pendingTexMaterial.uniforms.map.value = bakedAtlas;
+                                return new THREE.Mesh(geo, pendingTexMaterial);
+                            }
+                            if (!assignment || !srcPositions) return null;
+                            var src = [];
+                            for (var s = 0; s < triCount; s++) if (pending.has(assignment[s])) src.push(s);
+                            if (src.length === 0) return null;
+                            var spos = new Float32Array(src.length * 9);
+                            src.forEach(function (s, k) { spos.set(srcPositions.subarray(s * 9, s * 9 + 9), k * 9); });
+                            geo.setAttribute('position', new THREE.BufferAttribute(spos, 3));
+                            return new THREE.Mesh(geo, pendingSrcMaterial);
                         }
 
                         // Every billboard a ray through this pixel passes through, nearest first.

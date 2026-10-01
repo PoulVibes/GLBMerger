@@ -17,8 +17,11 @@ namespace GlbMerger
     // mesh in its bind pose underneath.
     //
     // One of the modes hosted by ModelEditorForm (see EditorMode there), which owns the window.
-    public class TextureEditorEditor : UserControl
+    public class TextureEditorEditor : UserControl, IUnappliedChanges
     {
+        // Each setting's description, shown on hover (see HelpTips).
+        private readonly HelpTips _help;
+
         private readonly ModelRoot _model;
 
         private ComboBox _targetDropdown = null!;
@@ -54,6 +57,7 @@ namespace GlbMerger
 
         public TextureEditorEditor(ModelRoot model, bool darkMode = false)
         {
+            _help = new HelpTips(this);
             _model = model;
 
             Dock = DockStyle.Fill;
@@ -92,10 +96,10 @@ namespace GlbMerger
             _targetDropdown.SelectedIndexChanged += (s, e) => ShowSelectedOriginal();
             flow.Controls.Add(_targetDropdown);
 
-            flow.Controls.Add(HelpText(
+            _help.Add(flow, 
                 "Only images bound as a material's base color (albedo) are listed - an image used " +
                 "solely as a normal, metallic/roughness, occlusion or emissive map never shows up " +
-                "as a target here."));
+                "as a target here.");
 
             flow.Controls.Add(new Label
             {
@@ -104,12 +108,12 @@ namespace GlbMerger
                 Margin = new Padding(3, 8, 3, 4),
             });
 
-            flow.Controls.Add(HelpText(
+            _help.Add(flow, 
                 "Extends each island's own edge color into the unused gutter around it. Up close " +
                 "this changes nothing visible - but from a distance, mip-mapped sampling blends a " +
                 "wider patch of texels, and an unpadded gutter lets that blend pull in an unrelated " +
                 "island's color across the seam, which is what reads as a faint color fringe at " +
-                "range. Applies to every material channel bound to this image, not just base color."));
+                "range. Applies to every material channel bound to this image, not just base color.");
 
             var paddingRow = LabeledNumeric("Padding (texels):", out _numIslandPadding, 0, 64, 16, 0);
             flow.Controls.Add(paddingRow);
@@ -138,33 +142,33 @@ namespace GlbMerger
                 Margin = new Padding(3, 8, 3, 4),
             });
 
-            flow.Controls.Add(HelpText(
+            _help.Add(flow, 
                 "Reorders triangles and vertex records into the order the GPU reads them, without " +
                 "changing a single pixel or vertex position. Two of the three passes pay off in " +
                 "texturing specifically: front-to-back triangle clustering lets early-Z throw away " +
                 "hidden fragments before their texture fetches are paid for, and reordering vertex " +
                 "records puts each triangle's UVs next to the ones sampled beside it instead of " +
                 "scattered across the buffer. Unlike the two tools above, this works on the whole " +
-                "model at once rather than the selected texture."));
+                "model at once rather than the selected texture.");
 
             var overdrawRow = LabeledNumeric("Overdraw threshold:", out _numOverdrawThreshold, 1.0m, 3.0m, 1.05m, 2);
             _numOverdrawThreshold.Increment = 0.01m;   // LabeledNumeric's 0.5 step overshoots the useful 1.00-1.20 range
             flow.Controls.Add(overdrawRow);
-            flow.Controls.Add(HelpText(
+            _help.Add(flow, 
                 "How much vertex-cache efficiency the front-to-back pass may trade away to get " +
                 "there. 1.00 forbids the trade entirely; 1.05 allows 5% and is the usual choice. " +
                 "The trade is only taken where it pays: overdraw is measured before and after, and " +
                 "a mesh with little overdraw to begin with - anything convex and single-layered - " +
-                "keeps its cache ordering instead."));
+                "keeps its cache ordering instead.");
 
             _btnOptimizeLayout = MakeButton("Optimize Layout for Whole Model");
             _btnOptimizeLayout.Click += async (s, e) => await RunLayoutOptimizeAsync();
             flow.Controls.Add(_btnOptimizeLayout);
 
-            flow.Controls.Add(HelpText(
+            _help.Add(flow, 
                 "There is no Revert for this one - it rewrites geometry for every mesh in the " +
                 "model, so re-merge if you want it undone. It is a pure reordering, so the render " +
-                "is unchanged either way."));
+                "is unchanged either way.");
 
             _lblStatus = new Label
             {
@@ -233,14 +237,6 @@ namespace GlbMerger
             return row;
         }
 
-        private static Label HelpText(string text) => new Label
-        {
-            Text = text,
-            AutoSize = true,
-            MaximumSize = new Size(300, 0),
-            Margin = new Padding(3, 0, 3, 10),
-            ForeColor = Color.Gray,
-        };
 
         private static Button MakeButton(string text) => new Button
         {
@@ -316,8 +312,14 @@ namespace GlbMerger
             }
         }
 
+        // A padding preview showing in the After view that hasn't been applied.
+        private bool _previewNotApplied;
+        public bool HasUnappliedChanges => _previewNotApplied;
+        public string UnappliedChangesDescription => "a padding preview not yet applied";
+
         private void RevertSelected()
         {
+            _previewNotApplied = false;
             int imageIndex = SelectedImageIndex;
             if (imageIndex < 0 || !_originalContent.TryGetValue(imageIndex, out var original)) return;
 
@@ -371,6 +373,7 @@ namespace GlbMerger
             _lastPreviewImageIndex = imageIndex;
             UpdateAfterViewer(imageIndex, pngBytes);
 
+            _previewNotApplied = !apply;
             if (!apply)
             {
                 SetBusy(false, $"{report.TexelsPadded:N0} gutter texel(s) padded around " +
@@ -430,6 +433,7 @@ namespace GlbMerger
 
             _btnRevert.Enabled = _originalContent.ContainsKey(SelectedImageIndex);
             RefreshBeforeViewer();
+            _previewNotApplied = false;
             SetBusy(false, $"Applied to {_targets.Count} texture(s): {totalPadded:N0} gutter texels padded in total. " +
                 "Included the next time you save the merge.");
         }

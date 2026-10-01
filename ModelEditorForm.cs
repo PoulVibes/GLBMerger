@@ -55,6 +55,8 @@ namespace GlbMerger
         private ComboBox _modeDropdown = null!;
         private Panel _host = null!;
         private Control? _currentEditor;
+        private int _currentModeIndex = -1;
+        private bool _revertingMode;
 
         public ModelEditorForm(ModelRoot model, bool darkMode = false, AppSettings? settings = null)
         {
@@ -76,7 +78,31 @@ namespace GlbMerger
             // WebView2 the moment it's created, and doing that before this form has a window
             // handle of its own leaves the browser control sized against a not-yet-laid-out
             // parent. By Shown the host panel has its real size.
-            Shown += (s, e) => _modeDropdown.SelectedIndex = 0;
+            // Reopens on whichever editor was used last, by name so reordering the list is harmless.
+            Shown += (s, e) =>
+            {
+                int last = Array.FindIndex(Modes, m => m.Mode.ToString() == _settings.LastEditorMode);
+                _modeDropdown.SelectedIndex = Math.Max(last, 0);
+            };
+
+            // Every mode edits the model in place, but some stage their edits until an Apply /
+            // Save / Bake - closing the window throws those away, so ask first.
+            FormClosing += (s, e) =>
+            {
+                if (!ConfirmDiscard("close the editor")) e.Cancel = true;
+            };
+        }
+
+        // True when there's nothing unapplied in the current editor, or the user agrees to lose it.
+        private bool ConfirmDiscard(string action)
+        {
+            if (_currentEditor is not IUnappliedChanges editor || !editor.HasUnappliedChanges) return true;
+            string mode = _currentModeIndex >= 0 ? Modes[_currentModeIndex].Label : "This editor";
+            return MessageBox.Show(this,
+                $"{mode} has {editor.UnappliedChangesDescription} that haven't been applied to the model.\n\n" +
+                $"Discard them and {action}?",
+                "Unapplied changes", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2)
+                == DialogResult.Yes;
         }
 
         private void BuildUi()
@@ -101,7 +127,21 @@ namespace GlbMerger
 
             _modeDropdown = new ComboBox { Width = 240, DropDownStyle = ComboBoxStyle.DropDownList, Margin = new Padding(3, 4, 3, 3) };
             foreach (var (_, label) in Modes) _modeDropdown.Items.Add(label);
-            _modeDropdown.SelectedIndexChanged += (s, e) => ShowEditor(Modes[_modeDropdown.SelectedIndex].Mode);
+            _modeDropdown.SelectedIndexChanged += (s, e) =>
+            {
+                if (_revertingMode || _modeDropdown.SelectedIndex == _currentModeIndex) return;
+                // Switching disposes the current editor, which loses its unapplied edits too.
+                if (!ConfirmDiscard("switch editors"))
+                {
+                    _revertingMode = true;
+                    try { _modeDropdown.SelectedIndex = _currentModeIndex; }
+                    finally { _revertingMode = false; }
+                    return;
+                }
+                _currentModeIndex = _modeDropdown.SelectedIndex;
+                _settings.LastEditorMode = Modes[_currentModeIndex].Mode.ToString();
+                ShowEditor(Modes[_currentModeIndex].Mode);
+            };
 
             var btnClose = new Button
             {

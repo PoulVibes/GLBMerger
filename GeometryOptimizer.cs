@@ -332,9 +332,8 @@ namespace GlbMerger
         }
 
         // Returns a cleaned copy, leaving the model it was given untouched - the live model is
-        // shared by every editor mode and swapping that reference out is a much larger change than
-        // this needs to be. The copy is what gets written to disk; the session carries on with the
-        // original.
+        // shared by every editor mode while the editor is open, so the caller swaps its reference
+        // over only once that's closed (see MainForm.OfferCleanup).
         //
         // Order matters. Compaction has to run first, and it orphans the vertex accessors it
         // replaces on the way, so the rebuild has to run second: SceneBuilder walks the scene and

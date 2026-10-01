@@ -144,6 +144,10 @@ namespace GlbMerger
             // A low-resolution quad behind everything from each side the game sees a building
             // from, showing the whole building as seen from there (AddBackdrops).
             public bool Backdrops = true;
+            // A cornice overhanging the top of a facade becomes one billboard tilted from where it
+            // leaves the wall up to its lip (AddOverhangs), like an awning, instead of being cut up
+            // between the facade, its soffit and backdrops - which leaked sky between the brackets.
+            public bool Overhangs = true;
             // What becomes of upright curves - a round bay, a corner tower (see CurveHandling).
             // KeepAsMesh works on the input instead (PrepareInput); here it changes nothing.
             public CurveHandling Curves = CurveHandling.Planes;
@@ -274,6 +278,14 @@ namespace GlbMerger
             // looks solid (each slat's sides close the gaps between them); flattened, it would
             // show every gap at every angle, so the bake fills its enclosed holes instead.
             public bool FillHoles;
+            // Only the holes no gap leads out of to the rectangle's edge are filled (an overhang's:
+            // between its brackets the wall behind is one big face reaching past it, so there's
+            // nothing to draw there - but along its top the gaps lead out to open sky, which they are).
+            public bool FillEnclosed;
+            // A cornice's tilted billboard (see DetectOverhangs). Its lip stands out in front of
+            // it, and seen from below that shows past its top edge, so it takes the sweep fill
+            // the way an upright wall does (BillboardBaker.Sweeps), along its own up the slope.
+            public bool Overhang;
             // Set back behind a hole in a solid surface (a door in its arch, a window in its
             // reveal): its rectangle reaches out behind that surface (see ExtendRecessed), and
             // if it's mostly solid itself it bakes fully opaque.
@@ -638,18 +650,40 @@ namespace GlbMerger
 
         // --- solving ---------------------------------------------------------------------------
 
-        public static FlattenResult Compute(FlattenInput input, FlattenSettings settings, CancellationToken ct) =>
-            new Solver(input, settings, ct).Run();
+        // How far a long job has got (0..1) and what it's doing: Compute and BillboardBaker.Bake
+        // report it, the editor's status bar shows it.
+        public readonly record struct StageProgress(double Fraction, string Stage);
+
+        public static FlattenResult Compute(FlattenInput input, FlattenSettings settings, CancellationToken ct,
+            IProgress<StageProgress>? progress = null) =>
+            new Solver(input, settings, ct, progress).Run();
 
         private sealed class Solver
         {
             private const int Unassigned = -3;
             // Kept as mesh from the start (FlattenInput.Locked): no plane ever claims it.
             private const int LockedMesh = -4;
+            // Billboards this small and sparse stay as real triangles (see BuildResult).
+            private const int TinyBillboardTris = 24;
+            // A roof ornament stays as real triangles up to this many.
+            private const int MaxMeshOrnamentTris = 150;
             private bool[] _locked = Array.Empty<bool>();
             private bool IsLocked(int t) => _locked.Length > 0 && _locked[t];
             private List<CurvedRegions.Fold> _curves = new();
             private readonly Dictionary<CurvedRegions.Fold, List<int>> _curveTris = new();
+            private readonly List<Overhang> _overhangs = new();
+
+            // A cornice's overhang (DetectOverhangs): drawn on one plane through the line where it
+            // leaves the wall and the line along its lip, facing out and down.
+            private sealed class Overhang
+            {
+                public Vector3 Normal;
+                public float Offset;
+                public List<int> Triangles = new();
+                // Its pieces turned to the side (the returns round the building's corners) are on
+                // the side planes as well; the rest are the overhang's alone.
+                public HashSet<int> Shared = new();
+            }
 
             private readonly FlattenInput _in;
             private readonly FlattenSettings _s;
@@ -691,11 +725,35 @@ namespace GlbMerger
 
             private float[] _evKeys = Array.Empty<float>(), _evWeights = Array.Empty<float>();
 
-            public Solver(FlattenInput input, FlattenSettings settings, CancellationToken ct)
+            // Progress (see Report): the stages of Run, and within the plane search the share of
+            // triangles claimed so far, which is where most of the time goes.
+            private readonly IProgress<StageProgress>? _progress;
+            private string _stage = "";
+            private int _reportedPermille = -1;
+            private int _claimed, _toClaim = 1;
+            // Where each stage of Run starts on the bar, from timings on the 17 buildings: finding
+            // curves and cornices and flattening fire escapes take most of it, the plane search
+            // itself much less.
+            private const double CurvesStart = 0.0, CornicesStart = 0.17, SearchStart = 0.40, SearchEnd = 0.46,
+                SideStart = 0.47, BuildStart = 0.50, DetailStart = 0.53, StairsEnd = 0.80, RebuildStart = 0.83,
+                OrnamentsStart = 0.85, BackdropsStart = 0.87, FinishStart = 0.98;
+
+            private void Report(double fraction, string stage)
+            {
+                if (_progress == null) return;
+                int permille = (int)(fraction * 1000);
+                if (stage == _stage && permille < _reportedPermille + 5) return;
+                _stage = stage;
+                _reportedPermille = permille;
+                _progress.Report(new StageProgress(fraction, stage));
+            }
+
+            public Solver(FlattenInput input, FlattenSettings settings, CancellationToken ct, IProgress<StageProgress>? progress = null)
             {
                 _in = input;
                 _s = settings;
                 _ct = ct;
+                _progress = progress;
                 _eps = MathF.Max(settings.Tolerance, input.Extent * 1e-6f);
                 _minArea = MathF.Max(settings.MinBillboardArea, input.TotalArea * 1e-7f);
                 _degenerateArea = input.Extent * input.Extent * 1e-12f;
@@ -708,6 +766,7 @@ namespace GlbMerger
 
             public FlattenResult Run()
             {
+                Report(CurvesStart, "Finding curved walls");
                 Array.Fill(_plane, Unassigned);
                 _locked = _in.Locked.Length > 0 ? (bool[])_in.Locked.Clone() : new bool[_in.TriangleCount];
                 if (_s.Curves == CurveHandling.CurvedBillboards)
@@ -719,9 +778,18 @@ namespace GlbMerger
                         foreach (int t in _curveTris[cyl]) if (!SharedWithPlanes(cyl, t)) _locked[t] = true;
                     }
                 }
+                Report(CornicesStart, "Finding cornices");
+                if (_s.Overhangs)
+                    foreach (var o in DetectOverhangs())
+                    {
+                        _overhangs.Add(o);
+                        foreach (int t in o.Triangles) if (!o.Shared.Contains(t)) _locked[t] = true;
+                    }
                 for (int t = 0; t < _locked.Length; t++)
                     if (_locked[t]) _plane[t] = LockedMesh;
+                _toClaim = Math.Max(1, _plane.Count(p => p == Unassigned));
 
+                Report(SearchStart, "Finding planes");
                 for (int round = 0; round < MaxRounds && _planes.Count < MaxPlanes; round++)
                 {
                     var candidates = BuildCandidates(includeFrame: round == 0);
@@ -729,17 +797,207 @@ namespace GlbMerger
                     if (!RunRound(candidates)) break;
                 }
 
+                Report(SearchEnd, "Absorbing what's left");
                 AbsorbRemaining();
+                Report(SideStart, "Finding side planes");
                 if (_s.SideDetail) FindSidePlanes();
+                Report(BuildStart, "Building billboards");
                 var result = BuildResult();
 
+                Report(DetailStart, "Flattening fine detail");
                 if (_s.DetailTolerance > 0 && _s.DetailTolerance < _eps && RefineDetail(result))
+                {
+                    Report(RebuildStart, "Rebuilding billboards");
                     result = BuildResult();
+                }
+                Report(OrnamentsStart, "Finding roof ornaments");
                 if (AddRoofOrnaments()) result = BuildResult();
+                AddEdgeStrips(result);
+                Report(BackdropsStart, "Adding backdrops");
                 if (_s.Backdrops) AddBackdrops(result);
+                Report(FinishStart, "Adding curved and overhang billboards");
                 AddCurvedBillboards(result);
+                AddOverhangs(result);
                 GrowForSweep(result);
+                Report(1, "Done");
                 return result;
+            }
+
+            // Cornices overhanging the top of a facade. Per side of the building: the wall is where
+            // most of what faces that way is; seen straight on from that side, the rows near the
+            // top where most of the facade's width stands well out from the wall, with faces
+            // turned down under them (a soffit, the undersides of brackets), are the cornice. Its
+            // plane runs from the wall at the cornice's foot to the median depth of its lip at the
+            // top. A pediment rising over the middle of the cornice is too narrow to count as a
+            // row of it, so it stays on the facade.
+            private List<Overhang> DetectOverhangs()
+            {
+                var found = new List<Overhang>();
+                float ext = _in.Extent, cell = ext * 0.005f, minOut = ext * 0.015f;
+                Vector3 Centroid(int t) => (_in.Corners[t * 3] + _in.Corners[t * 3 + 1] + _in.Corners[t * 3 + 2]) / 3f;
+                int side = 0;
+                foreach (var (d, l) in new[] { (_in.FrameZ, _in.FrameX), (-_in.FrameZ, _in.FrameX), (_in.FrameX, _in.FrameZ), (-_in.FrameX, _in.FrameZ) })
+                {
+                    Report(CornicesStart + (SearchStart - CornicesStart) * side++ / 4.0, "Finding cornices");
+                    // Seen from this side: per (across, up) cell, how far out the surface is.
+                    float l0 = float.MaxValue, l1 = float.MinValue, y0 = float.MaxValue, y1 = float.MinValue;
+                    foreach (var c in _in.Corners)
+                    {
+                        float u = Vector3.Dot(c, l);
+                        l0 = MathF.Min(l0, u); l1 = MathF.Max(l1, u);
+                        y0 = MathF.Min(y0, c.Y); y1 = MathF.Max(y1, c.Y);
+                    }
+                    int cols = (int)MathF.Ceiling((l1 - l0) / cell) + 1, rows = (int)MathF.Ceiling((y1 - y0) / cell) + 1;
+                    var front = new float[cols * rows];
+                    Array.Fill(front, float.MinValue);
+                    float spacing = cell * 0.5f;
+                    for (int t = 0; t < _in.TriangleCount; t++)
+                    {
+                        if (_in.Areas[t] <= _degenerateArea) continue;
+                        Vector3 a = _in.Corners[t * 3], b = _in.Corners[t * 3 + 1], c = _in.Corners[t * 3 + 2];
+                        int k = Math.Clamp((int)MathF.Ceiling(MathF.Max(Vector3.Distance(a, b), MathF.Max(Vector3.Distance(b, c), Vector3.Distance(c, a))) / spacing), 1, 400);
+                        for (int i = 0; i <= k; i++)
+                            for (int j = 0; i + j <= k; j++)
+                            {
+                                var q = a + (b - a) * ((float)i / k) + (c - a) * ((float)j / k);
+                                int cc = (int)((Vector3.Dot(q, l) - l0) / cell), rr = (int)((q.Y - y0) / cell);
+                                if (cc < 0 || rr < 0 || cc >= cols || rr >= rows) continue;
+                                front[rr * cols + cc] = MathF.Max(front[rr * cols + cc], Vector3.Dot(q, d));
+                            }
+                    }
+                    // The wall: the depth most of what's seen from this side is at. (Not where most
+                    // of what faces this way is: a model can carry a flat backing face behind its
+                    // brickwork, and measured from that the whole brick face stood out.)
+                    var hist = new Dictionary<int, int>();
+                    foreach (float z in front)
+                        if (z != float.MinValue)
+                        {
+                            int k = (int)MathF.Floor(z / cell);
+                            hist[k] = hist.GetValueOrDefault(k) + 1;
+                        }
+                    if (hist.Count == 0) continue;
+                    float wall = (hist.MaxBy(kv => kv.Value).Key + 0.5f) * cell;
+                    float Share(int r, Func<float, bool> test)
+                    {
+                        int n = 0;
+                        for (int c = 0; c < cols; c++) if (front[r * cols + c] != float.MinValue && test(front[r * cols + c])) n++;
+                        return (float)n / cols;
+                    }
+
+                    // The facade's top: the highest row it spans most of (a pediment doesn't).
+                    int top = rows - 1;
+                    while (top >= 0 && Share(top, _ => true) < 0.5f) top--;
+                    if (top < 0) continue;
+                    // The cornice: from there down while most of the width stands well out.
+                    int r1 = top;
+                    while (r1 >= 0 && Share(r1, z => z >= wall + minOut) < 0.5f && top - r1 < 2) r1--;
+                    if (r1 < 0 || Share(r1, z => z >= wall + minOut) < 0.5f) continue;
+                    int r0 = r1;
+                    while (r0 > 0 && Share(r0 - 1, z => z >= wall + minOut) >= 0.5f) r0--;
+                    // ...and on down past its brackets and the moulding they hang over, which
+                    // stand out across less of the width: split between the slope and the facade,
+                    // a bracket broke in two where they met.
+                    // No more than one and a half times its own height again, or it ran on down
+                    // into the hoods of the top-floor windows.
+                    int core = top - r0 + 1;
+                    while (r0 > 0 && (top - r0 + 2) <= core * 2.5f && (top - r0 + 2) * cell <= ext * 0.12f
+                        && Share(r0 - 1, z => z >= wall + minOut * 0.4f) >= 0.15f) r0--;
+                    float foot = y0 + r0 * cell, crown = y0 + (top + 1) * cell;
+                    if (crown - foot < ext * 0.015f || crown - foot > ext * 0.12f) continue;
+                    // Not where a curved wall or bay runs up into it: its strip goes on up through
+                    // the cornice, and a straight slope across it tore both apart.
+                    if (_curves.Any(f => f.YMax > foot)) continue;
+
+                    // The lip: the median of how far out each column reaches, over the cornice.
+                    var reach = new List<float>();
+                    for (int c = 0; c < cols; c++)
+                    {
+                        float m = float.MinValue;
+                        for (int r = r0; r <= top; r++) m = MathF.Max(m, front[r * cols + c]);
+                        if (m != float.MinValue) reach.Add(m);
+                    }
+                    reach.Sort();
+                    float lip = reach[reach.Count / 2];
+                    if (lip - wall < minOut) continue;
+
+                    // Everything in the band in front of the wall; it has to overhang - faces
+                    // turned down under it, not just a thick band standing proud.
+                    var o = new Overhang();
+                    float under = 0f;
+                    for (int t = 0; t < _in.TriangleCount; t++)
+                    {
+                        if (_in.Areas[t] <= _degenerateArea || IsLocked(t)) continue;
+                        var c = Centroid(t);
+                        if (c.Y < foot - cell || c.Y > crown + cell || Vector3.Dot(c, d) < wall - cell) continue;
+                        // Wholly inside the band: a tall face of the parapet behind it, reaching
+                        // well above the crown, drew a band of roof above the real roofline, and
+                        // big faces of the wall reaching down below its foot came out as a jagged
+                        // fringe sloping away under it. They stay with the facade and the roof.
+                        if (MathF.Max(_in.Corners[t * 3].Y, MathF.Max(_in.Corners[t * 3 + 1].Y, _in.Corners[t * 3 + 2].Y)) > crown + cell) continue;
+                        if (MathF.Min(_in.Corners[t * 3].Y, MathF.Min(_in.Corners[t * 3 + 1].Y, _in.Corners[t * 3 + 2].Y)) < foot - cell) continue;
+                        if (Vector3.Dot(_in.Normals[t], d) < -0.5f) continue;
+                        // Not the plain wall behind it: that stays on the facade, lit as the
+                        // facade is - on the slope (turned down, so lit darker) it came out as a
+                        // darker strip under the cornice, with a jagged edge where the slope's
+                        // faces met the facade's. Where there's no wall behind the brackets (the
+                        // models are shells), the gaps it leaves are closed by FillEnclosed.
+                        if (Vector3.Dot(_in.Normals[t], d) > 0.9f && Vector3.Dot(c, d) < wall + cell) continue;
+                        // Not what's turned up (its top, the upper curve of the crown moulding),
+                        // which no one below sees: drawn on the slope it raised the overhang's
+                        // upper edge above the real one. It stays with the roof and the facade.
+                        if (_in.Normals[t].Y > 0.2f) continue;
+                        o.Triangles.Add(t);
+                        if (MathF.Abs(Vector3.Dot(_in.Normals[t], l)) > 0.7f) o.Shared.Add(t);
+                        if (_in.Normals[t].Y < -0.5f && Vector3.Dot(c, d) > wall + cell) under += _in.Areas[t] * -_in.Normals[t].Y;
+                    }
+                    if (under < 0.25f * (l1 - l0) * (lip - wall)) continue;
+
+                    o.Normal = Vector3.Normalize(d * (crown - foot) - Vector3.UnitY * (lip - wall));
+                    o.Offset = Vector3.Dot(d * wall + Vector3.UnitY * foot, o.Normal);
+                    found.Add(o);
+                }
+                return found;
+            }
+
+            // One billboard per overhang found at the start (see Run), holding everything in its
+            // band: drawn from out in front and below, what's nearest wins - the brackets and
+            // dentils over the soffit over the wall behind - so there are no gaps to see sky
+            // through, at the price of the ledge being drawn on a slope instead of in relief.
+            private void AddOverhangs(FlattenResult result)
+            {
+                foreach (var o in _overhangs)
+                {
+                    var tris = o.Triangles.Where(t => result.Assignment[t] != FlattenResult.Dropped).ToList();
+                    if (tris.Count == 0) continue;
+                    var (u, v) = PlaneBasis(o.Normal, _in.FrameX);
+                    var bb = new Billboard
+                    {
+                        Normal = o.Normal, Offset = o.Offset, AxisU = u, AxisV = v, Triangles = tris,
+                        // Not FillHoles: that fills between the first and last solid texel of
+                        // each row, and along the top it ran from a pediment out to the end blocks.
+                        PlaneIndex = -1, Part = true, FillEnclosed = true, Overhang = true,
+                    };
+                    var min = new Vector2(float.MaxValue);
+                    var max = new Vector2(float.MinValue);
+                    foreach (int t in tris)
+                        for (int k = 0; k < 3; k++)
+                        {
+                            var q = Project(_in.Corners[t * 3 + k], u, v);
+                            min = Vector2.Min(min, q);
+                            max = Vector2.Max(max, q);
+                        }
+                    bb.Min = bb.ContentMin = min;
+                    bb.Max = bb.ContentMax = max;
+                    bb.Coverage = CoverageGrid(bb).Fraction;
+                    int index = result.Billboards.Count;
+                    result.Billboards.Add(bb);
+                    foreach (int t in tris)
+                    {
+                        if (result.Assignment[t] != FlattenResult.Kept) continue;
+                        result.Assignment[t] = index;
+                        result.KeptTriangles--;
+                    }
+                }
             }
 
             // See-through detail (fire escapes, railings) isn't flattened the way solid surfaces
@@ -797,6 +1055,7 @@ namespace GlbMerger
                     // takes is clustered into structures below. The parts draw on every piece of
                     // see-through detail, not just what was released: a rail already flat enough
                     // to be left alone still belongs in its balcony's rail.
+                    Report(DetailStart, "Flattening fine detail: finding stairs");
                     var stairs = DetectStairPlanes(pool);
                     var candidates = new HashSet<int>(pool);
                     foreach (var bb in result.Billboards)
@@ -806,6 +1065,7 @@ namespace GlbMerger
                     candidates.RemoveWhere(t => _in.Areas[t] <= _degenerateArea);
 
                     var claimed = new HashSet<int>();
+                    Report(StairsEnd, "Flattening fine detail: fire escapes and railings");
                     foreach (var (n, tris, floor) in FireEscapeParts(candidates, pool, stairs, detailEps))
                     {
                         AddPartPlane(n, tris, floor);
@@ -1317,6 +1577,17 @@ namespace GlbMerger
                         // A finial or a chimney is small. Reaching most of the way down the
                         // building, its "surroundings" were the ground inside a roofless shell.
                         if (top - bottom > 0.2f * _in.Extent) continue;
+                        // A small one stays as real triangles: planes crossing at its middle drew
+                        // its faces a few centimetres from where they are, and seen from below its
+                        // outline was full of holes (a pediment's apex over the cornice) - the
+                        // real thing costs little more than its four planes.
+                        if (ornament.Count <= MaxMeshOrnamentTris)
+                        {
+                            if (_locked.Length == 0) _locked = new bool[_in.TriangleCount];
+                            foreach (int t in ornament) { _locked[t] = true; _plane[t] = LockedMesh; }
+                            any = true;
+                            continue;
+                        }
                         foreach (var n in new[] { ax, -ax, az, -az }) AddPartPlane(n, ornament, false);
                         any = true;
                     }
@@ -1350,6 +1621,7 @@ namespace GlbMerger
                 // window's jambs) only stand out as streaks up the curve. (Front and underneath,
                 // they still fill the gaps round its edges.)
                 var onCurve = new HashSet<int>(_curveTris.Values.SelectMany(v => v));
+                var onOverhang = new HashSet<int>(_overhangs.SelectMany(o => o.Triangles));
                 float minArea = _in.TotalArea * 0.001f;
                 foreach (var n in new[] { _in.FrameZ, -_in.FrameZ, _in.FrameX, -_in.FrameX, -Vector3.UnitY })
                 {
@@ -1393,6 +1665,9 @@ namespace GlbMerger
                         tris = tris.Where(t => Vector3.Dot(_in.Normals[t], n) > 0.45f && Depth(t) > depth + layer).ToList();
                     }
 
+                    // An overhang's pieces aren't layered either: under the lip a backdrop just
+                    // above the soffit would stand in front of the overhang's tilted plane.
+                    tris = tris.Where(t => !onOverhang.Contains(t)).ToList();
                     var sorted = tris.OrderBy(Depth).ToList();
                     for (int i = 0; i < sorted.Count;)
                     {
@@ -1560,12 +1835,109 @@ namespace GlbMerger
                 }
             }
 
+            // A wall's end standing proud of it (a corner pier, pilaster or quoins) is drawn back
+            // on the wall's plane with everything else. Seen along the facade from the far side,
+            // what stood out in front now lies behind where it was, and the ray that hit it in the
+            // real building passes the wall's plane beyond the end of the building: a slit of sky
+            // up the far corner. So the outermost columns of an upright wall in which nearly every
+            // row has something standing out by half a percent of the model's size or more become
+            // a narrow billboard of their own at their own depth (at least two columns, under 15%
+            // of the wall's width - more is a bay or a wing, not a pier). By rows, not by area or
+            // mean depth: a window's stone surround beside the pier stands out over most of its
+            // column's area, but not between the windows - pulled forward with the pier, the
+            // window showed from below as broken in two.
+            private void AddEdgeStrips(FlattenResult result)
+            {
+                float cell = _in.Extent * 0.005f, proud = _in.Extent * 0.005f;
+                int count = result.Billboards.Count;
+                for (int b = 0; b < count; b++)
+                {
+                    var bb = result.Billboards[b];
+                    if (MathF.Abs(bb.Normal.Y) >= 0.3f || bb.Detail || bb.Part || bb.Backdrop || bb.Recessed || bb.Curve != null || bb.Coverage < 0.5f) continue;
+                    int cols = (int)MathF.Ceiling((bb.Max.X - bb.Min.X) / cell);
+                    int rows = Math.Max(1, (int)MathF.Ceiling((bb.Max.Y - bb.Min.Y) / cell));
+                    int limit = (int)(cols * 0.15f);
+                    if (limit < 3) continue;
+
+                    // Per column and row, how far the furthest-out thing facing the wall's way
+                    // stands out from it (NaN: nothing there).
+                    var rowMax = new float[cols * rows];
+                    Array.Fill(rowMax, float.NaN);
+                    foreach (int t in bb.Triangles)
+                    {
+                        if (Vector3.Dot(_in.Normals[t], bb.Normal) < 0.7f) continue;
+                        var centre = Centroid(t);
+                        int col = Math.Clamp((int)((Vector3.Dot(centre, bb.AxisU) - bb.Min.X) / cell), 0, cols - 1);
+                        float v0 = float.MaxValue, v1 = float.MinValue;
+                        for (int k = 0; k < 3; k++)
+                        {
+                            float v = Vector3.Dot(_in.Corners[t * 3 + k], bb.AxisV);
+                            v0 = MathF.Min(v0, v); v1 = MathF.Max(v1, v);
+                        }
+                        float d = Vector3.Dot(centre, bb.Normal) - bb.Offset;
+                        int r0 = Math.Clamp((int)((v0 - bb.Min.Y) / cell), 0, rows - 1), r1 = Math.Clamp((int)((v1 - bb.Min.Y) / cell), 0, rows - 1);
+                        for (int r = r0; r <= r1; r++)
+                        {
+                            ref float m = ref rowMax[col * rows + r];
+                            m = float.IsNaN(m) ? d : MathF.Max(m, d);
+                        }
+                    }
+                    bool Proud(int col)
+                    {
+                        int any = 0, outward = 0;
+                        for (int r = 0; r < rows; r++)
+                        {
+                            float m = rowMax[col * rows + r];
+                            if (float.IsNaN(m)) continue;
+                            any++;
+                            if (m >= proud) outward++;
+                        }
+                        return any > 0 && outward >= 0.9f * any;
+                    }
+                    bool Empty(int col)
+                    {
+                        for (int r = 0; r < rows; r++) if (!float.IsNaN(rowMax[col * rows + r])) return false;
+                        return true;
+                    }
+
+                    foreach (bool fromMin in new[] { true, false })
+                    {
+                        int step = fromMin ? 1 : -1;
+                        // Past up to two empty columns right at the edge (the rectangle reaches a
+                        // little past what faces this way).
+                        int col = fromMin ? 0 : cols - 1, skipped = 0;
+                        while (skipped < 2 && col >= 0 && col < cols && Empty(col)) { col += step; skipped++; }
+                        int run = skipped;
+                        for (; run < limit && col >= 0 && col < cols && Proud(col); col += step) run++;
+                        if (run - skipped < 2 || run >= limit) continue;
+
+                        // Wholly inside the strip (a cell's slack): a long wall triangle with its
+                        // centre in it reached right across the next window.
+                        float edge = fromMin ? bb.Min.X + (run + 1) * cell : bb.Max.X - (run + 1) * cell;
+                        var moved = bb.Triangles.Where(t =>
+                        {
+                            for (int k = 0; k < 3; k++)
+                            {
+                                float u = Vector3.Dot(_in.Corners[t * 3 + k], bb.AxisU);
+                                if (fromMin ? u > edge : u < edge) return false;
+                            }
+                            return Vector3.Dot(Centroid(t), bb.Normal) - bb.Offset >= proud * 0.5f;
+                        }).ToList();
+                        if (moved.Count == 0) continue;
+                        // The wall keeps drawing them as well: emptied there, it showed a slit of
+                        // sky between the strip's inner edge and itself, looked past at a slant.
+                        foreach (int t in moved) result.Assignment[t] = result.Billboards.Count;
+                        result.Billboards.Add(MakeBillboard(bb.Normal, bb.Offset, bb.AxisU, bb.AxisV, bb.PlaneIndex, moved));
+                    }
+                }
+            }
+
             private void GrowForSweep(FlattenResult result)
             {
-                float tan = BillboardBaker.MaxSweepTangent;
                 foreach (var bb in result.Billboards)
                 {
                     if (!BillboardBaker.Sweeps(bb)) continue;
+                    float tan = BillboardBaker.SweepTangentsFor(bb).Max();
                     float top = bb.Max.Y;
                     foreach (int t in bb.Triangles)
                         for (int k = 0; k < 3; k++)
@@ -1828,6 +2200,9 @@ namespace GlbMerger
 
                 foreach (var up in new[] { Vector3.UnitY, -Vector3.UnitY })
                 {
+                    // Treads facing up, then their undersides: half the stage each.
+                    double passStart = up.Y > 0 ? DetailStart : (DetailStart + StairsEnd) / 2, passSpan = (StairsEnd - DetailStart) / 2;
+                    Report(passStart, "Flattening fine detail: finding stairs");
                     var all = HorizontalPatches(pool, up);
                     foreach (var landing in all.Where(p => p.Area > maxTreadArea)) _landings.UnionWith(landing.Tris);
                     var patches = all.Where(p => p.Area <= maxTreadArea).ToList();
@@ -1837,8 +2212,13 @@ namespace GlbMerger
                         _ct.ThrowIfCancellationRequested();
                         // Best line through two unused patches: the one most other unused patches sit on.
                         List<int>? best = null;
+                        // Each scan is cubic in the patches, so it's the scan itself that's
+                        // tracked: how many are used up, plus how far through this scan it is.
+                        double usedShare = patches.Count > 0 ? (double)used.Count(u => u) / patches.Count : 1;
                         for (int i = 0; i < patches.Count; i++)
                         {
+                            Report(passStart + passSpan * Math.Min(0.99, usedShare + (1 - usedShare) * 0.5 * i / patches.Count),
+                                "Flattening fine detail: finding stairs");
                             if (used[i]) continue;
                             for (int j = i + 1; j < patches.Count; j++)
                             {
@@ -2183,7 +2563,13 @@ namespace GlbMerger
                 int p = RegisterPlane(n, claimRho, rho, minArea, null);
 
                 foreach (int t in aligned)
-                    if (_plane[t] == Unassigned && Fits(t, n, claimRho)) _plane[t] = p;
+                    if (_plane[t] == Unassigned && Fits(t, n, claimRho))
+                    {
+                        _plane[t] = p;
+                        _claimed++;
+                    }
+                if (!_inSidePass && !_inDetailPass)
+                    Report(SearchStart + (SearchEnd - SearchStart) * Math.Min(1.0, (double)_claimed / _toClaim), "Finding planes");
 
                 for (int t = 0; t < _in.TriangleCount; t++)
                 {
@@ -2355,6 +2741,13 @@ namespace GlbMerger
                         foreach (var piece in pieces)
                         {
                             if (pieces.Count > 1 && ProjectedArea(piece) < largest * 0.05f) leftovers.AddRange(piece.Triangles);
+                            // A handful of triangles, mostly see-through, standing upright (a strip
+                            // of a cornice's cap moulding, a scrap of a pediment): drawn flat at
+                            // the strip's depth they float above the roofline seen from below, and
+                            // the real triangles cost about what the billboard saves.
+                            else if (piece.Triangles.Count <= TinyBillboardTris && piece.Coverage < 0.5f && MathF.Abs(n.Y) < 0.3f
+                                && !_planeIsSide[p] && !_planeIsDetail[p] && !_planeIsStructure.Contains(p))
+                                leftovers.AddRange(piece.Triangles);
                             else
                             {
                                 piece.FillHoles = _planeIsStructure.Contains(p) && MathF.Abs(n.Y) > 0.9f && piece.Coverage >= 0.5f;

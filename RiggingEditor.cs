@@ -29,7 +29,7 @@ namespace GlbMerger
     // One of the modes hosted by ModelEditorForm (see EditorMode there), which owns the window
     // chrome shared by all of them, so this control only contributes its own left-hand controls
     // and 3D preview.
-    public class RiggingEditor : UserControl
+    public class RiggingEditor : UserControl, IUnappliedChanges
     {
         private readonly ModelRoot _model;
         private readonly AppSettings _settings;
@@ -56,6 +56,9 @@ namespace GlbMerger
         // move) or leave them exactly where they were (stretching just this one bone). Nothing
         // here is written to the model until Bake Rig Changes - see BakeRigChanges.
         private readonly Dictionary<string, (Vector3 Delta, bool MoveChildren)> _pendingOffsets = new();
+
+        public bool HasUnappliedChanges => _pendingOffsets.Values.Any(p => p.Delta != Vector3.Zero);
+        public string UnappliedChangesDescription => "joint moves not yet baked";
 
         // Bone name -> whether "Mirror to opposite side" was checked while that bone was
         // selected, kept per bone (like _pendingOffsets) so switching away and back restores the

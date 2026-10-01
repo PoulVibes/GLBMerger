@@ -103,7 +103,7 @@ namespace GlbMerger
             List<GlbAnimationSource>? libraryAnims2 = null)
         {
             if (path1 == null)
-                throw new ArgumentException("Model 1 must be loaded - its geometry is always used as the merged output's structure.");
+                throw new ArgumentException("A model must be loaded - its geometry is always used as the merged output's structure.");
 
             // Model 1 always supplies geometry; model 2 (if present) only contributes materials
             // (matched onto model 1's parts by node name) and/or supplemental animation clips.

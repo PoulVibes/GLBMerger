@@ -27,7 +27,7 @@ namespace GlbMerger
     // live in the WinForms panel on the left, like every other mode's controls do - the page
     // exposes a handful of window.* functions (see the script below) that the panel drives via
     // ExecuteScriptAsync instead.
-    public class AnimationTrimEditor : UserControl
+    public class AnimationTrimEditor : UserControl, IUnappliedChanges
     {
         // The live in-memory merge result - trimming writes straight onto this.
         private readonly ModelRoot _model;
@@ -304,71 +304,76 @@ namespace GlbMerger
         // times (nothing meaningful to cut).
         private void ConfigureTrimControls()
         {
-            var times = CurrentFrameTimes();
-            bool trimmable = times.Length >= 2;
-            _trimPanel.Enabled = trimmable;
-
-            _suppressSliderEvents = true;
+            _configuringTrim = true;
             try
             {
-                int lastIndex = trimmable ? times.Length - 1 : 0;
-                // Maximum is raised before Value is moved and lowered after, since a TrackBar
-                // clamps Value into whatever range it currently has - shrinking the range first
-                // would silently drag the values down with it.
-                _sliderStart.Maximum = Math.Max(_sliderStart.Maximum, lastIndex);
-                _sliderEnd.Maximum = Math.Max(_sliderEnd.Maximum, lastIndex);
-                _sliderStart.Value = 0;
-                _sliderEnd.Value = lastIndex;
-                _sliderStart.Maximum = lastIndex;
-                _sliderEnd.Maximum = lastIndex;
-            }
-            finally
-            {
-                _suppressSliderEvents = false;
-            }
+                var times = CurrentFrameTimes();
+                bool trimmable = times.Length >= 2;
+                _trimPanel.Enabled = trimmable;
 
-            UpdateTrimLabels();
-
-            // Preload whatever loop setting is already stamped on this clip (from an earlier
-            // session, or the main GUI's own Loop checkbox), converting its saved seconds-offset
-            // back to the nearest matching frame index in this clip's current numbering.
-            _suppressLoopEvents = true;
-            try
-            {
-                var name = CurrentAnimationName();
-                bool loop = false;
-                float loopTime = 0f;
-                if (name != null)
-                    (loop, loopTime) = GlbMergeService.GetAnimationLoop(_model, name);
-
-                _chkLoop.Checked = loop;
-                UpdateLoopFrameRange();
-                if (times.Length > 0)
+                _suppressSliderEvents = true;
+                try
                 {
-                    int nearestFrame = 0;
-                    float nearestDist = float.MaxValue;
-                    for (int i = 0; i < times.Length; i++)
-                    {
-                        float dist = Math.Abs(times[i] - loopTime);
-                        if (dist < nearestDist) { nearestDist = dist; nearestFrame = i; }
-                    }
-                    _numLoopFrame.Value = Math.Clamp(nearestFrame, (int)_numLoopFrame.Minimum, (int)_numLoopFrame.Maximum);
+                    int lastIndex = trimmable ? times.Length - 1 : 0;
+                    // Maximum is raised before Value is moved and lowered after, since a TrackBar
+                    // clamps Value into whatever range it currently has - shrinking the range first
+                    // would silently drag the values down with it.
+                    _sliderStart.Maximum = Math.Max(_sliderStart.Maximum, lastIndex);
+                    _sliderEnd.Maximum = Math.Max(_sliderEnd.Maximum, lastIndex);
+                    _sliderStart.Value = 0;
+                    _sliderEnd.Value = lastIndex;
+                    _sliderStart.Maximum = lastIndex;
+                    _sliderEnd.Maximum = lastIndex;
                 }
-            }
-            finally
-            {
-                _suppressLoopEvents = false;
-            }
-            _numLoopFrame.Enabled = trimmable && _chkLoop.Checked;
+                finally
+                {
+                    _suppressSliderEvents = false;
+                }
 
-            // Smoothing is a one-time bake action performed on Save (see ApplyTrim/
-            // GlbMergeService.AddLoopSmoothingFrames), not an ongoing setting - unlike Loop it
-            // never round-trips from the model's own extras, so it always starts back at
-            // unchecked on (re)selecting a clip, same as the trim sliders reset to the clip's full
-            // range rather than remembering the last trim.
-            _chkSmoothTransition.Checked = false;
-            _chkSmoothTransition.Enabled = trimmable && _chkLoop.Checked;
-            _numInterpolatedFrames.Enabled = false;
+                UpdateTrimLabels();
+
+                // Preload whatever loop setting is already stamped on this clip (from an earlier
+                // session, or the main GUI's own Loop checkbox), converting its saved seconds-offset
+                // back to the nearest matching frame index in this clip's current numbering.
+                _suppressLoopEvents = true;
+                try
+                {
+                    var name = CurrentAnimationName();
+                    bool loop = false;
+                    float loopTime = 0f;
+                    if (name != null)
+                        (loop, loopTime) = GlbMergeService.GetAnimationLoop(_model, name);
+
+                    _chkLoop.Checked = loop;
+                    UpdateLoopFrameRange();
+                    if (times.Length > 0)
+                    {
+                        int nearestFrame = 0;
+                        float nearestDist = float.MaxValue;
+                        for (int i = 0; i < times.Length; i++)
+                        {
+                            float dist = Math.Abs(times[i] - loopTime);
+                            if (dist < nearestDist) { nearestDist = dist; nearestFrame = i; }
+                        }
+                        _numLoopFrame.Value = Math.Clamp(nearestFrame, (int)_numLoopFrame.Minimum, (int)_numLoopFrame.Maximum);
+                    }
+                }
+                finally
+                {
+                    _suppressLoopEvents = false;
+                }
+                _numLoopFrame.Enabled = trimmable && _chkLoop.Checked;
+
+                // Smoothing is a one-time bake action performed on Save (see ApplyTrim/
+                // GlbMergeService.AddLoopSmoothingFrames), not an ongoing setting - unlike Loop it
+                // never round-trips from the model's own extras, so it always starts back at
+                // unchecked on (re)selecting a clip, same as the trim sliders reset to the clip's full
+                // range rather than remembering the last trim.
+                _chkSmoothTransition.Checked = false;
+                _chkSmoothTransition.Enabled = trimmable && _chkLoop.Checked;
+                _numInterpolatedFrames.Enabled = false;
+            }
+            finally { _configuringTrim = false; _unsaved = false; }
         }
 
         // Keeps the loop-back frame picker's range clamped to the current trim window [start,
@@ -393,6 +398,7 @@ namespace GlbMerger
             _numInterpolatedFrames.Enabled = _chkSmoothTransition.Enabled && _chkSmoothTransition.Checked;
 
             if (_suppressLoopEvents) return;
+            _unsaved = true;
 
             // Scrubbing to the chosen loop-back frame, same reasoning as the trim sliders: seeing
             // the actual pose is how the user judges whether it's the right frame to resume on.
@@ -407,11 +413,19 @@ namespace GlbMerger
         private void OnSmoothSettingChanged()
         {
             _numInterpolatedFrames.Enabled = _chkSmoothTransition.Enabled && _chkSmoothTransition.Checked;
+            if (!_suppressLoopEvents && !_configuringTrim) _unsaved = true;
         }
+        private bool _configuringTrim;
+
+        // Trim handles or loop settings moved since the clip was loaded or last saved.
+        private bool _unsaved;
+        public bool HasUnappliedChanges => _unsaved;
+        public string UnappliedChangesDescription => "trim or loop settings not yet saved";
 
         private void OnTrimSliderChanged(bool movedStart)
         {
             if (_suppressSliderEvents) return;
+            _unsaved = true;
 
             // Keep at least one frame between the handles - TrimAnimation clamps to the same rule,
             // so letting them cross here would just show a range that isn't what gets applied.
@@ -606,6 +620,7 @@ namespace GlbMerger
                 _frameTimes = ComputeAnimFrameTimes(_model);
                 ConfigureTrimControls();
 
+                _unsaved = false;
                 _lblStatus.Text = $"Trimmed '{name}' to {CurrentFrameTimes().Length} frame(s), " +
                     (loop ? $"looping back to {loopTime.ToString("0.000", CultureInfo.InvariantCulture)}s. " : "pausing at the end. ") +
                     (smoothFrameCount > 0 ? $"Added {smoothFrameCount} smoothing frame(s). " : "") +

@@ -50,6 +50,9 @@ namespace GlbMerger
     // left-hand controls and 3D preview.
     public class HandoffViewer : UserControl
     {
+        // Each setting's description, shown on hover (see HelpTips).
+        private readonly HelpTips _help;
+
         private readonly ModelRoot _model;
 
         private readonly bool _darkMode;
@@ -136,6 +139,7 @@ namespace GlbMerger
 
         public HandoffViewer(ModelRoot model, bool darkMode = false)
         {
+            _help = new HelpTips(this);
             _model = model;
             _darkMode = darkMode;
             _rightHand = FindHandNode(_model, right: true);
@@ -336,8 +340,8 @@ namespace GlbMerger
             };
             flow.Controls.Add(_lblViewOnly);
 
-            flow.Controls.Add(Note("Shows the handoff pose the game builds: the carry hand " +
-                "extended straight ahead, still holding the ball at its saved anchor."));
+            _help.Add(flow, "Shows the handoff pose the game builds: the carry hand " +
+                "extended straight ahead, still holding the ball at its saved anchor.");
 
             var sideRow = MakeRow();
             sideRow.Controls.Add(new Label { Text = "Carry / reach hand:", AutoSize = true, Margin = new Padding(3, 7, 8, 3) });
@@ -374,8 +378,8 @@ namespace GlbMerger
             reachBox.Controls.Add(reachPlus);
             flow.Controls.Add(reachBox);
 
-            flow.Controls.Add(Note("0% = the ball-carry hold. 100% = the straight-ahead give. " +
-                "In game this is handoffReachWeight easing between the two."));
+            _help.Add(flow, "0% = the ball-carry hold. 100% = the straight-ahead give. " +
+                "In game this is handoffReachWeight easing between the two.");
 
             flow.Controls.Add(new Label { Text = "Preview Animation (free arm only):", AutoSize = true, Margin = new Padding(3, 0, 3, 4) });
             var animRow = MakeRow();

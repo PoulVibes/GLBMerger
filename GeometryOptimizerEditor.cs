@@ -58,6 +58,9 @@ namespace GlbMerger
     // One of the five modes hosted by ModelEditorForm (see EditorMode there).
     public class GeometryOptimizerEditor : UserControl
     {
+        // Each setting's description, shown on hover (see HelpTips).
+        private readonly HelpTips _help;
+
         private readonly ModelRoot _model;
 
         private WebView2 _webView = null!;
@@ -165,6 +168,7 @@ namespace GlbMerger
 
         public GeometryOptimizerEditor(ModelRoot model, bool darkMode = false)
         {
+            _help = new HelpTips(this);
             _model = model;
             _history = new GeometryHistory(model);
             _worldBounds = PlanarCutter.WorldBounds(model);
@@ -258,10 +262,10 @@ namespace GlbMerger
             errorRow.Controls.Add(_numError);
             simplifySettings.Controls.Add(errorRow);
 
-            simplifySettings.Controls.Add(HelpText(
+            _help.Add(simplifySettings, 
                 "Whichever comes first wins: simplification stops at the keep ratio, or earlier if " +
                 "it would exceed the error budget. For a near-lossless pass, use a high keep ratio " +
-                "with a small budget."));
+                "with a small budget.");
 
             _chkLockBorders = new CheckBox { Text = "Preserve mesh outlines", AutoSize = true, Checked = true, Margin = new Padding(3, 0, 3, 0) };
             simplifySettings.Controls.Add(_chkLockBorders);
@@ -278,14 +282,14 @@ namespace GlbMerger
             };
             simplifySettings.Controls.Add(_chkRebakeTexture);
 
-            simplifySettings.Controls.Add(HelpText(
+            _help.Add(simplifySettings, 
                 "After the pass, every texel under a triangle that changed is looked up on the " +
                 "original surface and rewritten with what the original texture showed there, so " +
                 "the texture is pixel-accurate on the new triangles instead of stretched across " +
                 "them. Nothing is added to the geometry; what's genuinely lost (a flattened " +
                 "silhouette) stays lost. Texels that already match are left untouched, so nothing " +
                 "blurs. Every texture the model's materials use is rebuilt. Slow on a big atlas - " +
-                "watch the bar at the bottom of the window. Undone together with the pass in History."));
+                "watch the bar at the bottom of the window. Undone together with the pass in History.");
 
             _lblSkin = new Label { Text = SkinLabel(0), AutoSize = true, Margin = new Padding(3, 0, 3, 0) };
             _sliderSkin = new TrackBar
@@ -297,9 +301,9 @@ namespace GlbMerger
             simplifySettings.Controls.Add(_lblSkin);
             simplifySettings.Controls.Add(_sliderSkin);
 
-            simplifySettings.Controls.Add(HelpText(
+            _help.Add(simplifySettings, 
                 "Collapsing an edge re-interpolates its skin weights. At 0% only vertices whose " +
-                "neighbours share identical weights can move, so deformation cannot change."));
+                "neighbours share identical weights can move, so deformation cannot change.");
 
             paint.Controls.Add(new Label
             {
@@ -388,13 +392,13 @@ namespace GlbMerger
                 SyncSelectionMode(_chkExcludeSelection, _chkRestrictSelection);
             simplifyActions.Controls.Add(_chkExcludeSelection);
 
-            simplifyActions.Controls.Add(HelpText(
+            _help.Add(simplifyActions, 
                 "Two ways to use a painted region, and only one applies at a time - ticking either " +
                 "clears the other. ONLY makes the paint the region to simplify; EXCEPT makes it the " +
                 "region to protect and simplifies all the rest, which is the one to reach for on " +
                 "faces, hands and logos. Either way the vertices right at the edge of the paint are " +
                 "locked, so the side that moves can't pull away from the side that doesn't and open " +
-                "a gap. Leave both off to optimize the whole model."));
+                "a gap. Leave both off to optimize the whole model.");
 
             _btnAnalyze = MakeButton("Analyze (dry run)");
             _btnAnalyze.Click += async (s, e) => await RunAnalyzeAsync(apply: false);
@@ -404,22 +408,22 @@ namespace GlbMerger
             _btnApply.Click += async (s, e) => await RunAnalyzeAsync(apply: true);
             simplifyActions.Controls.Add(_btnApply);
 
-            simplifyActions.Controls.Add(HelpText(
+            _help.Add(simplifyActions, 
                 "Optimizing rewrites triangles only, so vertices the result no longer references - " +
                 "and the index buffer each pass replaces - stay in the model, and it can grow rather " +
-                "than shrink. Saving offers to rebuild and drop both."));
+                "than shrink. Saving offers to rebuild and drop both.");
 
-            delete.Controls.Add(HelpText(
+            _help.Add(delete, 
                 "Throws the painted triangles away outright, then drops every vertex no triangle " +
                 "references any more - including ones earlier simplify passes over the same mesh " +
                 "part left behind. For geometry that shouldn't be in the merge at all: interior " +
-                "surfaces no camera sees, a prop's backing plane, decals buried under other parts."));
+                "surfaces no camera sees, a prop's backing plane, decals buried under other parts.");
 
-            delete.Controls.Add(HelpText(
+            _help.Add(delete, 
                 "This leaves a hole - nothing is closed up behind it, so paint with the far side " +
                 "of the model in mind. The ONLY/EXCEPT checkboxes above belong to simplification; " +
                 "deletion always takes exactly what is painted, and a mesh part with every triangle " +
-                "painted is left alone rather than emptied."));
+                "painted is left alone rather than emptied.");
 
             _btnAnalyzeDelete = MakeButton("Analyze Deletion (dry run)");
             _btnAnalyzeDelete.Click += async (s, e) => await RunDeleteAsync(apply: false);
@@ -429,12 +433,12 @@ namespace GlbMerger
             _btnDelete.Click += async (s, e) => await RunDeleteAsync(apply: true);
             delete.Controls.Add(_btnDelete);
 
-            cut.Controls.Add(HelpText(
+            _help.Add(cut, 
                 "Slices the whole model with a flat plane and deletes everything on one side. " +
                 "Triangles the plane passes through are trimmed back to it - new vertices go in " +
                 "exactly where each edge crosses - so the model ends in a clean, flat edge on the " +
                 "plane rather than a jagged one. Positions are measured as the preview shows them, " +
-                "so the cut lands where the plane is drawn."));
+                "so the cut lands where the plane is drawn.");
 
             var cutAxisRow = new FlowLayoutPanel
             {
@@ -482,13 +486,13 @@ namespace GlbMerger
             _chkShowCutPlane.CheckedChanged += (s, e) => PushCutPlane();
             cut.Controls.Add(_chkShowCutPlane);
 
-            cut.Controls.Add(HelpText(
+            _help.Add(cut, 
                 "The cap closes each ring the cut edge forms with a flat fan on the plane, textured " +
                 "from a blank patch of the material where one exists - the same fill Make Watertight " +
                 "uses, restricted to the cut. Where the plane runs into an opening the model already " +
                 "had, that ring isn't closed (there's nothing flat to close), and where it meets a " +
                 "seam between two mesh parts, each part's half of the ring is capped on its own. " +
-                "A part lying entirely on the deleted side is left alone rather than emptied."));
+                "A part lying entirely on the deleted side is left alone rather than emptied.");
 
             _btnAnalyzeCut = MakeButton("Analyze Cut (dry run)");
             _btnAnalyzeCut.Click += async (s, e) => await RunCutAsync(apply: false);
@@ -505,18 +509,18 @@ namespace GlbMerger
             _numCut.ValueChanged += (s, e) => OnCutNumericChanged();
             OnCutAxisChanged();
 
-            watertight.Controls.Add(HelpText(
+            _help.Add(watertight, 
                 "Finds open holes - boundary edges with no triangle on the other side - and caps " +
                 "each one with a new triangle fan. Boundaries shared between two parts of this " +
                 "mesh (a material or UV seam) are recognized and left alone, not capped. A hole " +
                 "that's meant to stay open, like a mouth interior, will get capped too since there's " +
-                "no way to tell intent from geometry alone - step back in History if that happens."));
+                "no way to tell intent from geometry alone - step back in History if that happens.");
 
-            watertight.Controls.Add(HelpText(
+            _help.Add(watertight, 
                 "When the material has a texture, caps look for an unused, blank-looking patch of " +
                 "it and sample the fill from there, so the cap reads as a plain, unremarkable " +
                 "surface instead of a smear across unrelated texture. Where no such patch exists, " +
-                "the cap falls back to blending the hole's own edge colors."));
+                "the cap falls back to blending the hole's own edge colors.");
 
             _chkSealPlanar = new CheckBox
             {
@@ -528,13 +532,13 @@ namespace GlbMerger
             };
             watertight.Controls.Add(_chkSealPlanar);
 
-            watertight.Controls.Add(HelpText(
+            _help.Add(watertight, 
                 "A cut that was left open and saved leaves a ring that runs through every mesh " +
                 "part the plane crossed, which the hole search above can't close part by part. " +
                 "This gathers every open edge lying on an X, Y or Z plane across the whole mesh, " +
                 "joins them into rings, and closes each with one flat polygon of as few triangles " +
                 "as possible - no centre vertex. Rings inside another on the same plane become " +
-                "holes in its cap."));
+                "holes in its cap.");
 
             _btnAnalyzeWatertight = MakeButton("Analyze Holes (dry run)");
             _btnAnalyzeWatertight.Click += async (s, e) => await RunWatertightAsync(apply: false);
@@ -544,19 +548,19 @@ namespace GlbMerger
             _btnApplyWatertight.Click += async (s, e) => await RunWatertightAsync(apply: true);
             watertight.Controls.Add(_btnApplyWatertight);
 
-            uv.Controls.Add(HelpText(
+            _help.Add(uv, 
                 "Simplifying never moves a vertex or its texture coordinate, but a surviving " +
                 "triangle now spans surface that several triangles used to cover, and the texture " +
                 "is stretched straight across it where the original bent it - so it can read as " +
                 "slightly warped. This measures the current surface against the Original merge " +
                 "result, point by point, and nudges the surviving vertices' texture coordinates so " +
-                "the texture lands back where it was."));
+                "the texture lands back where it was.");
 
-            uv.Controls.Add(HelpText(
+            _help.Add(uv, 
                 "A triangle only has three coordinates to move, so a warp inside one large triangle " +
                 "is reduced to its best fit, not removed outright. Max correction is how far a point " +
                 "is allowed to be off before it's taken for the other side of a texture seam and " +
-                "left alone; raise it only if a warp is being skipped. Records a History step."));
+                "left alone; raise it only if a warp is being skipped. Records a History step.");
 
             uv.Controls.Add(new Label { Text = "Max correction (% of texture):", AutoSize = true, Margin = new Padding(3, 4, 3, 0) });
             _numUvJump = new NumericUpDown
@@ -574,20 +578,20 @@ namespace GlbMerger
             _btnApplyUv.Click += async (s, e) => await RunUvRepairAsync(apply: true);
             uv.Controls.Add(_btnApplyUv);
 
-            restore.Controls.Add(HelpText(
+            _help.Add(restore, 
                 "For texture Fix Texture Warp can't straighten - window frames, lettering, anything " +
                 "finer than the triangles left under it. Paint the area and this puts the original " +
                 "triangles back there, exactly as they were, then re-simplifies the rest of that " +
                 "mesh part from the original to about the triangle count it has now, using the " +
                 "Simplify operation's error budget, outline and skin settings. The painted area costs whatever " +
-                "it cost originally; the count goes up by that much."));
+                "it cost originally; the count goes up by that much.");
 
-            restore.Controls.Add(HelpText(
+            _help.Add(restore, 
                 "Anything already at original detail outside the paint - an earlier restore, a " +
                 "region a previous pass protected - is held exactly as it is, so restores stack. " +
                 "\"Original\" is the oldest History step whose vertices are the model's current " +
                 "ones: the merge result, or after a delete, cut or fill, the state that step " +
-                "left - the status line says which. Records a History step."));
+                "left - the status line says which. Records a History step.");
 
             _btnAnalyzeRestore = MakeButton("Analyze Restore (dry run)");
             _btnAnalyzeRestore.Click += async (s, e) => await RunRestoreAsync(apply: false);
@@ -608,10 +612,10 @@ namespace GlbMerger
             _chkWireframe.CheckedChanged += (s, e) => PushWireframe();
             flow.Controls.Add(_chkWireframe);
 
-            flow.Controls.Add(HelpText(
+            _help.Add(flow, 
                 "Edges are drawn over the shaded model rather than replacing it, and are hidden " +
                 "where the model itself hides them - so this reads as triangle density on the " +
-                "surface you are looking at, not an x-ray of the whole mesh."));
+                "surface you are looking at, not an x-ray of the whole mesh.");
 
             // Everything a run reports - the outcome line, the totals and the per-mesh table - is
             // boxed and labelled as output, so it reads as the result of the last click rather
@@ -692,16 +696,16 @@ namespace GlbMerger
             _historyGrid.SelectionChanged += (s, e) => OnHistorySelectionChanged();
             flow.Controls.Add(_historyGrid);
 
-            flow.Controls.Add(HelpText(
+            _help.Add(flow, 
                 "Every pass lands here. Click a row to put the model back into that state - the " +
                 "rows below it stay, so stepping back and forward again costs nothing and loses " +
                 "nothing. Applying a new pass while standing on an older row is what drops the " +
-                "ones under it, since they were built on the geometry that pass just replaced."));
+                "ones under it, since they were built on the geometry that pass just replaced.");
 
-            flow.Controls.Add(HelpText(
+            _help.Add(flow, 
                 "Vertices counts only the ones a triangle still uses - the number a save keeps. " +
                 "Simplifying rewrites triangles alone, so the ones it stops referencing stay in " +
-                "the file at full size until then, and this column is where that shows up."));
+                "the file at full size until then, and this column is where that shows up.");
 
             controlPanel.Controls.Add(flow);
 
@@ -766,14 +770,6 @@ namespace GlbMerger
             PushCutPlane();
         }
 
-        private static Label HelpText(string text) => new Label
-        {
-            Text = text,
-            AutoSize = true,
-            MaximumSize = new System.Drawing.Size(340, 0),
-            Margin = new Padding(3, 0, 3, 12),
-            ForeColor = System.Drawing.Color.Gray,
-        };
 
         private static Button MakeButton(string text) => new Button
         {

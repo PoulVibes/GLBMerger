@@ -34,8 +34,11 @@ namespace GlbMerger
     // rewrites POSITION/NORMAL for its own vertex edits.
     //
     // One of the modes hosted by ModelEditorForm (see EditorMode there), which owns the window.
-    public class RigidRegionEditor : UserControl
+    public class RigidRegionEditor : UserControl, IUnappliedChanges
     {
+        // Each setting's description, shown on hover (see HelpTips).
+        private readonly HelpTips _help;
+
         private readonly ModelRoot _model;
 
         private ComboBox _boneDropdown = null!;
@@ -74,6 +77,7 @@ namespace GlbMerger
 
         public RigidRegionEditor(ModelRoot model, bool darkMode = false)
         {
+            _help = new HelpTips(this);
             _model = model;
 
             Dock = DockStyle.Fill;
@@ -108,12 +112,12 @@ namespace GlbMerger
                 Margin = new Padding(3, 0, 3, 8),
             });
 
-            flow.Controls.Add(HelpText(
+            _help.Add(flow, 
                 "Paint the area over a jersey number or other flat detail, pick the bone it " +
                 "should move with, and Apply pins that patch's vertices to move as one rigid " +
                 "body instead of blending across bones - which is what causes painted detail to " +
                 "shear during animation. Best on flat torso/back areas; avoid painting across a " +
-                "joint that needs to bend on its own."));
+                "joint that needs to bend on its own.");
 
             flow.Controls.Add(new Label { Text = "Pin painted region to bone:", AutoSize = true, Margin = new Padding(3, 4, 3, 2) });
             _boneDropdown = new ComboBox { Width = 300, DropDownStyle = ComboBoxStyle.DropDownList, Margin = new Padding(3, 0, 3, 8) };
@@ -149,19 +153,19 @@ namespace GlbMerger
             _chkWireframe = new CheckBox { Text = "Wireframe", AutoSize = true, Margin = new Padding(3, 0, 3, 2) };
             _chkWireframe.CheckedChanged += (s, e) => PushWireframe();
             flow.Controls.Add(_chkWireframe);
-            flow.Controls.Add(HelpText(
+            _help.Add(flow, 
                 "Draws the triangle edges over the Paint view - useful for seeing how dense the " +
                 "mesh actually is under the brush, and how far a feather ring of a given width " +
-                "will really reach."));
+                "will really reach.");
 
             _btnColorize = MakeButton("Colorize by Rigidity");
             _btnColorize.Click += (s, e) => ToggleRigidityColors();
             flow.Controls.Add(_btnColorize);
-            flow.Controls.Add(HelpText(
+            _help.Add(flow, 
                 "Shades the Paint view by how rigidly each vertex is already bound: green where a " +
                 "single bone owns it outright (nothing painted there can shear), through yellow, " +
                 "to red where the weight is split evenly across four bones - the areas most likely " +
-                "to skew, and the ones worth painting. Regions you Apply turn green."));
+                "to skew, and the ones worth painting. Regions you Apply turn green.");
 
             _btnClearSelection = MakeButton("Clear Selection");
             _btnClearSelection.Click += (s, e) => ClearSelection();
@@ -179,10 +183,10 @@ namespace GlbMerger
             _numFeatherRings = new NumericUpDown { Width = 70, Minimum = 0, Maximum = 8, Value = 2, Margin = new Padding(0, 4, 3, 3) };
             featherRow.Controls.Add(_numFeatherRings);
             flow.Controls.Add(featherRow);
-            flow.Controls.Add(HelpText(
+            _help.Add(flow, 
                 "Triangles just outside the painted core are blended gradually toward the pinned " +
                 "bone instead of snapping outright, so the edge doesn't crease. 0 = hard edge, " +
-                "higher = softer/wider transition."));
+                "higher = softer/wider transition.");
 
             _btnApply = MakeButton("Apply");
             _btnApply.Click += async (s, e) => await ApplyAsync();
@@ -192,12 +196,12 @@ namespace GlbMerger
             _btnRemoveRigidity.Enabled = false;
             _btnRemoveRigidity.Click += async (s, e) => await RemovePaintedRigidityAsync();
             flow.Controls.Add(_btnRemoveRigidity);
-            flow.Controls.Add(HelpText(
+            _help.Add(flow, 
                 "Un-pins just the faces painted right now, putting their original skin weights " +
                 "back and leaving the rest of what you applied alone - paint over the part that " +
                 "got pinned too far and take only that back. Feather width applies here too: the " +
                 "painted core goes fully back to original and the rings ease into whatever pinning " +
-                "survives around them, so the cut doesn't leave a crease."));
+                "survives around them, so the cut doesn't leave a crease.");
 
             _btnRevert = MakeButton("Revert All Rigid Regions");
             _btnRevert.Enabled = false;
@@ -234,10 +238,10 @@ namespace GlbMerger
             };
             _sliderScrub.Scroll += (s, e) => Seek();
             flow.Controls.Add(_sliderScrub);
-            flow.Controls.Add(HelpText(
+            _help.Add(flow, 
                 "Watch the right pane while animating to confirm the pinned region holds its " +
                 "shape. Pause and drag the scrub bar to freeze on whichever frame used to show " +
-                "the worst skew."));
+                "the worst skew.");
 
             controlPanel.Controls.Add(flow);
 
@@ -260,14 +264,6 @@ namespace GlbMerger
             Controls.Add(controlPanel);
         }
 
-        private static Label HelpText(string text) => new Label
-        {
-            Text = text,
-            AutoSize = true,
-            MaximumSize = new Size(300, 0),
-            Margin = new Padding(3, 0, 3, 10),
-            ForeColor = Color.Gray,
-        };
 
         private static Button MakeButton(string text) => new Button
         {
@@ -473,6 +469,7 @@ namespace GlbMerger
 
             RefreshAfterSkinEdit();
 
+            _paintedNotApplied = false;
             _lblStatus.Text = touchedVerts > 0
                 ? $"Applied: {touchedVerts:N0} vertex weight(s) pinned to '{boneName}'" +
                   (skippedPrims > 0 ? $" ({skippedPrims} painted primitive(s) skipped - no matching skin/bone)." : ".") +
@@ -1701,6 +1698,7 @@ keepCutouts(mat);
             if (message.Action == "selectionChanged")
             {
                 int count = message.Count ?? 0;
+                _paintedNotApplied = count > 0;
                 _lblSelection.Text = count == 1 ? "1 triangle painted" : $"{count:N0} triangles painted";
             }
         }
@@ -1762,8 +1760,14 @@ keepCutouts(mat);
             _ = _webView.CoreWebView2.ExecuteScriptAsync($"seekPreview({t.ToString(CultureInfo.InvariantCulture)});");
         }
 
+        // Painted since the last Apply (or Clear): the regions that would be made rigid.
+        private bool _paintedNotApplied;
+        public bool HasUnappliedChanges => _paintedNotApplied;
+        public string UnappliedChangesDescription => "painted regions not yet applied";
+
         private void ClearSelection()
         {
+            _paintedNotApplied = false;
             _lblSelection.Text = "0 triangles painted";
             if (!_viewerReady || _webView.CoreWebView2 == null) return;
             _ = _webView.CoreWebView2.ExecuteScriptAsync("clearPaintSelection();");

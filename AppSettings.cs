@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Text.Json;
 
@@ -16,6 +17,8 @@ namespace GlbMerger
         public double Panel1SecondarySplitFraction { get; set; } = 0.4667;
         public double Panel2PrimarySplitFraction { get; set; } = 0.45;
         public double AnimationTrimPlaybackSpeed { get; set; } = 1.0;
+        // ModelEditorForm.EditorMode name of the editor last opened, which the next one starts on.
+        public string? LastEditorMode { get; set; }
         public int FlattenStrength { get; set; } = 500;
         public int FlattenMinSize { get; set; } = 40;
         public bool FlattenKeepLeftovers { get; set; } = true;
@@ -30,6 +33,10 @@ namespace GlbMerger
         public bool FlattenBakeNormals { get; set; } = true;
         public bool FlattenBakeMetallicRoughness { get; set; } = true;
         public int FlattenTriangleBudget { get; set; } = 500;
+        // Named sets of the Flatten* values above, and which one they currently match (null =
+        // "Custom Configuration", edited since or never saved).
+        public List<FlattenConfiguration> FlattenConfigurations { get; set; } = new();
+        public string? FlattenConfigurationName { get; set; }
         // Flatten editor viewport background, as #RRGGBB.
         public string FlattenBackgroundColor { get; set; } = "#1A1C1E";
         public string AnimationLibraryDirectory { get; set; } = @"C:\Projects\FootballRoguelite\Graphics\Models\Players";

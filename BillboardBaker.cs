@@ -75,8 +75,11 @@ namespace GlbMerger
         private const float MaskCutoff = 0.5f;
         // Viewing angles from below the sweep fill covers (see RenderBillboard).
         private static readonly float[] SweepTangents = new[] { 10f, 20f, 30f }.Select(a => MathF.Tan(a * MathF.PI / 180f)).ToArray();
-        public static float MaxSweepTangent => SweepTangents.Max();
-        public static bool Sweeps(ModelFlattener.Billboard bb) => !bb.Detail && !bb.Part && !bb.Backdrop && MathF.Abs(bb.Normal.Y) < 0.3f;
+        public static bool Sweeps(ModelFlattener.Billboard bb) => bb.Overhang || (!bb.Detail && !bb.Part && !bb.Backdrop && MathF.Abs(bb.Normal.Y) < 0.3f);
+        // A cornice's tilted billboard only at the shallowest angle: its top edge is broken by
+        // real gaps to the sky (between a pediment and the end blocks), and the steeper copies
+        // filled those, seen from the street as slabs above the cornice.
+        public static float[] SweepTangentsFor(ModelFlattener.Billboard bb) => bb.Overhang ? SweepTangents[..1] : SweepTangents;
         private const int MinTrimTexels = 64 * 64;     // smallest corner cut worth a triangle
 
         public sealed class SourceTexture
@@ -301,9 +304,14 @@ namespace GlbMerger
 
 
 
+        // Progress, if given, runs to PngDone by the time the textures are encoded; whatever the
+        // caller does with the result afterwards (writing a preview) has the rest.
+        public const double PngDone = 0.97;
+
         public static BakeResult Bake(ModelFlattener.FlattenInput input, ModelFlattener.FlattenResult flat,
-            BakeSource src, BakeSettings settings, CancellationToken ct)
+            BakeSource src, BakeSettings settings, CancellationToken ct, IProgress<ModelFlattener.StageProgress>? progress = null)
         {
+            progress?.Report(new ModelFlattener.StageProgress(0, "Laying out the atlas"));
             float detailBoost = settings.DetailBoost;
             float globalDensity = SourceDensity(input, src, Enumerable.Range(0, input.TriangleCount));
             var items = new List<Item>();
@@ -338,12 +346,35 @@ namespace GlbMerger
             };
 
             // Every item owns a disjoint rectangle of the atlas, so they can all be written in parallel.
+            // Progress through them goes by texels, which is what the time goes on.
+            const double RenderStart = 0.05, RenderEnd = 0.85;
+            long totalTexels = Math.Max(1, items.Sum(it => (long)it.W * it.H)), doneTexels = 0;
+            int reportedPermille = -1;
+            progress?.Report(new ModelFlattener.StageProgress(RenderStart, "Rendering billboards"));
             var masked = new bool[items.Count];
-            Parallel.For(0, items.Count, new ParallelOptions { CancellationToken = ct }, i =>
+            // Largest first: the big facades start straight away instead of one of them being
+            // left to run alone at the end, and the many small items then fill in the rest.
+            var order = Enumerable.Range(0, items.Count).OrderByDescending(i => (long)items[i].W * items[i].H).ToArray();
+            void Advance(long texels)
+            {
+                if (progress == null || texels <= 0) return;
+                long done = Interlocked.Add(ref doneTexels, texels);
+                int permille = (int)(done * 1000 / totalTexels);
+                int last = Volatile.Read(ref reportedPermille);
+                if (permille >= last + 5 && Interlocked.CompareExchange(ref reportedPermille, permille, last) == last)
+                    progress.Report(new ModelFlattener.StageProgress(RenderStart + (RenderEnd - RenderStart) * permille / 1000.0, "Rendering billboards"));
+            }
+            Parallel.ForEach(order, new ParallelOptions { CancellationToken = ct }, i =>
             {
                 var item = items[i];
-                if (item.Billboard >= 0) masked[i] = RenderBillboard(input, flat, item.Billboard, src, item, settings, result);
+                // A billboard reports its rows as they're done, or one big facade held the bar
+                // still for a quarter of the bake; the item's padding is counted at the end.
+                long counted = 0;
+                if (item.Billboard >= 0)
+                    masked[i] = RenderBillboard(input, flat, item.Billboard, src, item, settings, result,
+                        progress == null ? null : texels => { Interlocked.Add(ref counted, texels); Advance(texels); });
                 else CopyChart(src, item, result);
+                Advance((long)item.W * item.H - Interlocked.Read(ref counted));
             });
             ct.ThrowIfCancellationRequested();
 
@@ -369,16 +400,29 @@ namespace GlbMerger
             result.MaskedBillboards = masked.Count(m => m);
             result.UsesAlpha = result.MaskedBillboards > 0;
 
+            progress?.Report(new ModelFlattener.StageProgress(RenderEnd, "Building the mesh"));
             EmitGeometry(input, flat, items, src, settings, result);
 
+            // The encodes share what's left before PngDone.
+            int images = 1 + (result.HasNormals ? 1 : 0) + (result.HasMetallicRoughness ? 1 : 0), encoded = 0;
+            void Encoding(string what) =>
+                progress?.Report(new ModelFlattener.StageProgress(0.88 + (PngDone - 0.88) * encoded++ / images, "Encoding " + what));
+            Encoding("the colour atlas");
             using (var bmp = TextureAtlasUtil.WritePixels(result.AtlasBgra, width, height))
                 result.AtlasPng = TextureAtlasUtil.EncodePng(bmp);
             if (result.HasNormals)
+            {
+                Encoding("the normal map");
                 using (var bmp = TextureAtlasUtil.WritePixels(result.NormalBgra, width, height))
                     result.NormalPng = TextureAtlasUtil.EncodePng(bmp);
+            }
             if (result.HasMetallicRoughness)
+            {
+                Encoding("the metallic/roughness map");
                 using (var bmp = TextureAtlasUtil.WritePixels(result.MetallicRoughnessBgra, width, height))
                     result.MetallicRoughnessPng = TextureAtlasUtil.EncodePng(bmp);
+            }
+            progress?.Report(new ModelFlattener.StageProgress(PngDone, "Finishing"));
             return result;
         }
 
@@ -651,7 +695,7 @@ namespace GlbMerger
 
         // Returns true if the billboard needs alpha.
         private static bool RenderBillboard(ModelFlattener.FlattenInput input, ModelFlattener.FlattenResult flat, int index,
-            BakeSource src, Item item, BakeSettings settings, BakeResult atlas)
+            BakeSource src, Item item, BakeSettings settings, BakeResult atlas, Action<long>? texelsDone = null)
         {
             var bb = flat.Billboards[index];
             int w = item.W - Pad * 2, h = item.H - Pad * 2;
@@ -693,7 +737,9 @@ namespace GlbMerger
             var fill = new List<RasterTri>();
             float behind = -input.Extent * 0.1f;
             float reach = flat.Tolerance * 2f;
-            bool backfill = !bb.Side && !bb.Detail && !bb.Backdrop && bb.Curve == null && bb.Coverage >= 0.5f;
+            // Nor a part (a fire escape's, an overhang's), which draws everything in its box
+            // already: past a cornice's slope that reached the roof behind it.
+            bool backfill = !bb.Side && !bb.Detail && !bb.Backdrop && !bb.Part && bb.Curve == null && bb.Coverage >= 0.5f;
             for (int t = 0; backfill && t < input.TriangleCount; t++)
             {
                 int a = flat.Assignment[t];
@@ -726,7 +772,7 @@ namespace GlbMerger
                 {
                     float da = rt.Za - bb.Offset, db = rt.Zb - bb.Offset, dc = rt.Zc - bb.Offset;
                     if (MathF.Max(MathF.Abs(da), MathF.Max(MathF.Abs(db), MathF.Abs(dc))) < tiny) continue;
-                    foreach (float tan in SweepTangents)
+                    foreach (float tan in SweepTangentsFor(bb))
                         sweep.Add(new RasterTri(rt.A - new Vector2(0, da * tan * sy), rt.B - new Vector2(0, db * tan * sy),
                             rt.C - new Vector2(0, dc * tan * sy), rt.Za, rt.Zb, rt.Zc, rt.Tri));
                 }
@@ -756,6 +802,7 @@ namespace GlbMerger
             {
                 int row0 = band * BandRows;
                 int rows = Math.Min(BandRows, h - row0);
+                texelsDone?.Invoke((long)rows * item.W);
                 int sRow0 = row0 * SS, sRows = rows * SS;
                 var ownTri = RasterBand(own, ownBuckets[band], sw, sRow0, sRows);
                 var fillTri = fill.Count > 0 ? RasterBand(fill, fillBuckets[band], sw, sRow0, sRows) : null;
@@ -903,9 +950,9 @@ namespace GlbMerger
 
             // A grating floor is baked solid inside its outline (see Billboard.FillHoles); the
             // holes take the colour bled in from the slats around them.
-            if (bb.FillHoles)
+            if (bb.FillHoles || bb.FillEnclosed)
             {
-                var enclosed = BoundedHoles(solid, w, h);
+                var enclosed = bb.FillHoles ? BoundedHoles(solid, w, h) : EnclosedHoles(solid, w, h, int.MaxValue);
                 for (int i = 0; i < w * h; i++)
                     if (enclosed[i]) { alpha[i] = 255; solid[i] = true; }
             }

@@ -40,8 +40,11 @@ namespace GlbMerger
     // One of the four modes hosted by ModelEditorForm (see EditorMode there),
     // which owns the window chrome shared by all four, so this control only
     // contributes its own left-hand controls and 3D preview.
-    public class BallAnchorEditor : UserControl
+    public class BallAnchorEditor : UserControl, IUnappliedChanges
     {
+        // Each setting's description, shown on hover (see HelpTips).
+        private readonly HelpTips _help;
+
         private readonly ModelRoot _model;
         private readonly AppSettings _settings;
 
@@ -88,6 +91,25 @@ namespace GlbMerger
         private (float X, float Y, float Z) _rightPos, _leftPos;
         private (int X, int Y, int Z) _rightRotDeg, _leftRotDeg;
 
+        // What's in the model: loaded at start, updated by each save (SaveAnchorFor,
+        // SaveArmCategory).
+        private (float X, float Y, float Z) _savedRightPos, _savedLeftPos;
+        private (int X, int Y, int Z) _savedRightRotDeg, _savedLeftRotDeg;
+        private readonly JointDeg[,] _savedArmDeg = new JointDeg[4, 3];
+        public bool HasUnappliedChanges
+        {
+            get
+            {
+                if (_rightPos != _savedRightPos || _leftPos != _savedLeftPos
+                    || _rightRotDeg != _savedRightRotDeg || _leftRotDeg != _savedLeftRotDeg) return true;
+                for (int c = 0; c < 4; c++)
+                    for (int j = 0; j < 3; j++)
+                        if (!_armDeg[c, j].Equals(_savedArmDeg[c, j])) return true;
+                return false;
+            }
+        }
+        public string UnappliedChangesDescription => "anchor or arm pose edits not yet saved";
+
         // Preview-only: mirrors the game's Renderer::CarriedBallPose
         // kHandoffHalfWidth constant (currently hardcoded to 0.15f in the
         // C++). Not yet written back to the model or read by the game - see
@@ -128,6 +150,7 @@ namespace GlbMerger
 
         public BallAnchorEditor(ModelRoot model, bool darkMode = false, AppSettings? settings = null)
         {
+            _help = new HelpTips(this);
             _model = model;
             _settings = settings ?? new AppSettings();
             _rightHand = FindHandNode(_model, right: true);
@@ -146,6 +169,8 @@ namespace GlbMerger
             PopulateAnimationList();
             RefreshUiFromState();
             RefreshArmUiFromState();
+            (_savedRightPos, _savedLeftPos, _savedRightRotDeg, _savedLeftRotDeg) = (_rightPos, _leftPos, _rightRotDeg, _leftRotDeg);
+            Array.Copy(_armDeg, _savedArmDeg, _armDeg.Length);
 
             ThemeManager.Apply(this, darkMode);
 
@@ -513,16 +538,11 @@ namespace GlbMerger
 
             armFlow.Controls.Add(new Label { Text = "Arm Pose:", AutoSize = true, Margin = new Padding(3, 10, 3, 4) });
 
-            var lblArmInfo = new Label
-            {
-                AutoSize = true, MaximumSize = new System.Drawing.Size(300, 0), Margin = new Padding(3, 0, 3, 10),
-                Text = "Right/Left above = the carry pose that hand locks to while holding the ball. " +
+            _help.Add(armFlow, "Right/Left above = the carry pose that hand locks to while holding the ball. " +
                        "Merged above = the single shared pose both arms ease toward mid-handoff - edited once, " +
                        "right-handed, and mirrored onto the left arm automatically, since they meet in the middle " +
                        "symmetrically. The preview always shows Merged at full strength, with the ball staying " +
-                       "wherever Right/Left last left it."
-            };
-            armFlow.Controls.Add(lblArmInfo);
+                       "wherever Right/Left last left it.");
 
             const int kRowHeaderTop   = 26;
             const int kLabelToSlider  = 26;
@@ -728,6 +748,8 @@ namespace GlbMerger
             anchor.Name = anchorName;
             anchor.WithLocalTranslation(new Vector3(pos.X, pos.Y, pos.Z));
             anchor.WithLocalRotation(ComputeOffsetQuaternion(rot.X, rot.Y, rot.Z));
+            if (right) (_savedRightPos, _savedRightRotDeg) = (_rightPos, _rightRotDeg);
+            else (_savedLeftPos, _savedLeftRotDeg) = (_leftPos, _leftRotDeg);
             return true;
         }
 
@@ -923,6 +945,7 @@ namespace GlbMerger
                 var d = _armDeg[category, joint];
                 marker.WithLocalRotation(ComputeOffsetQuaternion(d.X, d.Y, d.Z));
             }
+            for (int j = 0; j < 3; j++) _savedArmDeg[category, j] = _armDeg[category, j];
             return true;
         }
 

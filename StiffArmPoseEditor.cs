@@ -33,7 +33,7 @@ namespace GlbMerger
     // One of the four modes hosted by ModelEditorForm (see EditorMode there),
     // which owns the window chrome shared by all four, so this control only
     // contributes its own left-hand controls and 3D preview.
-    public class StiffArmPoseEditor : UserControl
+    public class StiffArmPoseEditor : UserControl, IUnappliedChanges
     {
         private readonly ModelRoot _model;
         private readonly AppSettings _settings;
@@ -58,6 +58,21 @@ namespace GlbMerger
         private struct JointDeg { public int X, Y, Z; }
         // [side (0=right,1=left), pose (0=forward,1=side,2=down), joint (0=shoulder,1=elbow,2=wrist)]
         private readonly JointDeg[,,] _deg = new JointDeg[2, 3, 3];
+
+        // What's in the model: loaded at start, updated by each save (SaveSidePose).
+        private readonly JointDeg[,,] _savedDeg = new JointDeg[2, 3, 3];
+        public bool HasUnappliedChanges
+        {
+            get
+            {
+                for (int s = 0; s < 2; s++)
+                    for (int p = 0; p < 3; p++)
+                        for (int j = 0; j < 3; j++)
+                            if (!_deg[s, p, j].Equals(_savedDeg[s, p, j])) return true;
+                return false;
+            }
+        }
+        public string UnappliedChangesDescription => "arm pose edits not yet saved";
 
         private readonly Node? _rightWrist, _leftWrist;
         private readonly Node? _rightElbow, _leftElbow;
@@ -89,6 +104,7 @@ namespace GlbMerger
             LoadAllExisting();
             PopulateAnimationList();
             RefreshUiFromState();
+            Array.Copy(_deg, _savedDeg, _deg.Length);
 
             ThemeManager.Apply(this, darkMode);
 
@@ -557,6 +573,8 @@ namespace GlbMerger
                 var d = _deg[side, pose, joint];
                 marker.WithLocalRotation(ComputeOffsetQuaternion(d.X, d.Y, d.Z));
             }
+            int savedSide = right ? 0 : 1;
+            for (int j = 0; j < 3; j++) _savedDeg[savedSide, pose, j] = _deg[savedSide, pose, j];
             return true;
         }
 

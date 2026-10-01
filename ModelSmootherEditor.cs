@@ -48,6 +48,9 @@ namespace GlbMerger
     // One of the modes hosted by ModelEditorForm (see EditorMode there).
     public class ModelSmootherEditor : UserControl
     {
+        // Each setting's description, shown on hover (see HelpTips).
+        private readonly HelpTips _help;
+
         private readonly ModelRoot _model;
 
         private WebView2 _webView = null!;
@@ -66,6 +69,7 @@ namespace GlbMerger
 
         public ModelSmootherEditor(ModelRoot model, bool darkMode = false)
         {
+            _help = new HelpTips(this);
             _model = model;
 
             Dock = DockStyle.Fill;
@@ -98,10 +102,10 @@ namespace GlbMerger
                 Margin = new Padding(3, 0, 3, 8),
             });
 
-            flow.Controls.Add(HelpText(
+            _help.Add(flow, 
                 "Drag over a bump or spike on the surface - it relaxes toward its surroundings live, " +
                 "for as long as the brush is held over it. Release to commit the stroke; the model " +
-                "you see is always the model that gets saved."));
+                "you see is always the model that gets saved.");
 
             _chkPaintMode = new CheckBox
             {
@@ -134,20 +138,20 @@ namespace GlbMerger
             flow.Controls.Add(_lblStrength);
             flow.Controls.Add(_sliderStrength);
 
-            flow.Controls.Add(HelpText(
+            _help.Add(flow, 
                 "How far the surface moves toward its neighbours per frame while the brush is held. " +
                 "It runs continuously, not once per stroke - low strength held a moment is gentle, " +
-                "high strength (or holding longer) flattens fast and can round off nearby detail."));
+                "high strength (or holding longer) flattens fast and can round off nearby detail.");
 
             _btnRevert = MakeButton("Revert Smoothing");
             _btnRevert.Enabled = false;
             _btnRevert.Click += (s, e) => RevertSmoothing();
             flow.Controls.Add(_btnRevert);
 
-            flow.Controls.Add(HelpText(
+            _help.Add(flow, 
                 "Each stroke moves vertex positions (and recomputes normals nearby) as soon as you " +
                 "release the brush - triangle count, UVs and skinning are never touched. Included the " +
-                "next time you save the merge."));
+                "next time you save the merge.");
 
             _lblStatus = new Label
             {
@@ -163,14 +167,6 @@ namespace GlbMerger
             Controls.Add(controlPanel);
         }
 
-        private static Label HelpText(string text) => new Label
-        {
-            Text = text,
-            AutoSize = true,
-            MaximumSize = new System.Drawing.Size(340, 0),
-            Margin = new Padding(3, 0, 3, 12),
-            ForeColor = System.Drawing.Color.Gray,
-        };
 
         private static Button MakeButton(string text) => new Button
         {

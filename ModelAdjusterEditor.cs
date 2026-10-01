@@ -51,7 +51,7 @@ namespace GlbMerger
     //
     // One of the modes hosted by ModelEditorForm (see EditorMode there), which owns the window
     // chrome, so this control only contributes its own left-hand controls and 3D preview.
-    public class ModelAdjusterEditor : UserControl
+    public class ModelAdjusterEditor : UserControl, IUnappliedChanges
     {
         private const int MinPercent = 25;
         private const int MaxPercent = 300;
@@ -965,6 +965,11 @@ namespace GlbMerger
 
         private static IEnumerable<string> Unapplied(Dictionary<string, int> pending, Dictionary<string, int> applied) =>
             Unapplied(pending, applied, DefaultPercent);
+
+        public bool HasUnappliedChanges =>
+            UnappliedLengths().Any() || Unapplied(_pendingThickness, _appliedThickness).Any()
+            || UnappliedSizes().Any() || Unapplied(_pendingGroupSize, _appliedGroupSize).Any();
+        public string UnappliedChangesDescription => "bone adjustments";
 
         private IEnumerable<string> UnappliedSizes() => Unapplied(_pendingSize, _appliedSize, ScalePercent.Default);
 
