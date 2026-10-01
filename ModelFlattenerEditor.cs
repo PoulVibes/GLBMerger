@@ -1229,8 +1229,14 @@ namespace GlbMerger
                                     var mats = Array.isArray(obj.material) ? obj.material : [obj.material];
                                     mats.forEach(function (mat) {
                                         mat.side = THREE.DoubleSide;
-                                        mat.transparent = false;
-                                        mat.depthWrite = true;
+                                        // Opaque with depth writes, but still alpha-tested where
+                                        // the texture has cut-outs; real translucency (glass) keeps
+                                        // its blending.
+                                        if (mat.transparent && mat.opacity >= 0.5) {
+                                            mat.transparent = false;
+                                            mat.depthWrite = true;
+                                            if (!mat.alphaTest) mat.alphaTest = 0.5;
+                                        }
                                         mat.polygonOffset = true; mat.polygonOffsetFactor = 1; mat.polygonOffsetUnits = 1;
                                     });
                                 });

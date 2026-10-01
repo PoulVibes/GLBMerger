@@ -822,18 +822,40 @@ namespace GlbMerger
 
                     window.stopRange = function () { stopRangeInternal(); };
 
+                    // How the <model-viewer> previews keep the far side of a model from showing
+                    // through its near side WITHOUT losing its cut-outs. BLEND with no real
+                    // translucency (alpha 1.0 - common out of Meshy/Blender) draws in the
+                    // transparent pass with depth writes off, so nothing occludes anything; drawn
+                    // alpha-tested instead it writes depth like an opaque surface, and anything the
+                    // texture's alpha cuts away (a flattened building's window gaps, foliage)
+                    // still stays cut away. MASK already is exactly that. Only a genuinely
+                    // translucent material (glass, base alpha under a half) stays BLEND - forcing
+                    // it to anything else would make it solid or make it vanish.
+                    function keepCutouts(mat) {
+                        if (mat.getAlphaMode() !== 'BLEND') return;
+                        var factor = mat.pbrMetallicRoughness && mat.pbrMetallicRoughness.baseColorFactor;
+                        if (factor && factor[3] < 0.5) return;
+                        mat.setAlphaMode('MASK');
+                        mat.setAlphaCutoff(0.5);
+                    }
+
                     // -1 shows everything; anything else fades every OTHER material almost fully
                     // out rather than hiding it outright, so the isolated one still reads in
-                    // context.
+                    // context. A shown material goes back to how it was loaded (keepCutouts
+                    // applied, so cut-outs stay cut out and real translucency keeps its alpha)
+                    // rather than to OPAQUE at full alpha.
                     window.isolateMaterial = function (idx) {
                         if (!loaded) return;
                         (viewer.model.materials || []).forEach(function (mat, i) {
                             var visible = idx < 0 || i === idx;
-                            mat.setAlphaMode(visible ? 'OPAQUE' : 'BLEND');
-                            if (mat.pbrMetallicRoughness) {
-                                var factor = mat.pbrMetallicRoughness.baseColorFactor || [1, 1, 1, 1];
-                                mat.pbrMetallicRoughness.setBaseColorFactor([factor[0], factor[1], factor[2], visible ? 1 : 0.05]);
+                            var pbr = mat.pbrMetallicRoughness;
+                            var factor = (pbr && pbr.baseColorFactor) || [1, 1, 1, 1];
+                            if (mat.__shown === undefined) {
+                                keepCutouts(mat);
+                                mat.__shown = { mode: mat.getAlphaMode(), alpha: factor[3] };
                             }
+                            mat.setAlphaMode(visible ? mat.__shown.mode : 'BLEND');
+                            if (pbr) pbr.setBaseColorFactor([factor[0], factor[1], factor[2], visible ? mat.__shown.alpha : 0.05]);
                         });
                     };
 

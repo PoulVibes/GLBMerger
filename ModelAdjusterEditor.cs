@@ -2031,11 +2031,32 @@ namespace GlbMerger
                                     }
                                 });
 
+                                // Shown, a material draws opaque with depth writes, but alpha-tested
+                                // where its texture has cut-outs (GLTFLoader's alphaTest for MASK;
+                                // 0.5 for a BLEND one that isn't really translucent) - forced
+                                // opaque, a flattened building's see-through gaps turned solid.
+                                // Genuinely translucent materials (glass) keep their blending.
+                                // Faded, the alpha test is off, or a cut-out material at 5% opacity
+                                // falls under it everywhere and vanishes instead of fading.
+                                function showMaterial(mat, visible) {
+                                    if (!mat.userData.shown) {
+                                        var translucent = mat.transparent && mat.opacity < 0.5;
+                                        mat.userData.shown = {
+                                            translucent: translucent, opacity: mat.opacity,
+                                            alphaTest: mat.transparent && !translucent ? 0.5 : mat.alphaTest,
+                                        };
+                                    }
+                                    var shown = mat.userData.shown;
+                                    mat.transparent = !visible || shown.translucent;
+                                    mat.opacity = visible ? (shown.translucent ? shown.opacity : 1) : 0.05;
+                                    mat.alphaTest = visible && !shown.translucent ? shown.alphaTest : 0;
+                                    mat.needsUpdate = true;
+                                    mat.depthWrite = visible && !shown.translucent;
+                                }
+
                                 orderedMaterials.forEach(function (mat, i) {
                                     var visible = i === 0;
-                                    mat.transparent = !visible;
-                                    mat.opacity = visible ? 1 : 0.05;
-                                    mat.depthWrite = visible;
+                                    showMaterial(mat, visible);
                                     if (typeof mat.metalness === 'number') mat.metalness = Math.min(mat.metalness, 0.15);
                                     if (typeof mat.roughness === 'number') mat.roughness = Math.max(mat.roughness, 0.7);
                                 });

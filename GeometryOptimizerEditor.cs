@@ -1744,6 +1744,23 @@ namespace GlbMerger
                     var loaded = false;
                     var currentUrl = viewer.getAttribute('src');
 
+                    // How the <model-viewer> previews keep the far side of a model from showing
+                    // through its near side WITHOUT losing its cut-outs. BLEND with no real
+                    // translucency (alpha 1.0 - common out of Meshy/Blender) draws in the
+                    // transparent pass with depth writes off, so nothing occludes anything; drawn
+                    // alpha-tested instead it writes depth like an opaque surface, and anything the
+                    // texture's alpha cuts away (a flattened building's window gaps, foliage)
+                    // still stays cut away. MASK already is exactly that. Only a genuinely
+                    // translucent material (glass, base alpha under a half) stays BLEND - forcing
+                    // it to anything else would make it solid or make it vanish.
+                    function keepCutouts(mat) {
+                        if (mat.getAlphaMode() !== 'BLEND') return;
+                        var factor = mat.pbrMetallicRoughness && mat.pbrMetallicRoughness.baseColorFactor;
+                        if (factor && factor[3] < 0.5) return;
+                        mat.setAlphaMode('MASK');
+                        mat.setAlphaCutoff(0.5);
+                    }
+
                     viewer.addEventListener('load', function () {
                         (viewer.model.materials || []).forEach(function (mat) {
                             // Forcing OPAQUE is what stops the far side of the model showing
@@ -1757,7 +1774,10 @@ namespace GlbMerger
                             // and for a tool about triangle density a solid model is the right
                             // preview anyway. AnimationTrimEditor already gets this for free from
                             // isolateMaterial(-1); it just isn't obvious that's what's doing it.
-                            mat.setAlphaMode('OPAQUE');
+                            // Not OPAQUE, though: forced OPAQUE, every see-through gap in an
+                            // alpha-tested model (a flattened billboard building) turned into a
+                            // solid slab. keepCutouts gets the depth writes without that.
+                            keepCutouts(mat);
 
                             // Same preview-only matte-plastic tweak AnimationTrimEditor applies -
                             // never touches the saved file.
@@ -1841,12 +1861,26 @@ namespace GlbMerger
                     var depthMaskGroup = new THREE.Group();
                     overlayScene.add(depthMaskGroup);
 
+                    // The depth pass has to be cut out where the model is: a mesh whose texture
+                    // alpha cuts parts of it away (a flattened billboard building's window gaps,
+                    // foliage) would otherwise hide the wireframe and the paint on whatever shows
+                    // through those gaps. Such a mesh gets its own copy of the mask with the
+                    // texture and an alpha test (its own cutoff, or 0.5 as keepCutouts gives BLEND).
+                    function depthMaskFor(object) {
+                        var src = Array.isArray(object.material) ? object.material[0] : object.material;
+                        if (!src || !src.map || !(src.alphaTest > 0 || src.transparent)) return depthMaskMaterial;
+                        var mask = depthMaskMaterial.clone();
+                        mask.map = src.map;
+                        mask.alphaTest = src.alphaTest > 0 ? src.alphaTest : 0.5;
+                        return mask;
+                    }
+
                     function rebuildDepthMask() {
                         for (var i = depthMaskGroup.children.length - 1; i >= 0; i--) {
                             depthMaskGroup.remove(depthMaskGroup.children[i]);
                         }
                         paintableMeshes.forEach(function (meshInfo) {
-                            var maskMesh = new THREE.Mesh(meshInfo.object.geometry, depthMaskMaterial);
+                            var maskMesh = new THREE.Mesh(meshInfo.object.geometry, depthMaskFor(meshInfo.object));
                             maskMesh.matrixAutoUpdate = false;
                             maskMesh.matrix.copy(meshInfo.object.matrixWorld);
                             depthMaskGroup.add(maskMesh);

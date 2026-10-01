@@ -470,15 +470,36 @@ namespace GlbMerger
                                 // Default to showing only the first material, same as the main
                                 // model viewer - the rest start faded out instead of everything
                                 // being shown at once.
-                                orderedMaterials.forEach(function (mat, i) {
-                                    var visible = i === 0;
-                                    mat.transparent = !visible;
-                                    mat.opacity = visible ? 1 : 0.05;
+                                // Shown, a material draws opaque with depth writes, but alpha-tested
+                                // where its texture has cut-outs (GLTFLoader's alphaTest for MASK;
+                                // 0.5 for a BLEND one that isn't really translucent) - forced
+                                // opaque, a flattened building's see-through gaps turned solid.
+                                // Genuinely translucent materials (glass) keep their blending.
+                                // Faded, the alpha test is off, or a cut-out material at 5% opacity
+                                // falls under it everywhere and vanishes instead of fading.
+                                function showMaterial(mat, visible) {
+                                    if (!mat.userData.shown) {
+                                        var translucent = mat.transparent && mat.opacity < 0.5;
+                                        mat.userData.shown = {
+                                            translucent: translucent, opacity: mat.opacity,
+                                            alphaTest: mat.transparent && !translucent ? 0.5 : mat.alphaTest,
+                                        };
+                                    }
+                                    var shown = mat.userData.shown;
+                                    mat.transparent = !visible || shown.translucent;
+                                    mat.opacity = visible ? (shown.translucent ? shown.opacity : 1) : 0.05;
+                                    mat.alphaTest = visible && !shown.translucent ? shown.alphaTest : 0;
+                                    mat.needsUpdate = true;
                                     // Faded-out materials must not write depth, or their invisible
                                     // triangles still occlude the visible mesh behind them - this is
                                     // what caused the see-through/depth-confusion glitches, especially
                                     // once the skinned mesh deforms (e.g. arms swinging).
-                                    mat.depthWrite = visible;
+                                    mat.depthWrite = visible && !shown.translucent;
+                                }
+
+                                orderedMaterials.forEach(function (mat, i) {
+                                    var visible = i === 0;
+                                    showMaterial(mat, visible);
 
                                     // Same metallic/roughness dampening as the main model viewer,
                                     // so this preview doesn't look shinier/darker than the real thing.

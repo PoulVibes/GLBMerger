@@ -852,9 +852,25 @@ namespace GlbMerger
                     </div>
                 </div>
                 <script>
+                    // How the <model-viewer> previews keep the far side of a model from showing
+                    // through its near side WITHOUT losing its cut-outs. BLEND with no real
+                    // translucency (alpha 1.0 - common out of Meshy/Blender) draws in the
+                    // transparent pass with depth writes off, so nothing occludes anything; drawn
+                    // alpha-tested instead it writes depth like an opaque surface, and anything the
+                    // texture's alpha cuts away (a flattened building's window gaps, foliage)
+                    // still stays cut away. MASK already is exactly that. Only a genuinely
+                    // translucent material (glass, base alpha under a half) stays BLEND - forcing
+                    // it to anything else would make it solid or make it vanish.
+                    function keepCutouts(mat) {
+                        if (mat.getAlphaMode() !== 'BLEND') return;
+                        var factor = mat.pbrMetallicRoughness && mat.pbrMetallicRoughness.baseColorFactor;
+                        if (factor && factor[3] < 0.5) return;
+                        mat.setAlphaMode('MASK');
+                        mat.setAlphaCutoff(0.5);
+                    }
                     function fixMaterials(viewer) {
                         (viewer.model.materials || []).forEach(function (mat) {
-                            mat.setAlphaMode('OPAQUE');
+keepCutouts(mat);
                             if (mat.pbrMetallicRoughness) {
                                 var pbr = mat.pbrMetallicRoughness;
                                 pbr.setMetallicFactor(Math.min(pbr.metallicFactor, 0.15));
@@ -989,12 +1005,26 @@ namespace GlbMerger
                     var depthMaskGroup = new THREE.Group();
                     overlayScene.add(depthMaskGroup);
 
+                    // The depth pass has to be cut out where the model is: a mesh whose texture
+                    // alpha cuts parts of it away (a flattened billboard building's window gaps,
+                    // foliage) would otherwise hide the wireframe and the paint on whatever shows
+                    // through those gaps. Such a mesh gets its own copy of the mask with the
+                    // texture and an alpha test (its own cutoff, or 0.5 as keepCutouts gives BLEND).
+                    function depthMaskFor(object) {
+                        var src = Array.isArray(object.material) ? object.material[0] : object.material;
+                        if (!src || !src.map || !(src.alphaTest > 0 || src.transparent)) return depthMaskMaterial;
+                        var mask = depthMaskMaterial.clone();
+                        mask.map = src.map;
+                        mask.alphaTest = src.alphaTest > 0 ? src.alphaTest : 0.5;
+                        return mask;
+                    }
+
                     function rebuildDepthMask() {
                         for (var i = depthMaskGroup.children.length - 1; i >= 0; i--) {
                             depthMaskGroup.remove(depthMaskGroup.children[i]);
                         }
                         paintableMeshes.forEach(function (meshInfo) {
-                            var maskMesh = makeSkinnedCopy(meshInfo.object, meshInfo.object.geometry, depthMaskMaterial);
+                            var maskMesh = makeSkinnedCopy(meshInfo.object, meshInfo.object.geometry, depthMaskFor(meshInfo.object));
                             depthMaskGroup.add(maskMesh);
                         });
                     }

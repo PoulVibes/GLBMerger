@@ -591,10 +591,27 @@ namespace GlbMerger
                     // <model-viewer> setup was written independently - if a THIRD preview gets
                     // added anywhere in this app, it needs this same 'load' handler, unconditionally,
                     // not just when alpha looks like it's exactly 1.0 (the alpha may live in the
-                    // base-colour texture, which isn't readable from here).
+                    // base-colour texture, which isn't readable from here) - by keepCutouts
+                    // rather than OPAQUE, which turned every cut-out solid.
+                    // How the <model-viewer> previews keep the far side of a model from showing
+                    // through its near side WITHOUT losing its cut-outs. BLEND with no real
+                    // translucency (alpha 1.0 - common out of Meshy/Blender) draws in the
+                    // transparent pass with depth writes off, so nothing occludes anything; drawn
+                    // alpha-tested instead it writes depth like an opaque surface, and anything the
+                    // texture's alpha cuts away (a flattened building's window gaps, foliage)
+                    // still stays cut away. MASK already is exactly that. Only a genuinely
+                    // translucent material (glass, base alpha under a half) stays BLEND - forcing
+                    // it to anything else would make it solid or make it vanish.
+                    function keepCutouts(mat) {
+                        if (mat.getAlphaMode() !== 'BLEND') return;
+                        var factor = mat.pbrMetallicRoughness && mat.pbrMetallicRoughness.baseColorFactor;
+                        if (factor && factor[3] < 0.5) return;
+                        mat.setAlphaMode('MASK');
+                        mat.setAlphaCutoff(0.5);
+                    }
                     function fixMaterials(viewer) {
                         (viewer.model.materials || []).forEach(function (mat) {
-                            mat.setAlphaMode('OPAQUE');
+                            keepCutouts(mat);
                             if (mat.pbrMetallicRoughness) {
                                 var pbr = mat.pbrMetallicRoughness;
                                 pbr.setMetallicFactor(Math.min(pbr.metallicFactor, 0.15));

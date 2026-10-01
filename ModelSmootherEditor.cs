@@ -682,9 +682,14 @@ namespace GlbMerger
                                     // alphaMode BLEND with no real translucency - see
                                     // GeometryOptimizerEditor's identical fix for why that
                                     // combination otherwise lets the far side of the model show
-                                    // through the near side.
-                                    mat.transparent = false;
-                                    mat.depthWrite = true;
+                                    // through the near side. Alpha-tested rather than simply
+                                    // opaque, so cut-outs in the texture stay cut out; real
+                                    // translucency (glass, base alpha under a half) keeps blending.
+                                    if (mat.transparent && mat.opacity >= 0.5) {
+                                        mat.transparent = false;
+                                        mat.depthWrite = true;
+                                        if (!mat.alphaTest) mat.alphaTest = 0.5;
+                                    }
                                     if (typeof mat.metalness === 'number') mat.metalness = Math.min(mat.metalness, 0.15);
                                     if (typeof mat.roughness === 'number') mat.roughness = Math.max(mat.roughness, 0.7);
                                 });
