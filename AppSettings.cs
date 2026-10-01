@@ -30,6 +30,8 @@ namespace GlbMerger
         public bool FlattenBakeNormals { get; set; } = true;
         public bool FlattenBakeMetallicRoughness { get; set; } = true;
         public int FlattenTriangleBudget { get; set; } = 500;
+        // Flatten editor viewport background, as #RRGGBB.
+        public string FlattenBackgroundColor { get; set; } = "#1A1C1E";
         public string AnimationLibraryDirectory { get; set; } = @"C:\Projects\FootballRoguelite\Graphics\Models\Players";
 
         private static string SettingsPath => Path.Combine(

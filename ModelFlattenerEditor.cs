@@ -46,6 +46,7 @@ namespace GlbMerger
         private TrackBar _sliderStrength = null!, _sliderMinSize = null!, _sliderSideMinSize = null!, _sliderDetailBoost = null!, _sliderDetailStrength = null!, _sliderRecess = null!;
         private Label _lblStrength = null!, _lblMinSize = null!, _lblSideMinSize = null!, _lblDetailBoost = null!, _lblDetailStrength = null!, _lblRecess = null!, _lblStats = null!, _lblStatus = null!;
         private CheckBox _chkKeepLeftovers = null!, _chkSideDetail = null!, _chkTrimCorners = null!, _chkBakeNormals = null!, _chkBakeMr = null!, _chkOutline = null!, _chkHighlight = null!;
+        private Button _btnBackground = null!;
         private NumericUpDown _numBudget = null!;
         private Button _btnFitBudget = null!;
         private ComboBox _previewDropdown = null!, _cmbCurves = null!;
@@ -107,6 +108,7 @@ namespace GlbMerger
             BuildUi();
 
             ThemeManager.Apply(this, darkMode);
+            UpdateBackgroundButton();   // the theme repaints buttons; keep the colour swatch
 
             _debounce.Tick += (s, e) => { _debounce.Stop(); RunCompute(); };
 
@@ -426,6 +428,17 @@ namespace GlbMerger
                 if (Mode == PreviewMode.Baked && !BakeIsCurrent) _ = RunBakeAsync();
             };
             flow.Controls.Add(_previewDropdown);
+
+            var bgRow = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0, 0, 0, 4) };
+            bgRow.Controls.Add(new Label { Text = "Background:", AutoSize = true, Margin = new Padding(3, 7, 6, 3) });
+            _btnBackground = new Button { AutoSize = true, Margin = new Padding(0, 3, 6, 3) };
+            _btnBackground.Click += (s, e) => PickBackground();
+            bgRow.Controls.Add(_btnBackground);
+            var btnBackgroundReset = new Button { Text = "Reset", AutoSize = true, Margin = new Padding(0, 3, 3, 3) };
+            btnBackgroundReset.Click += (s, e) => SetBackground(DefaultBackground);
+            bgRow.Controls.Add(btnBackgroundReset);
+            flow.Controls.Add(bgRow);
+            UpdateBackgroundButton();
 
             _chkOutline = new CheckBox { Text = "Outline billboards", AutoSize = true, Checked = true, Margin = new Padding(3, 0, 3, 0) };
             _chkOutline.CheckedChanged += (s, e) => PushViewState();
@@ -1091,6 +1104,46 @@ namespace GlbMerger
                 $"loadBaked('https://appassets.local/{EscapeJs(Path.GetFileName(_bakePath))}');");
         }
 
+        private static readonly System.Drawing.Color DefaultBackground = System.Drawing.Color.FromArgb(0x1A, 0x1C, 0x1E);
+
+        private System.Drawing.Color BackgroundColor
+        {
+            get
+            {
+                try { return System.Drawing.ColorTranslator.FromHtml(_settings.FlattenBackgroundColor); }
+                catch { return DefaultBackground; }
+            }
+        }
+
+        private void PickBackground()
+        {
+            using var dlg = new ColorDialog { Color = BackgroundColor, FullOpen = true };
+            if (dlg.ShowDialog(this) == DialogResult.OK) SetBackground(dlg.Color);
+        }
+
+        private void SetBackground(System.Drawing.Color c)
+        {
+            _settings.FlattenBackgroundColor = $"#{c.R:X2}{c.G:X2}{c.B:X2}";
+            UpdateBackgroundButton();
+            PushBackground();
+        }
+
+        private void UpdateBackgroundButton()
+        {
+            var c = BackgroundColor;
+            _btnBackground.Text = _settings.FlattenBackgroundColor.ToUpperInvariant();
+            _btnBackground.BackColor = c;
+            _btnBackground.ForeColor = c.GetBrightness() > 0.5f ? System.Drawing.Color.Black : System.Drawing.Color.White;
+            _btnBackground.UseVisualStyleBackColor = false;
+        }
+
+        private void PushBackground()
+        {
+            if (!_viewerReady || _webView.CoreWebView2 == null) return;
+            var c = BackgroundColor;
+            _ = _webView.CoreWebView2.ExecuteScriptAsync($"setBackground({(c.R << 16) | (c.G << 8) | c.B});");
+        }
+
         private void PushViewState()
         {
             if (!_viewerReady || _webView.CoreWebView2 == null) return;
@@ -1142,6 +1195,7 @@ namespace GlbMerger
             if (action == "ready")
             {
                 _viewerReady = true;
+                PushBackground();
                 PushViewState();
                 PushPaintState();
                 PushResult();
@@ -1364,6 +1418,11 @@ namespace GlbMerger
                             else if (mode === 'baked' && !bakedRoot) setInfo('Baking textures...');
                             else setInfo('');
                         }
+
+                        window.setBackground = function (hex) {
+                            scene.background = new THREE.Color(hex);
+                            document.body.style.background = '#' + ('000000' + hex.toString(16)).slice(-6);
+                        };
 
                         window.setViewState = function (m, o, h, threshold) {
                             var recolor = h !== highlight;

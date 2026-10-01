@@ -214,8 +214,8 @@ namespace GlbMerger
                     var mrch = mat?.FindChannel("MetallicRoughness");
                     if (mrch.HasValue)
                     {
-                        sm.Metallic = mrch.Value.Parameter.X;
-                        sm.Roughness = mrch.Value.Parameter.Y;
+                        sm.Metallic = mrch.Value.GetFactor("MetallicFactor");
+                        sm.Roughness = mrch.Value.GetFactor("RoughnessFactor");
                         var mrimg = mrch.Value.Texture?.PrimaryImage;
                         if (mrimg != null) sm.MrTexture = Decode(mrimg);
                     }
@@ -224,7 +224,7 @@ namespace GlbMerger
                     if (nimg != null)
                     {
                         sm.NormalTexture = Decode(nimg);
-                        sm.NormalScale = nch!.Value.Parameter.X is > 0 and var scale ? scale : 1f;
+                        sm.NormalScale = nch!.Value.GetFactor("NormalScale") is > 0 and var scale ? scale : 1f;
                     }
                     src.Materials.Add(sm);
                     materialIndex[key] = mi = src.Materials.Count - 1;
