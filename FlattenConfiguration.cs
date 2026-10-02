@@ -21,6 +21,22 @@ namespace GlbMerger
         public bool BakeNormals { get; set; } = true;
         public bool BakeMetallicRoughness { get; set; } = true;
         public int DetailBoost { get; set; } = 20;
+        // Per group (see ModelFlattenerEditor's sections); -1 strength = same as the front walls,
+        // 0 budget = none. Older saved configurations read these as their defaults.
+        public int SideStrength { get; set; } = -1;
+        public int BackStrength { get; set; } = -1;
+        public int RoofStrength { get; set; } = -1;
+        public int SideBudget { get; set; }
+        public int BackBudget { get; set; }
+        public int RoofBudget { get; set; }
+        public int FireEscapeBudget { get; set; }
+        public bool Overhangs { get; set; } = true;
+        public bool EdgeStrips { get; set; } = true;
+        public bool Pediments { get; set; } = true;
+        public bool Columns { get; set; } = true;
+        public int OrnamentMethod { get; set; }
+        public int OrnamentMeshMax { get; set; } = 150;
+        public bool Backdrops { get; set; } = true;
 
         // Whether the two hold the same settings, whatever they're called.
         public bool SameSettingsAs(FlattenConfiguration other) => this with { Name = "" } == other with { Name = "" };

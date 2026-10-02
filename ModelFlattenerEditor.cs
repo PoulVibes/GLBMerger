@@ -33,7 +33,7 @@ namespace GlbMerger
     // WriteResultFile) so a slider change never has to re-save a 60 MB model.
     //
     // One of the modes hosted by ModelEditorForm (see EditorMode there).
-    public class ModelFlattenerEditor : UserControl, IUnappliedChanges
+    public partial class ModelFlattenerEditor : UserControl, IUnappliedChanges
     {
         // Each setting's description, shown on hover (see HelpTips).
         private readonly HelpTips _help;
@@ -48,6 +48,8 @@ namespace GlbMerger
 
         private WebView2 _webView = null!;
         private TrackBar _sliderStrength = null!, _sliderMinSize = null!, _sliderSideMinSize = null!, _sliderDetailBoost = null!, _sliderDetailStrength = null!, _sliderRecess = null!;
+        private TableLayoutPanel _groupList = null!;
+        private FeatureGroup _groupFocus = FeatureGroup.None;
         private Label _lblStrength = null!, _lblMinSize = null!, _lblSideMinSize = null!, _lblDetailBoost = null!, _lblDetailStrength = null!, _lblRecess = null!, _lblStats = null!, _lblStatus = null!;
         private CheckBox _chkKeepLeftovers = null!, _chkSideDetail = null!, _chkTrimCorners = null!, _chkBakeNormals = null!, _chkBakeMr = null!, _chkOutline = null!, _chkHighlight = null!;
         private Button _btnBackground = null!;
@@ -116,13 +118,14 @@ namespace GlbMerger
         // model is shared with every other editor mode and nothing else keeps a copy.
         private List<(Node Node, Mesh Mesh)>? _originalMeshes;
 
-        private enum PreviewMode { Billboards, Baked, Source, Original }
+        private enum PreviewMode { Billboards, Baked, Source, Original, Groups }
         private PreviewMode Mode => (PreviewMode)_previewDropdown.SelectedIndex;
 
-        public ModelFlattenerEditor(ModelRoot model, bool darkMode = false, AppSettings? settings = null)
+        public ModelFlattenerEditor(ModelRoot model, bool darkMode = false, AppSettings? settings = null, string? sourcePath = null)
         {
             _help = new HelpTips(this);
             _model = model;
+            _modelPath = sourcePath;
             _settings = settings ?? new AppSettings();
             _darkMode = darkMode;
 
@@ -158,6 +161,7 @@ namespace GlbMerger
                 return;
             }
             UpdateLabels();
+            LoadOverrides();
 
             _ = InitializeViewerAsync();
             RunCompute();
@@ -210,23 +214,26 @@ namespace GlbMerger
                 "setting afterwards switches this back to Custom Configuration. Save Configuration " +
                 "stores the current settings under a name (an existing name is replaced).");
 
+            BuildSections(flow);
+
             _lblStrength = new Label { AutoSize = true, Margin = new Padding(3, 0, 3, 0) };
             _sliderStrength = new TrackBar
             {
-                Width = 330, Height = 45, Minimum = 0, Maximum = 1000,
+                Width = 320, Height = 45, Minimum = 0, Maximum = 1000,
                 Value = Math.Clamp(_settings.FlattenStrength, 0, 1000),
                 TickFrequency = 100, SmallChange = 5, LargeChange = 50, Margin = new Padding(3, 0, 3, 4),
             };
             _sliderStrength.ValueChanged += (s, e) =>
             {
                 _settings.FlattenStrength = _sliderStrength.Value;
+                FollowFrontStrength();
                 UpdateLabels();
                 ScheduleCompute();
             };
-            flow.Controls.Add(_lblStrength);
-            flow.Controls.Add(_sliderStrength);
+            _secWalls.Controls.Add(_lblStrength);
+            _secWalls.Controls.Add(_sliderStrength);
 
-            _help.Add(flow, 
+            _help.Add(_secWalls, 
                 "How far any point of the surface may move to land on its billboard. Low flattens " +
                 "brick grooves, medium flattens window wells, max flattens the whole model into a card.");
 
@@ -235,7 +242,7 @@ namespace GlbMerger
                 FlowDirection = FlowDirection.LeftToRight, WrapContents = false,
                 AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Margin = new Padding(0, 0, 0, 4),
             };
-            budgetRow.Controls.Add(new Label { Text = "Triangle budget:", AutoSize = true, Margin = new Padding(3, 7, 6, 3) });
+            budgetRow.Controls.Add(new Label { Text = "Budget:", AutoSize = true, Margin = new Padding(3, 7, 6, 3) });
             _numBudget = new NumericUpDown
             {
                 Width = 80, Minimum = 4, Maximum = 1000000, Increment = 50,
@@ -245,18 +252,20 @@ namespace GlbMerger
             _numBudget.ValueChanged += (s, e) => _settings.FlattenTriangleBudget = (int)_numBudget.Value;
             budgetRow.Controls.Add(_numBudget);
             _btnFitBudget = new Button { Text = "Fit Strength", AutoSize = true, Margin = new Padding(0, 3, 3, 3) };
-            _btnFitBudget.Click += async (s, e) => await FitStrengthToBudgetAsync();
+            _btnFitBudget.Click += async (s, e) =>
+                await FitGroupAsync("Front walls", new[] { FeatureGroup.Front }, (int)_numBudget.Value, _sliderStrength, null, v => SettingsAt(v));
             budgetRow.Controls.Add(_btnFitBudget);
-            flow.Controls.Add(budgetRow);
+            _secWalls.Controls.Add(budgetRow);
 
-            _help.Add(flow, 
-                "Fit Strength finds the lowest Strength (most detail) whose result fits the budget, " +
-                "with every other setting as it is. Trimmed corners can add a few triangles on top.");
+            _help.Add(_secWalls, 
+                "The triangles the front walls end up as. Fit Strength finds the lowest Strength (most " +
+                "detail) that meets it, with every other setting as it is; groups set to the front's " +
+                "Strength move with it.");
 
             _lblMinSize = new Label { AutoSize = true, Margin = new Padding(3, 0, 3, 0) };
             _sliderMinSize = new TrackBar
             {
-                Width = 330, Height = 45, Minimum = 0, Maximum = 100,
+                Width = 320, Height = 45, Minimum = 0, Maximum = 100,
                 Value = Math.Clamp(_settings.FlattenMinSize, 0, 100),
                 TickFrequency = 10, Margin = new Padding(3, 0, 3, 4),
             };
@@ -266,8 +275,8 @@ namespace GlbMerger
                 UpdateLabels();
                 ScheduleCompute();
             };
-            flow.Controls.Add(_lblMinSize);
-            flow.Controls.Add(_sliderMinSize);
+            _secWalls.Controls.Add(_lblMinSize);
+            _secWalls.Controls.Add(_sliderMinSize);
 
             _chkKeepLeftovers = new CheckBox
             {
@@ -281,9 +290,9 @@ namespace GlbMerger
                 _settings.FlattenKeepLeftovers = _chkKeepLeftovers.Checked;
                 ScheduleCompute();
             };
-            flow.Controls.Add(_chkKeepLeftovers);
+            _secWalls.Controls.Add(_chkKeepLeftovers);
 
-            _help.Add(flow, 
+            _help.Add(_secWalls, 
                 "Surface patches smaller than this don't get a billboard of their own - awnings, " +
                 "AC units, curved or noisy bits. Kept, they stay as real triangles; dropped, they vanish.");
 
@@ -300,12 +309,12 @@ namespace GlbMerger
                 _sliderSideMinSize.Enabled = _chkSideDetail.Checked;
                 ScheduleCompute();
             };
-            flow.Controls.Add(_chkSideDetail);
+            _secSides.Controls.Add(_chkSideDetail);
 
             _lblSideMinSize = new Label { AutoSize = true, Margin = new Padding(3, 0, 3, 0) };
             _sliderSideMinSize = new TrackBar
             {
-                Width = 330, Height = 45, Minimum = 1, Maximum = 100,
+                Width = 320, Height = 45, Minimum = 1, Maximum = 100,
                 Value = Math.Clamp(_settings.FlattenSideMinSize, 1, 100),
                 TickFrequency = 10, Margin = new Padding(3, 0, 3, 4),
                 Enabled = _settings.FlattenSideDetail,
@@ -316,15 +325,15 @@ namespace GlbMerger
                 UpdateLabels();
                 ScheduleCompute();
             };
-            flow.Controls.Add(_lblSideMinSize);
-            flow.Controls.Add(_sliderSideMinSize);
+            _secSides.Controls.Add(_lblSideMinSize);
+            _secSides.Controls.Add(_sliderSideMinSize);
 
-            _help.Add(flow, 
+            _help.Add(_secSides, 
                 "Balcony side rails and stair stringers face sideways, so flattening them into the " +
                 "front billboard makes them vanish from any side view. With this on they get side-facing " +
                 "billboards of their own, down to this size.");
 
-            flow.Controls.Add(new Label { Text = "Curved walls (round bays, towers):", AutoSize = true, Margin = new Padding(3, 0, 3, 0) });
+            _secCurves.Controls.Add(new Label { Text = "Curved walls (round bays, towers):", AutoSize = true, Margin = new Padding(3, 0, 3, 0) });
             _cmbCurves = new ComboBox { Width = 330, DropDownStyle = ComboBoxStyle.DropDownList, Margin = new Padding(3, 0, 3, 4) };
             _cmbCurves.Items.AddRange(new object[] { "Flat planes", "Curved billboards", "Keep as simplified mesh" });
             _cmbCurves.SelectedIndex = Math.Clamp(_settings.FlattenCurves, 0, 2);
@@ -333,9 +342,9 @@ namespace GlbMerger
                 _settings.FlattenCurves = _cmbCurves.SelectedIndex;
                 ScheduleCompute();
             };
-            flow.Controls.Add(_cmbCurves);
+            _secCurves.Controls.Add(_cmbCurves);
 
-            _help.Add(flow, 
+            _help.Add(_secCurves, 
                 "Flat planes: cheapest, but bands and cornices round a curve break into chevrons from " +
                 "below. Curved billboards: one billboard bent round each curve, a few dozen triangles, " +
                 "reads as round. Keep as simplified mesh: closest to the original, but thousands of " +
@@ -344,7 +353,7 @@ namespace GlbMerger
             _lblDetailStrength = new Label { AutoSize = true, Margin = new Padding(3, 0, 3, 0) };
             _sliderDetailStrength = new TrackBar
             {
-                Width = 330, Height = 45, Minimum = 10, Maximum = 100,
+                Width = 320, Height = 45, Minimum = 10, Maximum = 100,
                 Value = Math.Clamp(_settings.FlattenDetailStrength, 10, 100),
                 TickFrequency = 10, Margin = new Padding(3, 0, 3, 4),
             };
@@ -354,10 +363,10 @@ namespace GlbMerger
                 UpdateLabels();
                 ScheduleCompute();
             };
-            flow.Controls.Add(_lblDetailStrength);
-            flow.Controls.Add(_sliderDetailStrength);
+            _secFire.Controls.Add(_lblDetailStrength);
+            _secFire.Controls.Add(_sliderDetailStrength);
 
-            _help.Add(flow, 
+            _help.Add(_secFire, 
                 "See-through structures (fire escapes, railings) are flattened with this share of the " +
                 "Strength instead, so a stair's front and wall-side stringers stay separate layers and " +
                 "still read as stairs from an angle. 100% = same as everything else.");
@@ -365,7 +374,7 @@ namespace GlbMerger
             _lblRecess = new Label { AutoSize = true, Margin = new Padding(3, 0, 3, 0) };
             _sliderRecess = new TrackBar
             {
-                Width = 330, Height = 45, Minimum = 0, Maximum = 100,
+                Width = 320, Height = 45, Minimum = 0, Maximum = 100,
                 Value = Math.Clamp(_settings.FlattenRecessDarkening, 0, 100),
                 TickFrequency = 10, Margin = new Padding(3, 0, 3, 4),
             };
@@ -375,10 +384,10 @@ namespace GlbMerger
                 UpdateLabels();
                 ScheduleCompute();
             };
-            flow.Controls.Add(_lblRecess);
-            flow.Controls.Add(_sliderRecess);
+            _secGlass.Controls.Add(_lblRecess);
+            _secGlass.Controls.Add(_sliderRecess);
 
-            _help.Add(flow, 
+            _help.Add(_secGlass, 
                 "Darkens what sat deeper than the surface around it (window glass, grooves), to keep " +
                 "a hint of the depth that flattening removed.");
 
@@ -394,9 +403,9 @@ namespace GlbMerger
                 _settings.FlattenTrimCorners = _chkTrimCorners.Checked;
                 ScheduleCompute();
             };
-            flow.Controls.Add(_chkTrimCorners);
+            _secBake.Controls.Add(_chkTrimCorners);
 
-            _help.Add(flow, 
+            _help.Add(_secBake, 
                 "Cuts a billboard's empty corners off diagonally (a stepped roofline, a stair flight): " +
                 "one more triangle per corner, but less see-through area for the game to alpha-test.");
 
@@ -412,9 +421,9 @@ namespace GlbMerger
                 _settings.FlattenBakeNormals = _chkBakeNormals.Checked;
                 ScheduleCompute();
             };
-            flow.Controls.Add(_chkBakeNormals);
+            _secBake.Controls.Add(_chkBakeNormals);
 
-            _help.Add(flow, 
+            _help.Add(_secBake, 
                 "A second atlas with the original surface's normals (vertex normals plus the source " +
                 "normal map), so flattened grooves and ornament still shade. Written as the material's " +
                 "normal texture - the game doesn't read it yet.");
@@ -431,9 +440,9 @@ namespace GlbMerger
                 _settings.FlattenBakeMetallicRoughness = _chkBakeMr.Checked;
                 ScheduleCompute();
             };
-            flow.Controls.Add(_chkBakeMr);
+            _secBake.Controls.Add(_chkBakeMr);
 
-            _help.Add(flow, 
+            _help.Add(_secBake, 
                 "A third atlas with the source's metallic/roughness texture, same layout. Without a " +
                 "source texture (or with this off) the source material's factors are used as constants. " +
                 "The game doesn't read it yet.");
@@ -441,7 +450,7 @@ namespace GlbMerger
             _lblDetailBoost = new Label { AutoSize = true, Margin = new Padding(3, 0, 3, 0) };
             _sliderDetailBoost = new TrackBar
             {
-                Width = 330, Height = 45, Minimum = 10, Maximum = 40,
+                Width = 320, Height = 45, Minimum = 10, Maximum = 40,
                 Value = Math.Clamp(_settings.FlattenDetailBoost, 10, 40),
                 TickFrequency = 5, Margin = new Padding(3, 0, 3, 4),
             };
@@ -451,13 +460,15 @@ namespace GlbMerger
                 UpdateLabels();
                 ScheduleCompute();
             };
-            flow.Controls.Add(_lblDetailBoost);
-            flow.Controls.Add(_sliderDetailBoost);
+            _secFire.Controls.Add(_lblDetailBoost);
+            _secFire.Controls.Add(_sliderDetailBoost);
 
-            _help.Add(flow, 
+            _help.Add(_secFire, 
                 "Extra texture resolution for small see-through billboards (rails, fire escapes), " +
                 "relative to the big walls - never beyond the source texture's own. The game caps " +
                 "textures at 2048, so this trades against the walls' resolution.");
+
+            BuildGroupControls();
 
             flow.Controls.Add(new Label { Text = "Preview", AutoSize = true, Margin = new Padding(3, 4, 3, 4) });
 
@@ -468,12 +479,15 @@ namespace GlbMerger
                 "Textured result (baked)",
                 "Source triangles, coloured by billboard",
                 "Original model",
+                "Source triangles, coloured by group",
             });
             _previewDropdown.SelectedIndex = 0;
             _previewDropdown.SelectedIndexChanged += (s, e) =>
             {
                 PushViewState();
                 if (Mode == PreviewMode.Baked && !BakeIsCurrent) _ = RunBakeAsync();
+                // The section headers take the group colours in the "coloured by group" preview.
+                if (_result != null) ShowGroups(_result);
             };
             flow.Controls.Add(_previewDropdown);
 
@@ -563,12 +577,30 @@ namespace GlbMerger
                 "triangles - works in every preview but Original. Deletions carry over when you " +
                 "change settings, onto whatever billboard lands in the same place.");
 
+            BuildTagUi(flow);
+
             _lblStats = new Label
             {
                 AutoSize = true, MaximumSize = new System.Drawing.Size(340, 0),
                 Margin = new Padding(3, 4, 3, 6),
             };
             flow.Controls.Add(_lblStats);
+
+            flow.Controls.Add(new Label { Text = "Groups", AutoSize = true, Margin = new Padding(3, 4, 3, 2) });
+            _groupList = new TableLayoutPanel
+            {
+                AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 3,
+                Margin = new Padding(3, 0, 3, 6),
+            };
+            _groupList.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            _groupList.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            _groupList.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            flow.Controls.Add(_groupList);
+
+            _help.Add(flow,
+                "What each part of the building was taken to be, and what it became: source " +
+                "triangles in, billboards, and triangles out. Click a group to show only it in the " +
+                "\"coloured by group\" preview; click it again to show them all.");
 
             flow.Controls.Add(new Label { Text = "Texture and apply", AutoSize = true, Margin = new Padding(3, 8, 3, 4) });
 
@@ -663,16 +695,24 @@ namespace GlbMerger
 
         private ModelFlattener.FlattenSettings CurrentSettings() => SettingsAt(_sliderStrength.Value);
 
-        private ModelFlattener.FlattenSettings SettingsAt(int strength) => new()
+        private ModelFlattener.FlattenSettings SettingsAt(int strength, int? side = null, int? back = null, int? roof = null, int? detail = null) => new()
         {
             Tolerance = Fraction(strength) * (_input?.Extent ?? 1f),
             MinBillboardArea = MinSizePercent / 100f * (_input?.TotalArea ?? 0f),
             KeepLeftoversAsMesh = _chkKeepLeftovers.Checked,
             SideDetail = _chkSideDetail.Checked,
             SideMinArea = SideMinSizePercent / 100f * (_input?.TotalArea ?? 0f),
-            DetailTolerance = _sliderDetailStrength.Value >= 100 ? 0f : Fraction(strength) * _sliderDetailStrength.Value / 100f * (_input?.Extent ?? 1f),
+            DetailTolerance = (detail ?? _sliderDetailStrength.Value) >= 100 ? 0f : Fraction(strength) * (detail ?? _sliderDetailStrength.Value) / 100f * (_input?.Extent ?? 1f),
             DetailMinArea = MathF.Min(MinSizePercent, SideMinSizePercent) / 100f * (_input?.TotalArea ?? 0f),
             Curves = CurveHandling,
+            Tags = ActiveTags(),
+            GroupToleranceScale = GroupScales(strength, side, back, roof),
+            Overhangs = _chkOverhangs.Checked,
+            EdgeStrips = _chkEdgeStrips.Checked,
+            Pediments = _chkPediments.Checked,
+            Columns = _chkColumns.Checked,
+            MeshOrnamentMaxTris = _cmbOrnaments.SelectedIndex == 0 ? (int)_numOrnamentMax.Value : 0,
+            Backdrops = _chkBackdrops.Checked,
         };
 
         private ModelFlattener.CurveHandling CurveHandling => (ModelFlattener.CurveHandling)Math.Clamp(_cmbCurves.SelectedIndex, 0, 2);
@@ -703,6 +743,12 @@ namespace GlbMerger
             _lblSideMinSize.Text = $"Minimum side billboard size: {FormatPercent(SideMinSizePercent)} of surface area";
             _lblDetailBoost.Text = $"Detail texture boost: {DetailBoost.ToString("0.0", CultureInfo.InvariantCulture)}x";
             _lblRecess.Text = $"Recess darkening: {_sliderRecess.Value}%";
+            if (_sideStrength != null)
+            {
+                _sideStrength.Label.Text = GroupStrengthText(_sideStrength);
+                _backStrength.Label.Text = GroupStrengthText(_backStrength);
+                _roofStrength.Label.Text = GroupStrengthText(_roofStrength);
+            }
             _lblDetailStrength.Text = _sliderDetailStrength.Value >= 100
                 ? "Detail flattening: same as Strength"
                 : $"Detail flattening: {_sliderDetailStrength.Value}% of Strength";
@@ -785,6 +831,20 @@ namespace GlbMerger
             BakeNormals = _chkBakeNormals.Checked,
             BakeMetallicRoughness = _chkBakeMr.Checked,
             DetailBoost = _sliderDetailBoost.Value,
+            SideStrength = _sideStrength.Value,
+            BackStrength = _backStrength.Value,
+            RoofStrength = _roofStrength.Value,
+            SideBudget = (int)_numSideBudget.Value,
+            BackBudget = (int)_numBackBudget.Value,
+            RoofBudget = (int)_numRoofBudget.Value,
+            FireEscapeBudget = (int)_numFireBudget.Value,
+            Overhangs = _chkOverhangs.Checked,
+            EdgeStrips = _chkEdgeStrips.Checked,
+            Pediments = _chkPediments.Checked,
+            Columns = _chkColumns.Checked,
+            OrnamentMethod = _cmbOrnaments.SelectedIndex,
+            OrnamentMeshMax = (int)_numOrnamentMax.Value,
+            Backdrops = _chkBackdrops.Checked,
         };
 
         // Sets every control, whose own handlers then update the saved settings and recompute
@@ -808,6 +868,22 @@ namespace GlbMerger
                 _chkBakeNormals.Checked = c.BakeNormals;
                 _chkBakeMr.Checked = c.BakeMetallicRoughness;
                 _sliderDetailBoost.Value = Clamp(c.DetailBoost, _sliderDetailBoost);
+                foreach (var (g, v) in new[] { (_sideStrength, c.SideStrength), (_backStrength, c.BackStrength), (_roofStrength, c.RoofStrength) })
+                {
+                    g.Same.Checked = v < 0;
+                    if (v >= 0) g.Slider.Value = Clamp(v, g.Slider);
+                }
+                _numSideBudget.Value = Math.Clamp(c.SideBudget, 0, 1000000);
+                _numBackBudget.Value = Math.Clamp(c.BackBudget, 0, 1000000);
+                _numRoofBudget.Value = Math.Clamp(c.RoofBudget, 0, 1000000);
+                _numFireBudget.Value = Math.Clamp(c.FireEscapeBudget, 0, 1000000);
+                _chkOverhangs.Checked = c.Overhangs;
+                _chkEdgeStrips.Checked = c.EdgeStrips;
+                _chkPediments.Checked = c.Pediments;
+                _chkColumns.Checked = c.Columns;
+                _cmbOrnaments.SelectedIndex = Math.Clamp(c.OrnamentMethod, 0, 1);
+                _numOrnamentMax.Value = Math.Clamp(c.OrnamentMeshMax, 1, 5000);
+                _chkBackdrops.Checked = c.Backdrops;
             }
             finally { _applyingConfiguration = false; }
         }
@@ -834,6 +910,16 @@ namespace GlbMerger
                 c.CheckedChanged += Edited;
             _cmbCurves.SelectedIndexChanged += Edited;
             _numBudget.ValueChanged += Edited;
+            foreach (var g in new[] { _sideStrength, _backStrength, _roofStrength })
+            {
+                g.Same.CheckedChanged += Edited;
+                g.Slider.ValueChanged += Edited;
+            }
+            foreach (var n in new[] { _numSideBudget, _numBackBudget, _numRoofBudget, _numFireBudget, _numOrnamentMax })
+                n.ValueChanged += Edited;
+            foreach (var c in new[] { _chkOverhangs, _chkEdgeStrips, _chkBackdrops, _chkPediments, _chkColumns })
+                c.CheckedChanged += Edited;
+            _cmbOrnaments.SelectedIndexChanged += Edited;
         }
 
         private void SaveConfiguration()
@@ -1029,6 +1115,7 @@ namespace GlbMerger
 
         private void RefilterResult()
         {
+            SaveOverrides();
             if (_rawResult == null) return;
             _result = WithoutDeleted(_rawResult);
             ShowStats(_result, TimeSpan.Zero);
@@ -1036,65 +1123,6 @@ namespace GlbMerger
             PushResult();
             UpdateButtons();
             if (Mode == PreviewMode.Baked) _ = RunBakeAsync();
-        }
-
-        // Binary search over the Strength slider for the lowest value whose flatten fits the
-        // budget. Assumes more strength never means more triangles - true in practice, and the
-        // search only needs it to be roughly so.
-        private async Task FitStrengthToBudgetAsync()
-        {
-            if (_input == null) return;
-            int budget = (int)_numBudget.Value;
-            var activity = BeginActivity("Fitting Strength to the budget");
-            var input = CurrentInput(activity);
-            var progress = ProgressFor(activity);
-            var settingsAt = Enumerable.Range(0, 1001).Select(SettingsAt).ToArray();
-            var deleted = _deletedStrokes.SelectMany(s => s).ToList();
-            float slack = _input.Extent * 1e-3f;
-
-            _btnFitBudget.Enabled = false;
-            _lblStatus.Text = $"Searching for a Strength that fits {budget:N0} triangles...";
-            try
-            {
-                var (strength, triangles) = await Task.Run(() =>
-                {
-                    // A binary search over 0..1000: the first try plus at most 10 halvings. Each
-                    // flatten gets its own slice of the bar.
-                    const int Tries = 11;
-                    int tried = 0;
-                    int Count(int v)
-                    {
-                        int k = tried++;
-                        var slice = new SliceProgress(progress, (double)k / Tries, (double)(k + 1) / Tries, $"try {k + 1} of up to {Tries} (Strength {v / 10.0:0.#}%)");
-                        return WithoutDeleted(ModelFlattener.Compute(input, settingsAt[v], CancellationToken.None, slice), deleted, slack).OutputTriangles;
-                    }
-                    int atMax = Count(1000);
-                    if (atMax > budget) return (-1, atMax);
-                    int lo = 0, hi = 1000, best = atMax;
-                    while (lo < hi)
-                    {
-                        int mid = (lo + hi) / 2;
-                        int n = Count(mid);
-                        if (n <= budget) { hi = mid; best = n; } else lo = mid + 1;
-                    }
-                    return (lo, best);
-                });
-                if (IsDisposed) return;
-
-                if (strength < 0)
-                {
-                    _lblStatus.Text = $"Even maximum Strength gives {triangles:N0} triangles - lower Minimum billboard size, " +
-                        "drop leftovers, or turn off side billboards to get under the budget.";
-                    return;
-                }
-                _sliderStrength.Value = strength;
-                _lblStatus.Text = $"Strength set to fit the budget: {triangles:N0} triangles.";
-            }
-            finally
-            {
-                EndActivity(activity);
-                if (!IsDisposed) _btnFitBudget.Enabled = true;
-            }
         }
 
         // --- baking / applying -------------------------------------------------------------------
@@ -1349,7 +1377,102 @@ namespace GlbMerger
                 $"Will need transparency: {needAlpha:N0} billboard(s)" +
                 (DeletedCount > 0 ? $"\nDeleted by painting: {DeletedCount:N0} billboard(s)" : "");
             _lblStatus.Text = $"Computed in {elapsed.TotalSeconds:0.00} s.";
+            ShowGroups(r);
         }
+
+        // One row per group present: its colour, name, and source triangles -> billboards ->
+        // triangles out. Rebuilt with every result.
+        private void ShowGroups(ModelFlattener.FlattenResult r)
+        {
+            var over = UpdateBudgetHeaders(r);
+            var tris = new Dictionary<FeatureGroup, int>();
+            foreach (var g in r.TriangleGroup) tris[g] = tris.GetValueOrDefault(g) + 1;
+            var boards = new Dictionary<FeatureGroup, int>();
+            var outTris = new Dictionary<FeatureGroup, int>();
+            foreach (var bb in r.Billboards)
+            {
+                boards[bb.Group] = boards.GetValueOrDefault(bb.Group) + 1;
+                outTris[bb.Group] = outTris.GetValueOrDefault(bb.Group) + (bb.Curve != null ? 2 * bb.Curve.Segments : 2);
+            }
+            // What stays mesh is its own output.
+            for (int t = 0; t < r.Assignment.Length && t < r.TriangleGroup.Length; t++)
+                if (r.Assignment[t] == ModelFlattener.FlattenResult.Kept)
+                    outTris[r.TriangleGroup[t]] = outTris.GetValueOrDefault(r.TriangleGroup[t]) + 1;
+
+            _groupList.SuspendLayout();
+            foreach (Control c in _groupList.Controls.Cast<Control>().ToList()) c.Dispose();
+            _groupList.Controls.Clear();
+            _groupList.RowStyles.Clear();
+            _groupList.RowCount = 1;
+            _groupList.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            var header = new Label { Text = "tris in > billboards > tris out", AutoSize = true, Margin = new Padding(0, 0, 0, 2) };
+            _groupList.Controls.Add(header, 2, 0);
+            foreach (var g in Enum.GetValues<FeatureGroup>())
+            {
+                int inCount = tris.GetValueOrDefault(g), bbCount = boards.GetValueOrDefault(g);
+                if (inCount == 0 && bbCount == 0) continue;
+                int rgb = FeatureGroups.Color(g);
+                var swatch = new Label
+                {
+                    AutoSize = false, Size = new System.Drawing.Size(12, 12), Margin = new Padding(0, 4, 6, 0),
+                    BackColor = System.Drawing.Color.FromArgb((rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255),
+                };
+                var name = new Label { Text = FeatureGroups.Name(g), AutoSize = true, Margin = new Padding(0, 1, 8, 1) };
+                if (g == _groupFocus) name.Font = new System.Drawing.Font(name.Font, System.Drawing.FontStyle.Bold);
+                string inText = inCount > 0 ? $"{inCount:N0}" : "-";
+                var counts = new Label
+                {
+                    Text = g == FeatureGroup.Dropped ? $"{inCount:N0}" : $"{inText} > {bbCount:N0} > {outTris.GetValueOrDefault(g):N0}",
+                    AutoSize = true, Margin = new Padding(0, 1, 0, 1),
+                };
+                int row = _groupList.RowCount++;
+                _groupList.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+                _groupList.Controls.Add(swatch, 0, row);
+                _groupList.Controls.Add(name, 1, row);
+                _groupList.Controls.Add(counts, 2, row);
+                foreach (var c in new Control[] { swatch, name, counts })
+                {
+                    c.Cursor = Cursors.Hand;
+                    c.Click += (s, e) => FocusGroup(g == _groupFocus ? FeatureGroup.None : g);
+                }
+            }
+            _groupList.ResumeLayout();
+            foreach (Control c in _groupList.Controls)
+                if (c.AutoSize) c.ForeColor = ForeColor;
+            // In the "coloured by group" preview, each name in its group's colour.
+            if (Mode == PreviewMode.Groups)
+                for (int row = 1; row < _groupList.RowCount; row++)
+                    if (_groupList.GetControlFromPosition(1, row) is Label name
+                        && Enum.GetValues<FeatureGroup>().FirstOrDefault(g => FeatureGroups.Name(g) == name.Text) is var g && g != FeatureGroup.None)
+                    {
+                        int rgb = FeatureGroups.Color(g);
+                        name.ForeColor = System.Drawing.Color.FromArgb((rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255);
+                    }
+            // Over its budget: the counts in orange.
+            for (int row = 1; row < _groupList.RowCount; row++)
+                if (_groupList.GetControlFromPosition(1, row) is Label name && _groupList.GetControlFromPosition(2, row) is Label counts
+                    && Enum.GetValues<FeatureGroup>().FirstOrDefault(g => FeatureGroups.Name(g) == name.Text) is var g && over.GetValueOrDefault(g))
+                    counts.ForeColor = System.Drawing.Color.DarkOrange;
+        }
+
+        // Shows only one group in the "coloured by group" preview (None: all of them).
+        private void FocusGroup(FeatureGroup g)
+        {
+            _groupFocus = g;
+            if (_result != null) ShowGroups(_result);
+            if (g != FeatureGroup.None && Mode != PreviewMode.Groups) _previewDropdown.SelectedIndex = (int)PreviewMode.Groups;
+            PushGroupFocus();
+        }
+
+        private void PushGroupFocus()
+        {
+            if (!_viewerReady || _webView.CoreWebView2 == null) return;
+            _ = _webView.CoreWebView2.ExecuteScriptAsync($"setGroupFocus({(int)_groupFocus});");
+        }
+
+        // The group colours, indexed by FeatureGroup, for the preview script.
+        private static string GroupColorsJs =>
+            "[" + string.Join(",", Enum.GetValues<FeatureGroup>().Select(g => "0x" + FeatureGroups.Color(g).ToString("X6"))) + "]";
 
         // --- preview files -----------------------------------------------------------------------
 
@@ -1365,6 +1488,7 @@ namespace GlbMerger
         }
 
         // Layout: int32 assignment per source triangle, then float32 x12 corners per billboard,
+        // (groups at the end - see below)
         // then float32 coverage per billboard. A fresh file per result, so the browser never
         // reads a cached older one.
         private string WriteResultFile(ModelFlattener.FlattenResult r)
@@ -1393,6 +1517,18 @@ namespace GlbMerger
                         w.Write(c.X); w.Write(c.Y); w.Write(c.Z);
                     }
                 foreach (var bb in r.Billboards) w.Write(bb.Coverage);
+                // Then int32 group per billboard, and per source triangle (the curves a rebuilt
+                // input replaced show as curved walls).
+                foreach (var bb in r.Billboards) w.Write((int)bb.Group);
+                if (gathered.Length == 0)
+                    foreach (var g in r.TriangleGroup) w.Write((int)g);
+                else
+                {
+                    var groups = Enumerable.Repeat((int)FeatureGroup.CurvedWall, _input!.TriangleCount).ToArray();
+                    for (int t = 0; t < gathered.Length; t++)
+                        if (gathered[t] >= 0 && t < r.TriangleGroup.Length) groups[gathered[t]] = (int)r.TriangleGroup[t];
+                    foreach (int g in groups) w.Write(g);
+                }
             }
             TryDelete(previous);
             return Path.GetFileName(_resultPath);
@@ -1509,6 +1645,7 @@ namespace GlbMerger
                 PreviewMode.Baked => "baked",
                 PreviewMode.Source => "source",
                 PreviewMode.Original => "original",
+                PreviewMode.Groups => "groups",
                 _ => "billboards",
             };
             if (mode == "original" && _originalPath == null)
@@ -1533,34 +1670,43 @@ namespace GlbMerger
 
         private void OnWebMessageReceived(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
         {
-            string? action;
-            int tag = 0;
-            var indices = new List<int>();
-            try
-            {
-                using var doc = JsonDocument.Parse(e.TryGetWebMessageAsString());
-                var root = doc.RootElement;
-                action = root.TryGetProperty("action", out var a) ? a.GetString() : null;
-                if (root.TryGetProperty("tag", out var tg)) tag = tg.GetInt32();
-                if (root.TryGetProperty("indices", out var idx))
-                    foreach (var i in idx.EnumerateArray()) indices.Add(i.GetInt32());
-            }
+            JsonDocument doc;
+            try { doc = JsonDocument.Parse(e.TryGetWebMessageAsString()); }
             catch { return; }
-
-            if (IsDisposed) return;
-            if (action == "ready")
+            using (doc)
             {
-                _viewerReady = true;
-                PushBackground();
-                PushViewState();
-                PushPaintState();
-                PushResult();
-                PushBaked();
+                string? action;
+                int tag = 0;
+                var indices = new List<int>();
+                var root = doc.RootElement;
+                try
+                {
+                    action = root.TryGetProperty("action", out var a) ? a.GetString() : null;
+                    if (root.TryGetProperty("tag", out var tg)) tag = tg.GetInt32();
+                    if (root.TryGetProperty("indices", out var idx))
+                        foreach (var i in idx.EnumerateArray()) indices.Add(i.GetInt32());
+                }
+                catch { return; }
+
+                if (IsDisposed) return;
+                if (action == "ready")
+                {
+                    _viewerReady = true;
+                    PushBackground();
+                    PushViewState();
+                    PushPaintState();
+                    PushResult();
+                    PushBaked();
+                    PushGroupFocus();
+                    PushFrame();
+                }
+                else if (action == "highlight")
+                    SetHighlighted(tag, indices);
+                else if (action == "deleteSelected")
+                    DeleteHighlighted();
+                else
+                    OnTagMessage(action, root, indices);
             }
-            else if (action == "highlight")
-                SetHighlighted(tag, indices);
-            else if (action == "deleteSelected")
-                DeleteHighlighted();
         }
 
         private static string EscapeJs(string s) => s.Replace("\\", "\\\\").Replace("'", "\\'");
@@ -1649,6 +1795,8 @@ namespace GlbMerger
                         // --- state ------------------------------------------------------------
                         var srcPositions = null, triCount = 0;
                         var assignment = null, quads = null, coverage = null, quadCount = 0;
+                        var triGroups = null, groupFocus = 0;
+                        var groupColors = " + GroupColorsJs + @";
                         var mode = 'billboards', outline = true, highlight = false, alphaThreshold = 0.95;
 
                         var srcMesh = null, keptMesh = null, bbFront = null, bbBack = null, outlines = null, originalRoot = null, bakedRoot = null;
@@ -1680,11 +1828,18 @@ namespace GlbMerger
                             scene.add(srcMesh);
                         }
 
+                        // By group: the group's colour; with one group picked, the rest dark.
+                        function groupColor(t) {
+                            var g = triGroups ? triGroups[t] : 0;
+                            if (groupFocus && g !== groupFocus) return tmpColor.setHex(0x2a2d30);
+                            return tmpColor.setHex(groupColors[g] || 0xff00ff);
+                        }
+
                         function updateSourceColors() {
                             if (!srcMesh || !assignment) return;
                             var col = srcMesh.geometry.attributes.color.array;
                             for (var t = 0; t < triCount; t++) {
-                                assignmentColor(assignment[t]);
+                                if (mode === 'groups') groupColor(t); else assignmentColor(assignment[t]);
                                 for (var k = 0; k < 3; k++) {
                                     var o = (t * 3 + k) * 3;
                                     col[o] = tmpColor.r; col[o + 1] = tmpColor.g; col[o + 2] = tmpColor.b;
@@ -1763,7 +1918,7 @@ namespace GlbMerger
                         }
 
                         function applyVisibility() {
-                            if (srcMesh) srcMesh.visible = mode === 'source';
+                            if (srcMesh) srcMesh.visible = mode === 'source' || mode === 'groups';
                             if (keptMesh) keptMesh.visible = mode === 'billboards';
                             if (bbFront) bbFront.visible = mode === 'billboards';
                             if (bbBack) bbBack.visible = mode === 'billboards';
@@ -1780,8 +1935,13 @@ namespace GlbMerger
                             document.body.style.background = '#' + ('000000' + hex.toString(16)).slice(-6);
                         };
 
+                        window.setGroupFocus = function (g) {
+                            groupFocus = g;
+                            updateSourceColors();
+                        };
+
                         window.setViewState = function (m, o, h, threshold) {
-                            var recolor = h !== highlight;
+                            var recolor = h !== highlight || (m === 'groups') !== (mode === 'groups');
                             mode = m; outline = o; highlight = h; alphaThreshold = threshold;
                             if (recolor && assignment) { updateSourceColors(); buildBillboards(); }
                             // The pink comes from the bake only in the baked preview.
@@ -1800,6 +1960,9 @@ namespace GlbMerger
                                 assignment = new Int32Array(buf, 0, triCount);
                                 quads = new Float32Array(buf, triCount * 4, count * 12);
                                 coverage = new Float32Array(buf, triCount * 4 + count * 48, count);
+                                var groupsAt = triCount * 4 + count * 52;
+                                triGroups = buf.byteLength >= groupsAt + count * 4 + triCount * 4
+                                    ? new Int32Array(buf, groupsAt + count * 4, triCount) : null;
                                 updateSourceColors();
                                 buildKept();
                                 buildBillboards();
@@ -1979,7 +2142,7 @@ namespace GlbMerger
                             raycaster.setFromCamera(_ndc, camera);
                             var stack = [];
                             function add(q) { if (q >= 0 && q < quadCount && stack.indexOf(q) < 0) stack.push(q); }
-                            if (mode === 'source') {
+                            if (mode === 'source' || mode === 'groups') {
                                 if (srcMesh) raycaster.intersectObject(srcMesh, false).forEach(function (h) { add(assignment[h.faceIndex]); });
                                 return stack;
                             }
@@ -2012,7 +2175,7 @@ namespace GlbMerger
                         canvas.addEventListener('pointerup', function (event) {
                             var start = downAt;
                             downAt = null;
-                            if (!paintMode || !start || event.button !== 0 || !assignment || mode === 'original') return;
+                            if (tagTool !== 'none' || !paintMode || !start || event.button !== 0 || !assignment || mode === 'original') return;
                             // A drag is an orbit, not a click.
                             if (Math.abs(event.clientX - start.x) + Math.abs(event.clientY - start.y) > 4) return;
                             selectAt(event.clientX, event.clientY);
@@ -2024,6 +2187,242 @@ namespace GlbMerger
                             } else if (event.key === 'Escape') {
                                 clearPending();
                                 postSelection();
+                            }
+                        });
+
+                        // --- tagging parts: a box searched for a group, or a brush ----------------
+                        // With a tool on, the left button draws or paints and the right one orbits.
+                        // Boxes are aligned with the building's own axes (frameX, up, frameZ).
+                        var tagTool = 'none';
+                        var frameX = new THREE.Vector3(1, 0, 0), frameZ = new THREE.Vector3(0, 0, 1), modelExtent = 1;
+                        var tagBox = null, tagBoxCenter = new THREE.Vector3(), tagBoxSize = new THREE.Vector3();
+                        var boxDrag = null, rectStart = null, brushDown = false, brushErase = false, brushSet = null;
+                        // The painting so far: strokes add to it (left button) or take from it
+                        // (right button or Ctrl), until it's accepted or cancelled.
+                        var paintSel = new Set();
+                        var tagPink = null, tagRed = null, brushMesh = null;
+                        var rectDiv = document.createElement('div');
+                        rectDiv.style.cssText = 'position:fixed;border:1px dashed #ff3030;background:rgba(255,48,48,0.08);pointer-events:none;display:none;';
+                        document.body.appendChild(rectDiv);
+                        var tagPinkMaterial = new THREE.MeshBasicMaterial({ color: 0xff10f0, transparent: true, opacity: 0.75, side: THREE.DoubleSide, depthTest: false, depthWrite: false });
+                        var tagRedMaterial = new THREE.MeshBasicMaterial({ color: 0xff3030, transparent: true, opacity: 0.55, side: THREE.DoubleSide, depthTest: false, depthWrite: false });
+                        var boxFaceMaterial = new THREE.MeshBasicMaterial({ color: 0xff3030, transparent: true, opacity: 0.06, side: THREE.DoubleSide, depthWrite: false });
+                        var boxEdgeMaterial = new THREE.LineBasicMaterial({ color: 0xff3030 });
+
+                        function post(msg) { if (window.chrome && window.chrome.webview) window.chrome.webview.postMessage(JSON.stringify(msg)); }
+
+                        window.setFrame = function (xx, xy, xz, zx, zy, zz, ext) {
+                            frameX.set(xx, xy, xz).normalize(); frameZ.set(zx, zy, zz).normalize(); modelExtent = ext;
+                        };
+                        // Drawing a box takes the left button (the right one orbits). Painting and
+                        // erasing only take a press that lands on the model, as in the other
+                        // editors; one beside it orbits as usual.
+                        window.setTagTool = function (t) {
+                            tagTool = t;
+                            controls.mouseButtons.LEFT = t === 'box' ? -1 : THREE.MOUSE.ROTATE;
+                            controls.mouseButtons.RIGHT = t === 'box' ? THREE.MOUSE.ROTATE : THREE.MOUSE.PAN;
+                            canvas.style.cursor = t === 'none' ? (paintMode ? 'crosshair' : '') : 'crosshair';
+                            window.clearTagPaint();
+                        };
+                        window.clearTagPaint = function () {
+                            paintSel.clear();
+                            disposeObject(brushMesh); brushMesh = null;
+                        };
+
+                        function trianglesMesh(list, material) {
+                            if (!list || list.length === 0 || !srcPositions) return null;
+                            var pos = new Float32Array(list.length * 9);
+                            for (var i = 0; i < list.length; i++) pos.set(srcPositions.subarray(list[i] * 9, list[i] * 9 + 9), i * 9);
+                            var geo = new THREE.BufferGeometry();
+                            geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+                            var m = new THREE.Mesh(geo, material);
+                            m.renderOrder = 12;
+                            scene.add(m);
+                            return m;
+                        }
+                        window.setTagPending = function (pink, red) {
+                            disposeObject(tagPink); disposeObject(tagRed);
+                            tagRed = trianglesMesh(red, tagRedMaterial);
+                            tagPink = trianglesMesh(pink, tagPinkMaterial);
+                            if (tagPink) tagPink.renderOrder = 13;
+                        };
+
+                        // The box: a unit cube placed by a matrix with the frame axes as columns.
+                        function placeBox() {
+                            if (!tagBox) {
+                                tagBox = new THREE.Group();
+                                var faces = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), boxFaceMaterial);
+                                faces.name = 'faces';
+                                var edges = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1)), boxEdgeMaterial);
+                                tagBox.add(faces); tagBox.add(edges);
+                                tagBox.matrixAutoUpdate = false;
+                                scene.add(tagBox);
+                            }
+                            var m = new THREE.Matrix4().makeBasis(frameX, new THREE.Vector3(0, 1, 0), frameZ);
+                            m.multiply(new THREE.Matrix4().makeScale(tagBoxSize.x, tagBoxSize.y, tagBoxSize.z));
+                            m.setPosition(tagBoxCenter);
+                            tagBox.matrix.copy(m);
+                            tagBox.updateMatrixWorld(true);
+                        }
+                        window.clearTagBox = function () {
+                            if (tagBox) { scene.remove(tagBox); tagBox.children.forEach(function (c) { c.geometry.dispose(); }); tagBox = null; }
+                        };
+                        function postBox() {
+                            post({ action: 'tagBox', center: tagBoxCenter.toArray(), size: tagBoxSize.toArray() });
+                        }
+
+                        function ndcAt(x, y) {
+                            var rect = canvas.getBoundingClientRect();
+                            return new THREE.Vector2((x - rect.left) / rect.width * 2 - 1, -((y - rect.top) / rect.height) * 2 + 1);
+                        }
+                        function sourceHit(x, y) {
+                            if (!srcMesh) return null;
+                            raycaster.setFromCamera(ndcAt(x, y), camera);
+                            var hits = raycaster.intersectObject(srcMesh, false);
+                            return hits.length > 0 ? hits[0] : null;
+                        }
+
+                        // A box round what the dragged rectangle shows: the surface under a grid of
+                        // rays through it, padded so a part standing out from the wall fits.
+                        function boxFromRect(a, b) {
+                            var lo = new THREE.Vector3(Infinity, Infinity, Infinity), hi = new THREE.Vector3(-Infinity, -Infinity, -Infinity), any = false;
+                            for (var i = 0; i <= 14; i++)
+                                for (var j = 0; j <= 14; j++) {
+                                    var h = sourceHit(a.x + (b.x - a.x) * i / 14, a.y + (b.y - a.y) * j / 14);
+                                    if (!h) continue;
+                                    var q = new THREE.Vector3(h.point.dot(frameX), h.point.y, h.point.dot(frameZ));
+                                    lo.min(q); hi.max(q); any = true;
+                                }
+                            if (!any) return false;
+                            var pad = modelExtent * 0.02;
+                            lo.subScalar(pad); hi.addScalar(pad);
+                            var mid = lo.clone().add(hi).multiplyScalar(0.5);
+                            tagBoxSize.copy(hi).sub(lo);
+                            tagBoxCenter.copy(frameX).multiplyScalar(mid.x).add(new THREE.Vector3(0, mid.y, 0)).add(frameZ.clone().multiplyScalar(mid.z));
+                            return true;
+                        }
+
+                        // Which face of the box is under the pointer: axis 0/1/2 and side +1/-1.
+                        function boxFaceAt(x, y) {
+                            if (!tagBox) return null;
+                            raycaster.setFromCamera(ndcAt(x, y), camera);
+                            var hits = raycaster.intersectObject(tagBox.getObjectByName('faces'), false);
+                            if (hits.length === 0) return null;
+                            var n = hits[0].face.normal;
+                            var axis = Math.abs(n.x) > 0.5 ? 0 : Math.abs(n.y) > 0.5 ? 1 : 2;
+                            return { axis: axis, side: (axis === 0 ? n.x : axis === 1 ? n.y : n.z) > 0 ? 1 : -1 };
+                        }
+                        function axisDir(axis) { return axis === 0 ? frameX.clone() : axis === 1 ? new THREE.Vector3(0, 1, 0) : frameZ.clone(); }
+                        function toScreen(p) {
+                            var v = p.clone().project(camera), rect = canvas.getBoundingClientRect();
+                            return new THREE.Vector2((v.x + 1) / 2 * rect.width, (1 - v.y) / 2 * rect.height);
+                        }
+
+                        var eraseMaterial = new THREE.MeshBasicMaterial({ color: 0x9a9a9a, transparent: true, opacity: 0.7, depthTest: false, side: THREE.DoubleSide });
+                        function brushAt(x, y) {
+                            var r = 7;
+                            [[0, 0], [r, 0], [-r, 0], [0, r], [0, -r], [r * 0.7, r * 0.7], [-r * 0.7, r * 0.7], [r * 0.7, -r * 0.7], [-r * 0.7, -r * 0.7]].forEach(function (o) {
+                                var h = sourceHit(x + o[0], y + o[1]);
+                                if (!h) return;
+                                if (tagTool === 'erase') brushSet.add(h.faceIndex);
+                                else if (brushErase) paintSel.delete(h.faceIndex);
+                                else paintSel.add(h.faceIndex);
+                            });
+                            disposeObject(brushMesh);
+                            brushMesh = tagTool === 'erase' ? trianglesMesh(Array.from(brushSet), eraseMaterial) : trianglesMesh(Array.from(paintSel), tagRedMaterial);
+                        }
+
+                        // Paint and Erase: a press on the model starts a stroke, ahead of the orbit
+                        // controls (capturing, on the window), so they never see it.
+                        window.addEventListener('pointerdown', function (event) {
+                            if ((tagTool !== 'paint' && tagTool !== 'erase') || event.target !== canvas || event.button === 1) return;
+                            if (!sourceHit(event.clientX, event.clientY)) return;
+                            event.stopPropagation();
+                            event.preventDefault();
+                            brushDown = true;
+                            brushErase = tagTool === 'paint' && (event.button === 2 || event.ctrlKey);
+                            brushSet = new Set();
+                            // While painting, the selection so far shows on its own, red.
+                            window.setTagPending([], []);
+                            brushAt(event.clientX, event.clientY);
+                        }, true);
+                        window.addEventListener('pointermove', function (event) {
+                            if (brushDown) brushAt(event.clientX, event.clientY);
+                        });
+                        window.addEventListener('pointerup', function () {
+                            if (!brushDown) return;
+                            brushDown = false;
+                            if (tagTool === 'erase') {
+                                disposeObject(brushMesh); brushMesh = null;
+                                post({ action: 'tagErase', indices: Array.from(brushSet) });
+                            } else {
+                                post({ action: 'tagPaint', indices: Array.from(paintSel) });
+                            }
+                        });
+                        canvas.addEventListener('contextmenu', function (event) {
+                            if (tagTool !== 'none') event.preventDefault();
+                        });
+
+                        canvas.addEventListener('pointerdown', function (event) {
+                            if (tagTool !== 'box' || event.button !== 0) return;
+                            canvas.setPointerCapture(event.pointerId);
+                            {
+                                var face = boxFaceAt(event.clientX, event.clientY);
+                                if (face) {
+                                    boxDrag = { face: face, x: event.clientX, y: event.clientY, center: tagBoxCenter.clone(), size: tagBoxSize.clone() };
+                                } else {
+                                    rectStart = { x: event.clientX, y: event.clientY };
+                                }
+                            }
+                        });
+                        canvas.addEventListener('pointermove', function (event) {
+                            if (tagTool === 'none') return;
+                            if (rectStart) {
+                                var l = Math.min(rectStart.x, event.clientX), t = Math.min(rectStart.y, event.clientY);
+                                rectDiv.style.left = l + 'px'; rectDiv.style.top = t + 'px';
+                                rectDiv.style.width = Math.abs(event.clientX - rectStart.x) + 'px';
+                                rectDiv.style.height = Math.abs(event.clientY - rectStart.y) + 'px';
+                                rectDiv.style.display = 'block';
+                            } else if (boxDrag) {
+                                // Move the face along its axis by the drag's share of the axis on screen.
+                                var dir = axisDir(boxDrag.face.axis);
+                                var s0 = toScreen(boxDrag.center), s1 = toScreen(boxDrag.center.clone().add(dir));
+                                var screenDir = s1.sub(s0);
+                                var len2 = screenDir.lengthSq();
+                                if (len2 < 1e-6) return;
+                                var delta = ((event.clientX - boxDrag.x) * screenDir.x + (event.clientY - boxDrag.y) * screenDir.y) / len2;
+                                var size = boxDrag.size.clone(), center = boxDrag.center.clone();
+                                var comp = ['x', 'y', 'z'][boxDrag.face.axis];
+                                var grown = Math.max(modelExtent * 0.002, size[comp] + boxDrag.face.side * delta);
+                                var moved = (grown - size[comp]) * boxDrag.face.side;
+                                size[comp] = grown;
+                                center.add(dir.multiplyScalar(moved / 2));
+                                tagBoxSize.copy(size); tagBoxCenter.copy(center);
+                                placeBox();
+                            }
+                        });
+                        canvas.addEventListener('pointerup', function (event) {
+                            if (tagTool !== 'box' || event.button !== 0) return;
+                            if (rectStart) {
+                                var a = rectStart, b = { x: event.clientX, y: event.clientY };
+                                rectStart = null;
+                                rectDiv.style.display = 'none';
+                                if (Math.abs(a.x - b.x) < 4 || Math.abs(a.y - b.y) < 4) return;
+                                if (!boxFromRect(a, b)) { pickInfo.textContent = 'Nothing of the model under that box'; return; }
+                                pickInfo.textContent = 'Drag a face of the box to resize it';
+                                placeBox();
+                                postBox();
+                            } else if (boxDrag) {
+                                boxDrag = null;
+                                postBox();
+                            }
+                        });
+                        window.addEventListener('keydown', function (event) {
+                            if (tagTool !== 'none' && event.key === 'Escape') {
+                                window.clearTagBox();
+                                window.clearTagPaint();
+                                window.setTagPending([], []);
+                                post({ action: 'tagCancel' });
                             }
                         });
 

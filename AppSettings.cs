@@ -32,7 +32,27 @@ namespace GlbMerger
         public bool FlattenTrimCorners { get; set; } = true;
         public bool FlattenBakeNormals { get; set; } = true;
         public bool FlattenBakeMetallicRoughness { get; set; } = true;
+        // The front walls' triangle budget (0 = none).
         public int FlattenTriangleBudget { get; set; } = 500;
+        // Per group (see ModelFlattenerEditor's sections): Strength slider position, -1 = same as
+        // the front walls; budgets, 0 = none.
+        public int FlattenSideStrength { get; set; } = -1;
+        public int FlattenBackStrength { get; set; } = -1;
+        public int FlattenRoofStrength { get; set; } = -1;
+        public int FlattenSideBudget { get; set; }
+        public int FlattenBackBudget { get; set; }
+        public int FlattenRoofBudget { get; set; }
+        public int FlattenFireEscapeBudget { get; set; }
+        public bool FlattenOverhangs { get; set; } = true;
+        public bool FlattenEdgeStrips { get; set; } = true;
+        public bool FlattenPediments { get; set; } = true;
+        public bool FlattenColumns { get; set; } = true;
+        // 0 = small roof ornaments stay real triangles (up to FlattenOrnamentMeshMax), 1 = crossing billboards.
+        public int FlattenOrnamentMethod { get; set; }
+        public int FlattenOrnamentMeshMax { get; set; } = 150;
+        public bool FlattenBackdrops { get; set; } = true;
+        // Which of the flattener's group sections are open.
+        public List<string> FlattenOpenSections { get; set; } = new() { "Walls (front)" };
         // Named sets of the Flatten* values above, and which one they currently match (null =
         // "Custom Configuration", edited since or never saved).
         public List<FlattenConfiguration> FlattenConfigurations { get; set; } = new();

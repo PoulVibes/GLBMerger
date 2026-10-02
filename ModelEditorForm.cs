@@ -58,9 +58,14 @@ namespace GlbMerger
         private int _currentModeIndex = -1;
         private bool _revertingMode;
 
-        public ModelEditorForm(ModelRoot model, bool darkMode = false, AppSettings? settings = null)
+        // The GLB the model was loaded from, when it was one: the Flatten Model editor keeps its
+        // hand-tagged parts in a file next to it.
+        private readonly string? _sourcePath;
+
+        public ModelEditorForm(ModelRoot model, bool darkMode = false, AppSettings? settings = null, string? sourcePath = null)
         {
             _model = model;
+            _sourcePath = sourcePath;
             _darkMode = darkMode;
             _settings = settings ?? new AppSettings();
 
@@ -200,7 +205,7 @@ namespace GlbMerger
                     EditorMode.ModelAdjuster => new ModelAdjusterEditor(_model, _darkMode),
                     EditorMode.TextureEditor => new TextureEditorEditor(_model, _darkMode),
                     EditorMode.RigidRegion => new RigidRegionEditor(_model, _darkMode),
-                    EditorMode.FlattenModel => new ModelFlattenerEditor(_model, _darkMode, _settings),
+                    EditorMode.FlattenModel => new ModelFlattenerEditor(_model, _darkMode, _settings, _sourcePath),
                     _ => throw new ArgumentOutOfRangeException(nameof(mode)),
                 };
 

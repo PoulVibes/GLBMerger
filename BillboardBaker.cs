@@ -75,7 +75,7 @@ namespace GlbMerger
         private const float MaskCutoff = 0.5f;
         // Viewing angles from below the sweep fill covers (see RenderBillboard).
         private static readonly float[] SweepTangents = new[] { 10f, 20f, 30f }.Select(a => MathF.Tan(a * MathF.PI / 180f)).ToArray();
-        public static bool Sweeps(ModelFlattener.Billboard bb) => bb.Overhang || (!bb.Detail && !bb.Part && !bb.Backdrop && MathF.Abs(bb.Normal.Y) < 0.3f);
+        public static bool Sweeps(ModelFlattener.Billboard bb) => bb.Overhang || (!bb.Detail && (!bb.Part || bb.Group == FeatureGroup.Pediment) && !bb.Backdrop && MathF.Abs(bb.Normal.Y) < 0.3f);
         // A cornice's tilted billboard only at the shallowest angle: its top edge is broken by
         // real gaps to the sky (between a pediment and the end blocks), and the steeper copies
         // filled those, seen from the street as slabs above the cornice.

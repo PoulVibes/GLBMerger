@@ -165,6 +165,25 @@ namespace GlbMerger
             // instead of collapsing into one line seen from the side. 0 or >= Tolerance = off.
             public float DetailTolerance;
             public float DetailMinArea;
+
+            // Parts tagged by hand in the editor (see FeatureTag), by triangle of the gathered
+            // input. Tagged triangles are their tag's group and no other pass takes them.
+            public List<FeatureTag> Tags = new();
+
+            // Per group: its Strength as a multiple of Tolerance, for the plane search - planes
+            // are grouped by the way they face (front, side, back, roof, underside). Absent = 1.
+            public Dictionary<FeatureGroup, float> GroupToleranceScale = new();
+            // A wall's proud end becomes a strip billboard at its own depth (AddEdgeStrips).
+            public bool EdgeStrips = true;
+            // A pilaster standing out from a wall full height gets a strip at its own depth and one
+            // for each side face (AddWallStrips).
+            public bool Columns = true;
+            // A pediment or gable rising over the cornice becomes a front quad and one quad per
+            // sloped top (DetectPediments).
+            public bool Pediments = true;
+            // Roof ornaments with up to this many triangles stay real triangles; bigger ones (and
+            // all of them at 0) are drawn on crossing billboards.
+            public int MeshOrnamentMaxTris = 150;
         }
 
         // Billboards covering less than this share of their rectangle count as see-through detail.
@@ -262,6 +281,8 @@ namespace GlbMerger
 
         public sealed class Billboard
         {
+            // Which part of the building it shows (see FeatureGroup).
+            public FeatureGroup Group;
             public Vector3 Normal;
             public float Offset;              // plane: dot(p, Normal) == Offset
             public Vector3 AxisU, AxisV;      // AxisU x AxisV == Normal
@@ -433,6 +454,8 @@ namespace GlbMerger
             public List<Billboard> Billboards = new();
             // Per source triangle: billboard index, or Kept / Dropped.
             public int[] Assignment = Array.Empty<int>();
+            // Per source triangle: which part of the building it belongs to.
+            public FeatureGroup[] TriangleGroup = Array.Empty<FeatureGroup>();
             public int PlaneCount;
             public int KeptTriangles, DroppedTriangles;
             public float Tolerance;           // the epsilon it was flattened with
@@ -447,6 +470,7 @@ namespace GlbMerger
                 var result = new FlattenResult
                 {
                     Assignment = new int[Assignment.Length],
+                    TriangleGroup = (FeatureGroup[])TriangleGroup.Clone(),
                     PlaneCount = PlaneCount,
                     KeptTriangles = KeptTriangles,
                     DroppedTriangles = DroppedTriangles,
@@ -465,7 +489,11 @@ namespace GlbMerger
                     if (a >= 0)
                     {
                         a = newIndex[a];
-                        if (a == Dropped) result.DroppedTriangles++;
+                        if (a == Dropped)
+                        {
+                            result.DroppedTriangles++;
+                            if (t < result.TriangleGroup.Length) result.TriangleGroup[t] = FeatureGroup.Dropped;
+                        }
                     }
                     result.Assignment[t] = a;
                 }
@@ -665,13 +693,13 @@ namespace GlbMerger
             private const int LockedMesh = -4;
             // Billboards this small and sparse stay as real triangles (see BuildResult).
             private const int TinyBillboardTris = 24;
-            // A roof ornament stays as real triangles up to this many.
-            private const int MaxMeshOrnamentTris = 150;
             private bool[] _locked = Array.Empty<bool>();
             private bool IsLocked(int t) => _locked.Length > 0 && _locked[t];
             private List<CurvedRegions.Fold> _curves = new();
             private readonly Dictionary<CurvedRegions.Fold, List<int>> _curveTris = new();
             private readonly List<Overhang> _overhangs = new();
+            // Pediments and gables: the side they face and their triangles (see DetectPediments).
+            private readonly List<(Vector3 Dir, List<int> Tris)> _pediments = new();
 
             // A cornice's overhang (DetectOverhangs): drawn on one plane through the line where it
             // leaves the wall and the line along its lip, facing out and down.
@@ -709,6 +737,17 @@ namespace GlbMerger
             private readonly Dictionary<int, List<int>> _partTris = new();
             private readonly HashSet<int> _floorParts = new();
             private readonly List<bool> _planeIsSide = new();
+            // Per plane: the group a special pass made it for; None for an ordinary plane, which
+            // is grouped by the way it faces (LabelGroups).
+            private readonly List<FeatureGroup> _planeGroup = new();
+            // Per triangle: why a triangle locked during the run (a roof ornament kept as mesh)
+            // stays mesh; None for the input's own locked curves.
+            private FeatureGroup[] _lockedAs = Array.Empty<FeatureGroup>();
+            // Per triangle: the group it was tagged as by hand (FlattenSettings.Tags); empty when
+            // nothing is tagged.
+            private FeatureGroup[] _tag = Array.Empty<FeatureGroup>();
+            private bool Tagged(int t) => _tag.Length > 0 && _tag[t] != FeatureGroup.None;
+            private bool TaggedAs(int t, FeatureGroup g) => _tag.Length > 0 && _tag[t] == g;
             // Stair planes are confined to their flight's box; null for every other plane.
             private readonly List<(Vector3 Min, Vector3 Max)?> _planeRegion = new();
             // Per plane: the depth its billboard is drawn at (see AcceptPlane).
@@ -769,24 +808,30 @@ namespace GlbMerger
                 Report(CurvesStart, "Finding curved walls");
                 Array.Fill(_plane, Unassigned);
                 _locked = _in.Locked.Length > 0 ? (bool[])_in.Locked.Clone() : new bool[_in.TriangleCount];
+                ApplyTags();
                 if (_s.Curves == CurveHandling.CurvedBillboards)
                 {
                     _curves = CurvedRegions.DetectFolds(_in);
                     foreach (var cyl in _curves)
                     {
                         _curveTris[cyl] = StripTriangles(cyl);
+                        if (_tag.Length > 0) _curveTris[cyl].RemoveAll(Tagged);
                         foreach (int t in _curveTris[cyl]) if (!SharedWithPlanes(cyl, t)) _locked[t] = true;
                     }
                 }
                 Report(CornicesStart, "Finding cornices");
+                if (_s.Pediments) DetectPediments();
+                AddTaggedPediments();
                 if (_s.Overhangs)
                     foreach (var o in DetectOverhangs())
                     {
                         _overhangs.Add(o);
                         foreach (int t in o.Triangles) if (!o.Shared.Contains(t)) _locked[t] = true;
                     }
+                AddTaggedOverhangs();
                 for (int t = 0; t < _locked.Length; t++)
                     if (_locked[t]) _plane[t] = LockedMesh;
+                AddTaggedFireEscapes();
                 _toClaim = Math.Max(1, _plane.Count(p => p == Unassigned));
 
                 Report(SearchStart, "Finding planes");
@@ -812,13 +857,17 @@ namespace GlbMerger
                 }
                 Report(OrnamentsStart, "Finding roof ornaments");
                 if (AddRoofOrnaments()) result = BuildResult();
-                AddEdgeStrips(result);
+                if (_s.EdgeStrips || _s.Columns) AddWallStrips(result);
+                AddTaggedColumns(result);
+                AddTaggedCorners(result);
                 Report(BackdropsStart, "Adding backdrops");
                 if (_s.Backdrops) AddBackdrops(result);
                 Report(FinishStart, "Adding curved and overhang billboards");
                 AddCurvedBillboards(result);
                 AddOverhangs(result);
+                AddPediments(result);
                 GrowForSweep(result);
+                LabelGroups(result);
                 Report(1, "Done");
                 return result;
             }
@@ -926,7 +975,7 @@ namespace GlbMerger
                     float under = 0f;
                     for (int t = 0; t < _in.TriangleCount; t++)
                     {
-                        if (_in.Areas[t] <= _degenerateArea || IsLocked(t)) continue;
+                        if (_in.Areas[t] <= _degenerateArea || IsLocked(t) || Tagged(t)) continue;
                         var c = Centroid(t);
                         if (c.Y < foot - cell || c.Y > crown + cell || Vector3.Dot(c, d) < wall - cell) continue;
                         // Wholly inside the band: a tall face of the parapet behind it, reaching
@@ -975,7 +1024,7 @@ namespace GlbMerger
                         Normal = o.Normal, Offset = o.Offset, AxisU = u, AxisV = v, Triangles = tris,
                         // Not FillHoles: that fills between the first and last solid texel of
                         // each row, and along the top it ran from a pediment out to the end blocks.
-                        PlaneIndex = -1, Part = true, FillEnclosed = true, Overhang = true,
+                        PlaneIndex = -1, Part = true, FillEnclosed = true, Overhang = true, Group = FeatureGroup.Overhang,
                     };
                     var min = new Vector2(float.MaxValue);
                     var max = new Vector2(float.MinValue);
@@ -1032,7 +1081,7 @@ namespace GlbMerger
 
                     foreach (int t in bb.Triangles)
                     {
-                        if (_plane[t] < 0) continue;
+                        if (_plane[t] < 0 || Tagged(t)) continue;
                         released.Add((t, _plane[t]));
                         _plane[t] = Unassigned;
                         _absorbable[t] = false;
@@ -1062,14 +1111,14 @@ namespace GlbMerger
                         if (bb.Coverage < DetailCoverage) candidates.UnionWith(bb.Triangles);
                     for (int t = 0; t < _in.TriangleCount; t++)
                         if (result.Assignment[t] == FlattenResult.Kept && !IsLocked(t)) candidates.Add(t);
-                    candidates.RemoveWhere(t => _in.Areas[t] <= _degenerateArea);
+                    candidates.RemoveWhere(t => _in.Areas[t] <= _degenerateArea || Tagged(t));
 
                     var claimed = new HashSet<int>();
                     Report(StairsEnd, "Flattening fine detail: fire escapes and railings");
                     foreach (var (n, tris, floor) in FireEscapeParts(candidates, pool, stairs, detailEps))
                     {
-                        AddPartPlane(n, tris, floor);
-                        AddPartPlane(-n, tris, floor);
+                        AddPartPlane(n, tris, floor, FeatureGroup.FireEscape);
+                        AddPartPlane(-n, tris, floor, FeatureGroup.FireEscape);
                         claimed.UnionWith(tris);
                     }
                     var rest = pool.Where(t => !claimed.Contains(t)).ToList();
@@ -1195,7 +1244,7 @@ namespace GlbMerger
             // One face of a fire-escape part: a plane rendering all of `tris`, drawn at their
             // projected-area-weighted depth (seen from n's side). Triangles no part owns yet
             // become this one's.
-            private void AddPartPlane(Vector3 n, List<int> tris, bool floor)
+            private void AddPartPlane(Vector3 n, List<int> tris, bool floor, FeatureGroup group)
             {
                 double weightSum = 0, depthSum = 0, plainSum = 0;
                 foreach (int t in tris)
@@ -1208,6 +1257,7 @@ namespace GlbMerger
                 }
                 float rho = (float)(weightSum > 0 ? depthSum / weightSum : plainSum / tris.Count);
                 int p = RegisterPlane(n, rho, rho, _minArea * FittedMinScale, null);
+                _planeGroup[p] = group;
                 _planeIsStructure.Add(p);
                 _partTris[p] = tris;
                 if (floor) _floorParts.Add(p);
@@ -1560,7 +1610,7 @@ namespace GlbMerger
                 {
                     if (_in.Areas[t] <= _degenerateArea) continue;
                     var centre = (_in.Corners[t * 3] + _in.Corners[t * 3 + 1] + _in.Corners[t * 3 + 2]) / 3f;
-                    if (!IsLocked(t) && ornamentOf.TryGetValue(Cell(centre), out int i) && centre.Y >= bases[i]) tris[i].Add(t);
+                    if (!IsLocked(t) && !Tagged(t) && ornamentOf.TryGetValue(Cell(centre), out int i) && centre.Y >= bases[i]) tris[i].Add(t);
                 }
 
                 bool any = false;
@@ -1581,14 +1631,15 @@ namespace GlbMerger
                         // its faces a few centimetres from where they are, and seen from below its
                         // outline was full of holes (a pediment's apex over the cornice) - the
                         // real thing costs little more than its four planes.
-                        if (ornament.Count <= MaxMeshOrnamentTris)
+                        if (ornament.Count <= _s.MeshOrnamentMaxTris)
                         {
                             if (_locked.Length == 0) _locked = new bool[_in.TriangleCount];
-                            foreach (int t in ornament) { _locked[t] = true; _plane[t] = LockedMesh; }
+                            if (_lockedAs.Length == 0) _lockedAs = new FeatureGroup[_in.TriangleCount];
+                            foreach (int t in ornament) { _locked[t] = true; _plane[t] = LockedMesh; _lockedAs[t] = FeatureGroup.RoofOrnament; }
                             any = true;
                             continue;
                         }
-                        foreach (var n in new[] { ax, -ax, az, -az }) AddPartPlane(n, ornament, false);
+                        foreach (var n in new[] { ax, -ax, az, -az }) AddPartPlane(n, ornament, false, FeatureGroup.RoofOrnament);
                         any = true;
                     }
                 }
@@ -1821,6 +1872,7 @@ namespace GlbMerger
                     {
                         Normal = mid, Offset = 0f, AxisU = Vector3.Cross(Vector3.UnitY, mid), AxisV = Vector3.UnitY,
                         Triangles = tris, PlaneIndex = -1, Curve = frame, Coverage = 1f,
+                        Group = fold.Shares ? FeatureGroup.Bay : FeatureGroup.CurvedWall,
                     };
                     bb.Min = bb.ContentMin = min;
                     bb.Max = bb.ContentMax = max;
@@ -1846,7 +1898,7 @@ namespace GlbMerger
             // mean depth: a window's stone surround beside the pier stands out over most of its
             // column's area, but not between the windows - pulled forward with the pier, the
             // window showed from below as broken in two.
-            private void AddEdgeStrips(FlattenResult result)
+            private void AddWallStrips(FlattenResult result)
             {
                 float cell = _in.Extent * 0.005f, proud = _in.Extent * 0.005f;
                 int count = result.Billboards.Count;
@@ -1900,8 +1952,11 @@ namespace GlbMerger
                         return true;
                     }
 
+                    // Columns taken by the ends' strips, so a pilaster scan doesn't take them again.
+                    int leftEnd = -1, rightStart = cols;
                     foreach (bool fromMin in new[] { true, false })
                     {
+                        if (!_s.EdgeStrips) break;
                         int step = fromMin ? 1 : -1;
                         // Past up to two empty columns right at the edge (the rectangle reaches a
                         // little past what faces this way).
@@ -1910,6 +1965,7 @@ namespace GlbMerger
                         int run = skipped;
                         for (; run < limit && col >= 0 && col < cols && Proud(col); col += step) run++;
                         if (run - skipped < 2 || run >= limit) continue;
+                        if (fromMin) leftEnd = run - 1; else rightStart = cols - run;
 
                         // Wholly inside the strip (a cell's slack): a long wall triangle with its
                         // centre in it reached right across the next window.
@@ -1921,15 +1977,442 @@ namespace GlbMerger
                                 float u = Vector3.Dot(_in.Corners[t * 3 + k], bb.AxisU);
                                 if (fromMin ? u > edge : u < edge) return false;
                             }
-                            return Vector3.Dot(Centroid(t), bb.Normal) - bb.Offset >= proud * 0.5f;
+                            return !Tagged(t) && Vector3.Dot(Centroid(t), bb.Normal) - bb.Offset >= proud * 0.5f;
                         }).ToList();
                         if (moved.Count == 0) continue;
                         // The wall keeps drawing them as well: emptied there, it showed a slit of
                         // sky between the strip's inner edge and itself, looked past at a slant.
                         foreach (int t in moved) result.Assignment[t] = result.Billboards.Count;
-                        result.Billboards.Add(MakeBillboard(bb.Normal, bb.Offset, bb.AxisU, bb.AxisV, bb.PlaneIndex, moved));
+                        var strip = MakeBillboard(bb.Normal, bb.Offset, bb.AxisU, bb.AxisV, bb.PlaneIndex, moved);
+                        strip.Group = FeatureGroup.Corner;
+                        result.Billboards.Add(strip);
+                    }
+
+                    // Pilasters: runs of the same kind of column out across the wall, at least two
+                    // columns wide and at most a tenth of the wall, not at its ends.
+                    if (!_s.Columns) continue;
+                    for (int c = leftEnd + 2; c < rightStart - 1;)
+                    {
+                        if (!Proud(c)) { c++; continue; }
+                        int start = c;
+                        while (c < rightStart - 1 && Proud(c)) c++;
+                        int end = c - 1;
+                        if (end - start + 1 < 2 || end - start + 1 > cols * 0.1f) continue;
+                        float lo = bb.Min.X + start * cell - cell, hi = bb.Min.X + (end + 1) * cell + cell;
+                        AddColumn(result, bb, bb.Triangles, lo, hi, proud);
                     }
                 }
+            }
+
+            // One pilaster on wall `bb` between lo and hi across it: a strip at its own depth
+            // holding what stands out there, and a strip for each side face, facing sideways - on
+            // the wall those are edge-on, so looked at along the facade the pilaster was flat. The
+            // wall keeps drawing its triangles too, as with the corner strips.
+            private void AddColumn(FlattenResult result, Billboard bb, IEnumerable<int> tris, float lo, float hi, float proud)
+            {
+                bool Within(int t, float slack)
+                {
+                    for (int k = 0; k < 3; k++)
+                    {
+                        float u = Vector3.Dot(_in.Corners[t * 3 + k], bb.AxisU);
+                        if (u < lo - slack || u > hi + slack) return false;
+                    }
+                    return true;
+                }
+                var all = tris.Where(t => !TaggedOther(t, FeatureGroup.Column) && Within(t, 0f)).ToList();
+                var front = all.Where(t => Vector3.Dot(Centroid(t), bb.Normal) - bb.Offset >= proud * 0.5f
+                    && Vector3.Dot(_in.Normals[t], bb.Normal) > VisibleDot).ToList();
+                if (front.Count == 0) return;
+                var strip = MakeBillboard(bb.Normal, bb.Offset, bb.AxisU, bb.AxisV, bb.PlaneIndex, front);
+                strip.Group = FeatureGroup.Column;
+                foreach (int t in front) result.Assignment[t] = result.Billboards.Count;
+                result.Billboards.Add(strip);
+
+                // The side faces: turned well to the side, standing out from the wall.
+                float cell = _in.Extent * 0.005f;
+                foreach (float side in new[] { -1f, 1f })
+                {
+                    var n = bb.AxisU * side;
+                    var flank = all.Concat(tris.Where(t => !all.Contains(t) && Within(t, cell)))
+                        .Where(t => Vector3.Dot(_in.Normals[t], n) > 0.7f && Vector3.Dot(Centroid(t), bb.Normal) - bb.Offset > 0f && !TaggedOther(t, FeatureGroup.Column))
+                        .Distinct().ToList();
+                    if (flank.Count == 0 || flank.Sum(t => _in.Areas[t]) < _in.TotalArea * 1e-5f) continue;
+                    var (u, v) = PlaneBasis(n, _in.FrameX);
+                    var face = MakeBillboard(n, 0f, u, v, bb.PlaneIndex, flank);
+                    face.Group = FeatureGroup.Column;
+                    foreach (int t in flank)
+                    {
+                        if (result.Assignment[t] == FlattenResult.Kept) result.KeptTriangles--;
+                        result.Assignment[t] = result.Billboards.Count;
+                    }
+                    result.Billboards.Add(face);
+                }
+            }
+
+            private bool TaggedOther(int t, FeatureGroup g) => _tag.Length > 0 && _tag[t] != FeatureGroup.None && _tag[t] != g;
+
+            // A tagged column: its front strip and side faces, off the wall it stands on.
+            private void AddTaggedColumns(FlattenResult result)
+            {
+                if (_tag.Length == 0) return;
+                foreach (var tris in SplitByTag(FeatureGroup.Column))
+                {
+                    var (d, wall) = FeatureTagging.WallIn(_in, tris);
+                    var host = result.Billboards.Where(b => !b.Part && !b.Backdrop && b.Curve == null && Vector3.Dot(b.Normal, d) > 0.95f)
+                        .OrderBy(b => MathF.Abs(b.Offset - wall)).FirstOrDefault();
+                    if (host == null) continue;
+                    float lo = tris.SelectMany(t => new[] { t * 3, t * 3 + 1, t * 3 + 2 }).Min(c => Vector3.Dot(_in.Corners[c], host.AxisU));
+                    float hi = tris.SelectMany(t => new[] { t * 3, t * 3 + 1, t * 3 + 2 }).Max(c => Vector3.Dot(_in.Corners[c], host.AxisU));
+                    AddColumn(result, host, tris, lo, hi, _in.Extent * 0.0025f);
+                }
+            }
+
+            // --- pediments and gables -------------------------------------------------------------
+
+            // A pediment or gable over the top of a facade: seen from the front, the building's top
+            // line is the cornice's crown nearly all the way across, and a narrow stretch of it
+            // (3% of the model's size or more, under 40% of the facade's width) rises well above
+            // that, highest towards its middle. Flattened with the rest it came apart over half a
+            // dozen billboards - the cornice, a thin strip, the roof, planes behind - each drawing a
+            // piece of it at a different depth, and seen from below its outline was full of holes.
+            // Its triangles are claimed before anything else sees them (AddPediments draws them).
+            private void DetectPediments()
+            {
+                float ext = _in.Extent, cell = ext * 0.005f;
+                foreach (var d in new[] { _in.FrameZ, -_in.FrameZ })
+                {
+                    var l = Vector3.Cross(Vector3.UnitY, d);
+                    // The front skin: what lies within 3% of the model's size of the frontmost 5%.
+                    var depths = new List<float>();
+                    for (int t = 0; t < _in.TriangleCount; t++)
+                        if (_in.Areas[t] > _degenerateArea && Vector3.Dot(_in.Normals[t], d) > 0.3f) depths.Add(Vector3.Dot(Centroid(t), d));
+                    if (depths.Count == 0) continue;
+                    depths.Sort();
+                    float front = depths[(int)(depths.Count * 0.95f)];
+
+                    // The top line: per column across the facade, the highest point of the skin.
+                    float u0 = float.MaxValue, u1 = float.MinValue;
+                    for (int c = 0; c < _in.Corners.Length; c++) { float u = Vector3.Dot(_in.Corners[c], l); u0 = MathF.Min(u0, u); u1 = MathF.Max(u1, u); }
+                    int cols = Math.Max(1, (int)MathF.Ceiling((u1 - u0) / cell));
+                    var top = new float[cols];
+                    Array.Fill(top, float.NaN);
+                    for (int t = 0; t < _in.TriangleCount; t++)
+                    {
+                        if (_in.Areas[t] <= _degenerateArea || IsLocked(t) || Tagged(t)) continue;
+                        if (Vector3.Dot(Centroid(t), d) < front - ext * 0.03f) continue;
+                        for (int k = 0; k < 3; k++)
+                        {
+                            var p = _in.Corners[t * 3 + k];
+                            int col = Math.Clamp((int)((Vector3.Dot(p, l) - u0) / cell), 0, cols - 1);
+                            if (float.IsNaN(top[col]) || p.Y > top[col]) top[col] = p.Y;
+                        }
+                    }
+                    var known = top.Where(v => !float.IsNaN(v)).OrderBy(v => v).ToList();
+                    if (known.Count < 10) continue;
+                    float line = known[known.Count / 2];
+                    float rise = ext * 0.01f;
+
+                    // Runs of columns rising well over the line. More than two on one side is a row
+                    // of dormers or a crenellated parapet, not a pediment: drawn as pediments,
+                    // a mansard's dormers smeared dark shapes over the roof.
+                    var found = new List<List<int>>();
+                    for (int c = 0; c < cols;)
+                    {
+                        if (float.IsNaN(top[c]) || top[c] < line + rise) { c++; continue; }
+                        // Small gaps inside it (between the pieces of an ornament on its apex) don't end it.
+                        int start = c, end = c;
+                        bool Rises(int i) => !float.IsNaN(top[i]) && top[i] >= line + rise;
+                        while (c < cols)
+                        {
+                            if (Rises(c)) { end = c; c++; continue; }
+                            int next = c;
+                            while (next < cols && next <= end + 3 && !Rises(next)) next++;
+                            if (next < cols && next <= end + 3) { c = next; continue; }
+                            break;
+                        }
+                        c = end + 1;
+                        float width = (end - start + 1) * cell;
+                        if (width < ext * 0.03f || width > (u1 - u0) * 0.4f) continue;
+                        // Peaked: highest towards the middle, not a tower or a raised end.
+                        int apex = start;
+                        for (int k = start; k <= end; k++) if (top[k] > top[apex]) apex = k;
+                        float at = (apex - start + 0.5f) / (end - start + 1);
+                        if (at < 0.25f || at > 0.75f) continue;
+                        if (top[apex] - line > ext * 0.15f) continue;
+                        if (top[start] > top[apex] - rise * 0.5f || top[end] > top[apex] - rise * 0.5f) continue;
+
+                        // Everything over that stretch from a little below the line up, in the front
+                        // skin, but not what faces back in (its back, seen only from the roof).
+                        float lo = u0 + start * cell - cell, hi = u0 + (end + 1) * cell + cell, baseY = line - 3f * cell;
+                        var tris = new List<int>();
+                        for (int t = 0; t < _in.TriangleCount; t++)
+                        {
+                            if (_in.Areas[t] <= _degenerateArea || IsLocked(t) || Tagged(t)) continue;
+                            var centre = Centroid(t);
+                            float u = Vector3.Dot(centre, l);
+                            if (u < lo || u > hi || Vector3.Dot(centre, d) < front - ext * 0.06f) continue;
+                            if (MathF.Min(_in.Corners[t * 3].Y, MathF.Min(_in.Corners[t * 3 + 1].Y, _in.Corners[t * 3 + 2].Y)) < baseY) continue;
+                            if (Vector3.Dot(_in.Normals[t], d) < -0.3f) continue;
+                            tris.Add(t);
+                        }
+                        if (tris.Count == 0) continue;
+                        found.Add(tris);
+                    }
+                    if (found.Count > 2) continue;
+                    foreach (var tris in found)
+                    {
+                        _pediments.Add((d, tris));
+                        // What's below the top line - where it sits on the cornice - it draws but
+                        // leaves to the cornice as well: claimed, the cornice had a gap under it.
+                        foreach (int t in tris)
+                            if (MathF.Min(_in.Corners[t * 3].Y, MathF.Min(_in.Corners[t * 3 + 1].Y, _in.Corners[t * 3 + 2].Y)) >= line - cell)
+                                _locked[t] = true;
+                    }
+                }
+            }
+
+            private void AddTaggedPediments()
+            {
+                if (_tag.Length == 0) return;
+                foreach (var tris in SplitByTag(FeatureGroup.Pediment))
+                {
+                    var (d, _) = FeatureTagging.WallIn(_in, tris);
+                    _pediments.Add((d, tris));
+                    foreach (int t in tris) _locked[t] = true;
+                }
+            }
+
+            // Each pediment: a quad at its face drawing all of it, nearest wins, and a quad on
+            // each sloped top (its faces turned up and out to one side), tilted the way they face.
+            private void AddPediments(FlattenResult result)
+            {
+                foreach (var (d, tris) in _pediments)
+                {
+                    var live = tris.Where(t => result.Assignment[t] != FlattenResult.Dropped).ToList();
+                    if (live.Count == 0) continue;
+                    var l = Vector3.Cross(Vector3.UnitY, d);
+
+                    // At its outline's depth: the raking mouldings standing out in front of the
+                    // face define the outline, and drawn back on the face (the depth most of it is
+                    // at) they showed from below as a fringe of sky along its top. The 85th
+                    // percentile by area of what faces front - the tympanum behind, recessed in
+                    // the solid quad, shifts a little instead, with no gap to show through.
+                    var byDepth = live.Where(t => Vector3.Dot(_in.Normals[t], d) > 0.3f)
+                        .Select(t => (D: Vector3.Dot(Centroid(t), d), A: _in.Areas[t])).OrderBy(x => x.D).ToList();
+                    float face = byDepth.Count > 0 ? byDepth[^1].D : live.Average(t => Vector3.Dot(Centroid(t), d));
+                    float total = byDepth.Sum(x => x.A), acc = 0f;
+                    foreach (var (dd, a) in byDepth) { face = dd; if ((acc += a) >= 0.85f * total) break; }
+                    AddPedimentBillboard(result, d, face, live);
+
+                    // The sloped tops, one per side.
+                    foreach (float side in new[] { -1f, 1f })
+                    {
+                        var slope = live.Where(t => _in.Normals[t].Y > 0.3f && side * Vector3.Dot(_in.Normals[t], l) > 0.15f).ToList();
+                        if (slope.Count == 0) continue;
+                        var n = Vector3.Zero;
+                        double depth = 0, weight = 0;
+                        foreach (int t in slope) n += _in.Normals[t] * _in.Areas[t];
+                        if (n.LengthSquared() < 1e-12f) continue;
+                        n = Vector3.Normalize(n);
+                        foreach (int t in slope) { depth += _in.Areas[t] * Vector3.Dot(Centroid(t), n); weight += _in.Areas[t]; }
+                        AddPedimentBillboard(result, n, (float)(depth / weight), slope);
+                    }
+                }
+            }
+
+            private void AddPedimentBillboard(FlattenResult result, Vector3 n, float offset, List<int> tris)
+            {
+                var (u, v) = PlaneBasis(n, _in.FrameX);
+                var bb = new Billboard
+                {
+                    Normal = n, Offset = offset, AxisU = u, AxisV = v, Triangles = tris,
+                    PlaneIndex = -1, Part = true, FillEnclosed = true, Group = FeatureGroup.Pediment,
+                };
+                var min = new Vector2(float.MaxValue);
+                var max = new Vector2(float.MinValue);
+                foreach (int t in tris)
+                    for (int k = 0; k < 3; k++)
+                    {
+                        var q = Project(_in.Corners[t * 3 + k], u, v);
+                        min = Vector2.Min(min, q);
+                        max = Vector2.Max(max, q);
+                    }
+                bb.Min = bb.ContentMin = min;
+                bb.Max = bb.ContentMax = max;
+                bb.Coverage = CoverageGrid(bb).Fraction;
+                int index = result.Billboards.Count;
+                result.Billboards.Add(bb);
+                foreach (int t in tris)
+                {
+                    if (result.Assignment[t] != FlattenResult.Kept) continue;
+                    result.Assignment[t] = index;
+                    result.KeptTriangles--;
+                }
+            }
+
+            // --- parts tagged by hand ------------------------------------------------------------
+
+            // Reads FlattenSettings.Tags onto this input's triangles (the input may be one
+            // PrepareInput rebuilt, in which case tags follow GatheredIndex; the curves it replaced
+            // lose theirs). Kept-as-mesh, roof-ornament and dropped tags stay real triangles
+            // from the start, like the input's own locked curves.
+            private void ApplyTags()
+            {
+                if (_s.Tags.Count == 0) return;
+                var toHere = new Dictionary<int, int>();
+                if (_in.GatheredIndex.Length > 0)
+                    for (int t = 0; t < _in.GatheredIndex.Length; t++)
+                        if (_in.GatheredIndex[t] >= 0) toHere[_in.GatheredIndex[t]] = t;
+                _tag = new FeatureGroup[_in.TriangleCount];
+                foreach (var tag in _s.Tags)
+                    foreach (int g in tag.Triangles)
+                    {
+                        int t = _in.GatheredIndex.Length > 0 ? toHere.GetValueOrDefault(g, -1) : g;
+                        if (t >= 0 && t < _in.TriangleCount) _tag[t] = tag.Group;
+                    }
+                for (int t = 0; t < _in.TriangleCount; t++)
+                {
+                    if (_tag[t] is not (FeatureGroup.Leftover or FeatureGroup.RoofOrnament or FeatureGroup.Dropped)) continue;
+                    if (_lockedAs.Length == 0) _lockedAs = new FeatureGroup[_in.TriangleCount];
+                    _locked[t] = true;
+                    _lockedAs[t] = _tag[t];
+                }
+            }
+
+            // Each tag of group g, as triangles of this input.
+            private List<List<int>> SplitByTag(FeatureGroup g)
+            {
+                var toHere = new Dictionary<int, int>();
+                if (_in.GatheredIndex.Length > 0)
+                    for (int t = 0; t < _in.GatheredIndex.Length; t++)
+                        if (_in.GatheredIndex[t] >= 0) toHere[_in.GatheredIndex[t]] = t;
+                var sets = new List<List<int>>();
+                foreach (var tag in _s.Tags.Where(x => x.Group == g))
+                {
+                    var set = tag.Triangles
+                        .Select(t => _in.GatheredIndex.Length > 0 ? toHere.GetValueOrDefault(t, -1) : t)
+                        .Where(t => t >= 0 && t < _in.TriangleCount && _in.Areas[t] > _degenerateArea && _tag[t] == g)
+                        .Distinct().ToList();
+                    if (set.Count > 0) sets.Add(set);
+                }
+                return sets;
+            }
+
+            // A tagged cornice: one tilted billboard over what was tagged, set up the way
+            // DetectOverhangs sets up one it finds - from the wall at its foot up to the median
+            // reach of its lip at its crown.
+            private void AddTaggedOverhangs()
+            {
+                if (_tag.Length == 0) return;
+                foreach (var tris in SplitByTag(FeatureGroup.Overhang))
+                {
+                    var (d, wall) = FeatureTagging.WallIn(_in, tris);
+                    var l = Vector3.Cross(Vector3.UnitY, d);
+                    float foot = float.MaxValue, crown = float.MinValue;
+                    var reach = new List<float>();
+                    foreach (int t in tris)
+                    {
+                        float most = float.MinValue;
+                        for (int k = 0; k < 3; k++)
+                        {
+                            var p = _in.Corners[t * 3 + k];
+                            foot = MathF.Min(foot, p.Y);
+                            crown = MathF.Max(crown, p.Y);
+                            most = MathF.Max(most, Vector3.Dot(p, d));
+                        }
+                        if (most > wall) reach.Add(most);
+                    }
+                    reach.Sort();
+                    float lip = reach.Count > 0 ? reach[reach.Count / 2] : wall;
+                    var o = new Overhang { Triangles = tris };
+                    o.Normal = Vector3.Normalize(d * (crown - foot) - Vector3.UnitY * MathF.Max(lip - wall, 0f));
+                    o.Offset = Vector3.Dot(d * wall + Vector3.UnitY * foot, o.Normal);
+                    foreach (int t in tris)
+                        if (MathF.Abs(Vector3.Dot(_in.Normals[t], l)) > 0.7f) o.Shared.Add(t);
+                    _overhangs.Add(o);
+                    foreach (int t in tris) if (!o.Shared.Contains(t)) _locked[t] = true;
+                }
+            }
+
+            // A tagged fire escape (or any see-through structure): drawn whole from in front and
+            // behind, on two part planes facing the way most of it faces - the way roof ornaments
+            // and fire-escape parts are drawn.
+            private void AddTaggedFireEscapes()
+            {
+                if (_tag.Length == 0) return;
+                bool wasDetail = _inDetailPass;
+                _inDetailPass = true;
+                try
+                {
+                    foreach (var tris in SplitByTag(FeatureGroup.FireEscape))
+                    {
+                        var (d, _) = FeatureTagging.WallIn(_in, tris);
+                        AddPartPlane(d, tris, false, FeatureGroup.FireEscape);
+                        AddPartPlane(-d, tris, false, FeatureGroup.FireEscape);
+                    }
+                }
+                finally { _inDetailPass = wasDetail; }
+            }
+
+            // A tagged corner or pier: a billboard of its own at its own depth, facing the wall it
+            // stands on. The wall keeps drawing it as well (see AddEdgeStrips).
+            private void AddTaggedCorners(FlattenResult result)
+            {
+                if (_tag.Length == 0) return;
+                foreach (var tris in SplitByTag(FeatureGroup.Corner))
+                {
+                    var (d, _) = FeatureTagging.WallIn(_in, tris);
+                    var facing = tris.Where(t => Vector3.Dot(_in.Normals[t], d) > VisibleDot).ToList();
+                    if (facing.Count == 0) continue;
+                    var (u, v) = PlaneBasis(d, _in.FrameX);
+                    int plane = RegisterPlane(d, 0f, 0f, _minArea, null);
+                    _planeGroup[plane] = FeatureGroup.Corner;
+                    var strip = MakeBillboard(d, 0f, u, v, plane, tris);
+                    strip.Group = FeatureGroup.Corner;
+                    foreach (int t in tris)
+                    {
+                        if (result.Assignment[t] == FlattenResult.Kept) result.KeptTriangles--;
+                        result.Assignment[t] = result.Billboards.Count;
+                    }
+                    result.Billboards.Add(strip);
+                }
+            }
+
+            // Names the part of the building every billboard and source triangle belongs to. The
+            // special passes name their own billboards as they make them; an ordinary plane is
+            // named by the way it faces. Labels only - nothing here changes the result.
+            private void LabelGroups(FlattenResult result)
+            {
+                foreach (var bb in result.Billboards)
+                {
+                    if (bb.Group != FeatureGroup.None) continue;
+                    var planeGroup = bb.PlaneIndex >= 0 && bb.PlaneIndex < _planeGroup.Count ? _planeGroup[bb.PlaneIndex] : FeatureGroup.None;
+                    bb.Group = planeGroup != FeatureGroup.None ? planeGroup
+                        : bb.Recessed ? FeatureGroup.Reveal
+                        : bb.Detail ? FeatureGroup.FireEscape
+                        : GroupByFacing(bb.Normal);
+                }
+
+                result.TriangleGroup = new FeatureGroup[_in.TriangleCount];
+                for (int t = 0; t < _in.TriangleCount; t++)
+                {
+                    int a = result.Assignment[t];
+                    if (Tagged(t) && a != FlattenResult.Dropped) { result.TriangleGroup[t] = _tag[t]; continue; }
+                    result.TriangleGroup[t] = a >= 0 ? result.Billboards[a].Group
+                        : a == FlattenResult.Dropped ? FeatureGroup.Dropped
+                        : !IsLocked(t) ? FeatureGroup.Leftover
+                        : t < _lockedAs.Length && _lockedAs[t] != FeatureGroup.None ? _lockedAs[t]
+                        : FeatureGroup.CurvedWall;   // the input's own: curves kept as simplified mesh
+                }
+            }
+
+            private FeatureGroup GroupByFacing(Vector3 n)
+            {
+                if (n.Y > 0.7f) return FeatureGroup.Roof;
+                if (n.Y < -0.7f) return FeatureGroup.Underside;
+                float front = Vector3.Dot(n, _in.FrameZ), side = MathF.Abs(Vector3.Dot(n, _in.FrameX));
+                if (side > MathF.Abs(front)) return FeatureGroup.Side;
+                return front >= 0 ? FeatureGroup.Front : FeatureGroup.Back;
             }
 
             private void GrowForSweep(FlattenResult result)
@@ -1968,7 +2451,7 @@ namespace GlbMerger
 
             private Billboard MakeBackdrop(Vector3 n, Vector3 u, Vector3 v, float offset, List<int> tris, bool keepInside = false)
             {
-                var bb = new Billboard { Normal = n, Offset = offset, AxisU = u, AxisV = v, Triangles = tris, PlaneIndex = -1, Backdrop = true, DensityScale = 0.35f };
+                var bb = new Billboard { Normal = n, Offset = offset, AxisU = u, AxisV = v, Triangles = tris, PlaneIndex = -1, Backdrop = true, DensityScale = 0.35f, Group = FeatureGroup.Backdrop };
                 var min = new Vector2(float.MaxValue);
                 var max = new Vector2(float.MinValue);
                 foreach (int t in tris)
@@ -2461,7 +2944,11 @@ namespace GlbMerger
             // Not much finer, though: a round corner tower's faces beyond its curved strip then
             // fall to the axis planes and the sideways backdrops, and widen its outline.
             private float YawedEps(Vector3 n)
-                => MathF.Abs(n.Y) < 0.3f && !_frame.Any(f => Vector3.Dot(f, n) > 0.9999f) ? _eps * YawedToleranceScale : _eps;
+                => (MathF.Abs(n.Y) < 0.3f && !_frame.Any(f => Vector3.Dot(f, n) > 0.9999f) ? _eps * YawedToleranceScale : _eps) * GroupScale(n);
+
+            // The plane's group's own Strength, relative to the main one (FlattenSettings.GroupToleranceScale).
+            private float GroupScale(Vector3 n) =>
+                _s.GroupToleranceScale.Count > 0 && _s.GroupToleranceScale.TryGetValue(GroupByFacing(n), out float scale) ? scale : 1f;
 
             private T WithEps<T>(float eps, Func<T> body)
             {
@@ -2532,6 +3019,7 @@ namespace GlbMerger
                 _planeRegion.Add(region);
                 _planeIsSide.Add(_inSidePass);
                 _planeIsDetail.Add(_inDetailPass);
+                _planeGroup.Add(FeatureGroup.None);
                 return _planes.Count - 1;
             }
 
@@ -2806,7 +3294,7 @@ namespace GlbMerger
 
                 foreach (int t in leftovers)
                 {
-                    bool keep = IsLocked(t) || _s.KeepLeftoversAsMesh && _in.Areas[t] > _degenerateArea;
+                    bool keep = IsLocked(t) ? !TaggedAs(t, FeatureGroup.Dropped) : _s.KeepLeftoversAsMesh && _in.Areas[t] > _degenerateArea;
                     result.Assignment[t] = keep ? FlattenResult.Kept : FlattenResult.Dropped;
                     if (keep) result.KeptTriangles++; else result.DroppedTriangles++;
                 }
