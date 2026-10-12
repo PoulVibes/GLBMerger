@@ -210,17 +210,23 @@ namespace GlbMerger
         window.setEyes = function (s) {
             var rows = [eyeUniforms.eyeRowL.value, eyeUniforms.eyeRowR.value];
             var mats = [eyeUniforms.eyeL.value, eyeUniforms.eyeR.value];
+            // EyeRig::Build: each eye lifts its outer corner, away from the midpoint between them.
+            var bothOn = s.eyes[0].on && s.eyes[1].on;
+            var midline = bothOn ? 0.5 * (s.eyes[0].c[0] + s.eyes[1].c[0]) : 0;
             for (var side = 0; side < 2; side++) {
                 var e = s.eyes[side];
                 if (!e.on || e.r[1] <= 0 || e.r[2] <= 0) { rows[side].set(0, 0, 1, 0); continue; }
                 var aspect = e.r[0] / e.r[1];
                 // The slab runs r[2] behind the centre and f in front (EyeRig::Build).
                 var back = e.r[2], front = Math.min(e.f, back), half = Math.max(0.5 * (front + back), 1e-6);
+                var tilt = e.c[0] >= midline ? s.tilt : -s.tilt;
                 mats[side].makeTranslation(-e.c[0], -e.c[1], -e.c[2])
+                    .premultiply(new THREE.Matrix4().makeRotationZ(-tilt))
                     .premultiply(new THREE.Matrix4().makeTranslation(0, 0, -0.5 * (front - back)))
                     .premultiply(new THREE.Matrix4().makeScale(1 / e.r[1], 1 / e.r[1], 1 / half));
                 var p = pupilOffset(s.yaw, s.pitch, aspect, s.pupilRadius, s.maxOffset);
-                rows[side].set(p[0], p[1], aspect, 1);
+                var ct = Math.cos(-tilt), st = Math.sin(-tilt);
+                rows[side].set(ct * p[0] - st * p[1], st * p[0] + ct * p[1], aspect, 1);
             }
             eyeUniforms.eyeLook0.value.w = s.pupilRadius;
             eyeUniforms.eyeLook2.value.w = s.showRegion ? 1 : 0;

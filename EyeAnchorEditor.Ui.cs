@@ -108,6 +108,21 @@ namespace GlbMerger
 
             flow.Controls.Add(Caption("Eye style (both eyes, saved with the anchors):", 4));
 
+            var tiltRow = MakeRow();
+            tiltRow.Controls.Add(new Label { Text = "Tilt (deg)", Width = 110, Margin = new Padding(3, 6, 3, 3) });
+            _numTilt = new NumericUpDown
+            {
+                Width = 110, Minimum = -45m, Maximum = 45m, DecimalPlaces = 0, Increment = 1m,
+                Margin = new Padding(3, 3, 3, 3),
+            };
+            _numTilt.ValueChanged += (s, e) => OnStyleChanged();
+            tiltRow.Controls.Add(_numTilt);
+            flow.Controls.Add(tiltRow);
+            _help.Add(tiltRow,
+                "Slants both eyes: positive lifts each eye's outer corner (slanted eyes, like Sho's), negative " +
+                "drops it. The ellipse, lids, cleanup and limits all turn with it; the pupils still look where " +
+                "the player looks.");
+
             var fillRow = MakeRow();
             fillRow.Controls.Add(new Label { Text = "Eyeball fill %", Width = 110, Margin = new Padding(3, 6, 3, 3) });
             _numFill = new NumericUpDown

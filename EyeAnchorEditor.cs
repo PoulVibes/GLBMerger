@@ -89,6 +89,7 @@ namespace GlbMerger
             public float Cleanup;       // eye radii past the ellipse where stray painted eye becomes lid skin
             public float LimitAbove;    // overlay's reach past the resting upper / lower lid edge, eye radii (3 = none)
             public float LimitBelow;
+            public float Tilt;          // degrees, outer corners up; mirrored per eye
         }
         // The game's EyeLook defaults.
         private static readonly EyeStyle DefaultStyle = new()
@@ -96,7 +97,7 @@ namespace GlbMerger
             Fill = 1f, PupilRadius = 0.45f, MaxOffset = 0.50f, IrisRadius = 0.70f,
             IrisColor = Color.FromArgb(102, 64, 33), RimWidth = 0.15f, RimStrength = 0.20f,
             LidColor = null, LidRest = 0.18f, LowerRest = 0.05f, LashWidth = 0.10f, LashStrength = 0.85f, Cleanup = 0.15f,
-            LimitAbove = 3f, LimitBelow = 3f,
+            LimitAbove = 3f, LimitBelow = 3f, Tilt = 0f,
         };
         private EyeStyle _style = DefaultStyle, _savedStyle = DefaultStyle;
 
@@ -110,7 +111,7 @@ namespace GlbMerger
         private NumericUpDown _numIrisRadius = null!;
         private Button _btnIrisColor = null!, _btnLidColor = null!;
         private Color _swatchDefault = SystemColors.Control;   // the theme's button colour, for "no lid colour"
-        private NumericUpDown _numCleanup = null!, _numLimitAbove = null!, _numLimitBelow = null!;
+        private NumericUpDown _numCleanup = null!, _numLimitAbove = null!, _numLimitBelow = null!, _numTilt = null!;
         private NumericUpDown _numLidRest = null!, _numLowerRest = null!, _numLashWidth = null!, _numLashStrength = null!;
         private CheckBox _chkAutoBlink = null!;
         private TrackBar _sliderClosure = null!;
@@ -244,6 +245,8 @@ namespace GlbMerger
                 ReadUnit(o, "cleanup", ref _style.Cleanup);
                 ReadLimit(o, "limitAbove", ref _style.LimitAbove);
                 ReadLimit(o, "limitBelow", ref _style.LimitBelow);
+                if (o["tilt"] is JsonValue tv && tv.TryGetValue(out double tilt))
+                    _style.Tilt = Math.Clamp((float)tilt, -45f, 45f);
                 if (o["irisColor"] is JsonArray c && c.Count == 3)
                     _style.IrisColor = Color.FromArgb(ToByte(c[0]), ToByte(c[1]), ToByte(c[2]));
                 if (o["lidRoughness"] is JsonValue lr && lr.TryGetValue(out double rough))
@@ -288,6 +291,7 @@ namespace GlbMerger
             extras["cleanup"] = Math.Round(_style.Cleanup, 3);
             extras["limitAbove"] = Math.Round(_style.LimitAbove, 3);
             extras["limitBelow"] = Math.Round(_style.LimitBelow, 3);
+            extras["tilt"] = Math.Round(_style.Tilt, 2);
             if (_style.LidColor is Color lid)
                 extras["lidColor"] = new JsonArray(Unit(lid.R), Unit(lid.G), Unit(lid.B));
             if (_style.LidRoughness is float lr && _style.LidMetalness is float lm)
@@ -384,6 +388,7 @@ namespace GlbMerger
             _style.Cleanup = (float)_numCleanup.Value;
             _style.LimitAbove = (float)_numLimitAbove.Value;
             _style.LimitBelow = (float)_numLimitBelow.Value;
+            _style.Tilt = (float)_numTilt.Value;
             PushEyes();
         }
 
@@ -450,6 +455,7 @@ namespace GlbMerger
                 SetClamped(_numCleanup, _style.Cleanup);
                 SetClamped(_numLimitAbove, _style.LimitAbove);
                 SetClamped(_numLimitBelow, _style.LimitBelow);
+                SetClamped(_numTilt, _style.Tilt);
                 ShowLidColor();
 
                 string State(int s) => _eyes[s].Set ? "placed" : "not placed";
@@ -490,6 +496,7 @@ namespace GlbMerger
                           $"\"lidColor\":{LidColorJson()},\"lidMR\":{LidMRJson()},\"lidRest\":{Inv(_style.LidRest)},\"lowerRest\":{Inv(_style.LowerRest)}," +
                           $"\"lashWidth\":{Inv(_style.LashWidth)},\"lashStrength\":{Inv(_style.LashStrength)},\"cleanup\":{Inv(_style.Cleanup)}," +
                           $"\"limitAbove\":{Inv(_style.LimitAbove)},\"limitBelow\":{Inv(_style.LimitBelow)}," +
+                          $"\"tilt\":{Inv(_style.Tilt * MathF.PI / 180f)}," +
                           $"\"autoBlink\":{(_chkAutoBlink.Checked ? "true" : "false")}," +
                           $"\"testClosure\":{Inv(_sliderClosure.Value / 100f)}," +
                           $"\"showRegion\":{(_chkShowRegion.Checked ? "true" : "false")},\"selected\":{Side}}}";
