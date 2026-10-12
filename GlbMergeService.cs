@@ -388,6 +388,10 @@ namespace GlbMerger
                     : null;
 
             if (firstOutputName != null) result = ReorderAnimationToFront(result, firstOutputName);
+
+            // The node tree above is rebuilt by name and matrix only - put back what editors
+            // stored in its nodes' extras (eye anchors' style, etc.).
+            NodeExtras.Restore(result, NodeExtras.Capture(structuralModel));
             return result;
         }
 

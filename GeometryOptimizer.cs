@@ -355,6 +355,10 @@ namespace GlbMerger
             // "clean up unused geometry" doesn't quietly reset every clip's loop setting back to
             // whatever a freshly-created animation defaults to (no extras at all, which the rest of
             // the app then reads as "loop checked" - see GlbInfoPanel's _animLoopByName fallback).
+            // Node extras (editor data on named nodes - the eye anchors' style) are dropped the
+            // same way; NodeExtras puts them back by name.
+            NodeExtras.Restore(cleaned, NodeExtras.Capture(model));
+
             var extrasByName = model.LogicalAnimations.ToDictionary(a => a.Name ?? $"Anim_{a.LogicalIndex}", a => a.Extras);
             foreach (var anim in cleaned.LogicalAnimations)
             {

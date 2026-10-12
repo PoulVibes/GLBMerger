@@ -129,8 +129,11 @@ namespace GlbMerger
         private NumericUpDown _numUvJump = null!;
         private Button _btnAnalyzeUv = null!, _btnApplyUv = null!;
         private Button _btnAnalyzeRestore = null!, _btnRestore = null!;
+        private NumericUpDown _numRefineSegments = null!, _numRefineRoundness = null!, _numRefineCrease = null!;
+        private CheckBox _chkRefineStoredNormals = null!;
+        private Button _btnAnalyzeRefine = null!, _btnRefine = null!;
 
-        private enum Operation { Simplify, Delete, Cut, Watertight, TextureWarp, Restore }
+        private enum Operation { Simplify, Delete, Cut, Watertight, TextureWarp, Restore, Refine }
 
         // Dropdown order and labels, indexed by Operation.
         private static readonly (Operation Op, string Label)[] Operations =
@@ -141,11 +144,12 @@ namespace GlbMerger
             (Operation.Watertight,  "Make Watertight"),
             (Operation.TextureWarp, "Fix Texture Warp"),
             (Operation.Restore,     "Restore Painted Detail"),
+            (Operation.Refine,      "Round Out Painted Region"),
         };
 
         private ComboBox _cmbOperation = null!;
         private FlowLayoutPanel _secSimplifySettings = null!, _secPaint = null!, _secSimplifyActions = null!,
-            _secDelete = null!, _secCut = null!, _secWatertight = null!, _secUv = null!, _secRestore = null!;
+            _secDelete = null!, _secCut = null!, _secWatertight = null!, _secUv = null!, _secRestore = null!, _secRefine = null!;
 
         private Operation CurrentOperation => Operations[Math.Max(0, _cmbOperation.SelectedIndex)].Op;
 
@@ -237,6 +241,7 @@ namespace GlbMerger
             var watertight = _secWatertight = NewSection();
             var uv = _secUv = NewSection();
             var restore = _secRestore = NewSection();
+            var refine = _secRefine = NewSection();
 
             _lblRatio = new Label { Text = "Keep 50% of triangles", AutoSize = true, Margin = new Padding(3, 0, 3, 0) };
             _sliderRatio = new TrackBar
@@ -601,7 +606,9 @@ namespace GlbMerger
             _btnRestore.Click += async (s, e) => await RunRestoreAsync(apply: true);
             restore.Controls.Add(_btnRestore);
 
-            foreach (var section in new[] { simplifySettings, paint, simplifyActions, delete, cut, watertight, uv, restore })
+            BuildRefineSection(refine);
+
+            foreach (var section in new[] { simplifySettings, paint, simplifyActions, delete, cut, watertight, uv, restore, refine })
                 flow.Controls.Add(section);
 
             // Wired after every section exists, since the handler shows and hides all of them.
@@ -758,13 +765,14 @@ namespace GlbMerger
         {
             var op = CurrentOperation;
             _secSimplifySettings.Visible = op == Operation.Simplify;
-            _secPaint.Visible = op is Operation.Simplify or Operation.Delete or Operation.Restore;
+            _secPaint.Visible = op is Operation.Simplify or Operation.Delete or Operation.Restore or Operation.Refine;
             _secSimplifyActions.Visible = op == Operation.Simplify;
             _secDelete.Visible = op == Operation.Delete;
             _secCut.Visible = op == Operation.Cut;
             _secWatertight.Visible = op == Operation.Watertight;
             _secUv.Visible = op == Operation.TextureWarp;
             _secRestore.Visible = op == Operation.Restore;
+            _secRefine.Visible = op == Operation.Refine;
 
             // The cut plane overlay only makes sense while the cut is what's being set up.
             PushCutPlane();
@@ -1523,6 +1531,143 @@ namespace GlbMerger
                 (skipped.Count > 0 ? $"\n{skipped.Count} mesh part(s) skipped: {skipped[0].SkippedReason}" : "");
         }
 
+        private void BuildRefineSection(FlowLayoutPanel refine)
+        {
+            _help.Add(refine,
+                "The opposite of Simplify, for a part that was pruned too hard. Paint the faceted " +
+                "area and each painted triangle is cut into a finer grid that is bent out to the " +
+                "curve its corner normals describe (PN triangles), so a cylinder or a shoulder that " +
+                "went polygonal rounds out again. UVs, colours and skinning are interpolated across " +
+                "each triangle, so the texture lands where it did. Unpainted triangles on the edge " +
+                "of the paint are split to meet the new vertices, so nothing tears. Records a History step.");
+
+            _help.Add(refine,
+                "Segments: how many pieces each painted edge is cut into - triangle count grows by " +
+                "its square (2 = x4, 3 = x9). Roundness: 0% is a flat subdivision, 100% the full " +
+                "curve, more exaggerates it. Crease angle: faces meeting more sharply than this keep " +
+                "a straight, hard edge - lower it if box corners start to bulge. Stored normals are " +
+                "the original dense surface's and usually describe the curve best; untick to curve " +
+                "to normals rebuilt from the faces instead. Run it again for more detail.");
+
+            NumericUpDown AddNumber(string label, decimal min, decimal max, decimal value, decimal step)
+            {
+                refine.Controls.Add(new Label { Text = label, AutoSize = true, Margin = new Padding(3, 4, 3, 0) });
+                var num = new NumericUpDown
+                {
+                    Minimum = min, Maximum = max, Value = value, Increment = step,
+                    Width = 110, Margin = new Padding(3, 0, 3, 6),
+                };
+                refine.Controls.Add(num);
+                return num;
+            }
+
+            _numRefineSegments = AddNumber("Segments per edge:", 2, 8, 2, 1);
+            _numRefineRoundness = AddNumber("Roundness (%):", 0, 150, 100, 10);
+            _numRefineCrease = AddNumber("Crease angle (degrees):", 5, 180, 60, 5);
+
+            _chkRefineStoredNormals = new CheckBox
+            {
+                Text = "Curve to stored normals", Checked = true, AutoSize = true, Margin = new Padding(3, 2, 3, 6),
+            };
+            refine.Controls.Add(_chkRefineStoredNormals);
+
+            _btnAnalyzeRefine = MakeButton("Analyze Round Out (dry run)");
+            _btnAnalyzeRefine.Click += async (s, e) => await RunRefineAsync(apply: false);
+            refine.Controls.Add(_btnAnalyzeRefine);
+
+            _btnRefine = MakeButton("Round Out Painted Region");
+            _btnRefine.Click += async (s, e) => await RunRefineAsync(apply: true);
+            refine.Controls.Add(_btnRefine);
+        }
+
+        private async Task RunRefineAsync(bool apply)
+        {
+            var selection = await ReadSelectionAsync();
+            if (IsDisposed) return;
+            if (selection == null || selection.Values.All(s => s.Count == 0))
+            {
+                _lblStatus.Text = "Nothing is painted - turn on paint mode and drag over the faceted area to round out.";
+                return;
+            }
+
+            SetBusy(true, apply ? "Rounding out..." : "Analyzing...");
+
+            var options = new RegionRefiner.Options
+            {
+                Segments = (int)_numRefineSegments.Value,
+                Roundness = (float)_numRefineRoundness.Value / 100f,
+                CreaseAngleDegrees = (float)_numRefineCrease.Value,
+                UseStoredNormals = _chkRefineStoredNormals.Checked,
+            };
+            RegionRefiner.Report report;
+            try
+            {
+                report = await Task.Run(() => RegionRefiner.Analyze(_model, selection, options));
+            }
+            catch (Exception ex)
+            {
+                SetBusy(false, null);
+                MessageBox.Show(this, $"Round-out analysis failed: {ex.Message}",
+                    "Optimize Geometry", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            if (IsDisposed) return;
+
+            FillRefineGrid(report);
+
+            if (!report.HasChanges)
+            {
+                var reason = report.Primitives.FirstOrDefault(p => p.SkippedReason != null)?.SkippedReason;
+                SetBusy(false, reason != null ? $"Nothing to round out: {reason}." : "Nothing to round out in the painted area.");
+                return;
+            }
+
+            string summary =
+                $"{report.Refined:N0} triangle(s) " + (apply ? "refined" : "would be refined") +
+                (report.Promoted > 0 ? $" ({report.Promoted:N0} unpainted ones in notches of the paint included)" : "") +
+                $"; {report.TrianglesBefore:N0} -> {report.TrianglesAfter:N0} triangles (+{report.TrianglesAdded:N0}), " +
+                $"{report.VerticesAdded:N0} vertices added, surface moved out by up to {report.MaxBulge:0.####} units." +
+                (report.CreaseEdges > 0 ? $" {report.CreaseEdges:N0} hard edge(s) kept straight." : "");
+
+            if (!apply)
+            {
+                SetBusy(false, summary + " Nothing changed yet.");
+                return;
+            }
+
+            // Appends vertices and rewrites every vertex accessor, like a fill.
+            _history.BeginChange(touchesVertexData: true);
+            RegionRefiner.Apply(report, _model);
+
+            // The paint follows the refined region so a second pass refines the same area again.
+            var keep = new Dictionary<(int, int), HashSet<int>>(selection);
+            foreach (var (key, refined) in report.NewSelection) keep[key] = refined;
+
+            SetBusy(false, summary + " Included the next time you save the merge.");
+            RecordHistory($"Round out {report.Refined:N0} triangle(s) (+{report.TrianglesAdded:N0})", touchedVertexData: true);
+            ReloadPreview(keep);
+        }
+
+        private void FillRefineGrid(RegionRefiner.Report report)
+        {
+            _grid.Rows.Clear();
+            foreach (var group in report.Primitives.Where(p => p.SkippedReason == null).GroupBy(p => p.MeshName))
+            {
+                _grid.Rows.Add(
+                    group.Key,
+                    group.Sum(p => p.TrianglesBefore).ToString("N0"),
+                    group.Sum(p => p.TrianglesAfter).ToString("N0"),
+                    $"{group.Sum(p => p.Refined):N0} refined");
+            }
+
+            var skipped = report.Primitives.Where(p => p.SkippedReason != null).ToList();
+            _lblTotals.Text =
+                $"{report.TrianglesBefore:N0} -> {report.TrianglesAfter:N0} triangles in the painted mesh part(s)\n" +
+                $"{report.Stitched:N0} neighbouring triangle(s) split to meet the new edges" +
+                (skipped.Count > 0 ? $"\n{skipped.Count} mesh part(s) skipped: {skipped[0].SkippedReason}" : "");
+        }
+
         // Drift is measured in UV units, which nobody thinks in; shown in texels when the model's
         // textures give a scale, as a share of the texture otherwise. One scale for the whole
         // report - the largest texture bound - so figures across meshes stay comparable.
@@ -1668,6 +1813,8 @@ namespace GlbMerger
             _btnApplyUv.Enabled = !busy;
             _btnAnalyzeRestore.Enabled = !busy;
             _btnRestore.Enabled = !busy;
+            _btnAnalyzeRefine.Enabled = !busy;
+            _btnRefine.Enabled = !busy;
             // Restoring mid-run would have the pass write its result over the state just restored.
             _historyGrid.Enabled = !busy;
             Cursor = busy ? Cursors.WaitCursor : Cursors.Default;
