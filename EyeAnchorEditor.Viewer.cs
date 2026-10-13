@@ -1,45 +1,15 @@
 namespace GlbMerger
 {
-    // EyeAnchorEditor's three.js preview. The model's materials are patched with a copy of the
-    // game's eye overlay (FootballRoguelite shaders/EyeOverlay.glsl + model.vert's eye lines and
-    // EyeRig::PupilOffset) - keep the two in step, or what is tuned here stops being what the game
-    // draws. Everything runs in the mesh's raw bind-pose POSITION space, the same space the anchors
-    // are authored in, so the overlay sticks to the face however the rig is posed.
+    // EyeAnchorEditor's script for the shared preview page (FacePreviewPage). The model's materials
+    // are patched with a copy of the game's eye overlay (FootballRoguelite shaders/EyeOverlay.glsl,
+    // model.frag's ApplyEyes and EyeRig::PupilOffset) - keep the two in step, or what is tuned here
+    // stops being what the game draws.
     public partial class EyeAnchorEditor
     {
-        private static string BuildViewerHtml(string previewFileName) => @"
-<!DOCTYPE html>
-<html lang='en'>
-<head>
-    <meta charset='UTF-8'>
-    <script src='https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js'></script>
-    <script src='https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js'></script>
-    <script src='https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js'></script>
-    <style>
-        body, html { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #23272a; }
-        #viewport { width: 100%; height: 100%; display: block; }
-        #error-overlay {
-            position: absolute; top: 10px; left: 10px; right: 10px;
-            background: rgba(139, 0, 0, 0.92); color: #fff; padding: 12px;
-            border-radius: 6px; font-family: monospace; font-size: 12px;
-            white-space: pre-wrap; display: none; max-height: 40%; overflow: auto;
-        }
-        #hint { position: absolute; bottom: 8px; left: 10px; color: #aaa; font: 12px sans-serif; }
-    </style>
-</head>
-<body>
-    <canvas id='viewport'></canvas>
-    <div id='error-overlay'></div>
-    <div id='hint'>Click an eye to place the selected anchor. Drag to orbit, wheel to zoom.</div>
-    <script>
-        function showError(msg) {
-            var el = document.querySelector('#error-overlay');
-            el.style.display = 'block';
-            el.textContent += msg + '\n';
-        }
-        window.onerror = function (message) { showError('JS error: ' + message); };
-        function post(obj) { if (window.chrome && window.chrome.webview) window.chrome.webview.postMessage(JSON.stringify(obj)); }
+        private static string BuildViewerHtml(string previewFileName) => FacePreviewPage.Build(
+            previewFileName, "Click an eye to place the selected anchor. Drag to orbit, wheel to zoom.", ViewerScript);
 
+        private const string ViewerScript = @"
         // ---- The game's overlay (EyeOverlay.glsl), uniform-fed instead of UBO-fed ----
         var EYE_VERT_HEAD = [
             'uniform mat4 eyeL;', 'uniform mat4 eyeR;',
@@ -196,8 +166,6 @@ namespace GlbMerger
             mat.needsUpdate = true;
         }
 
-        function srgbToLinear(c) { return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); }
-
         // EyeRig::PupilOffset.
         function pupilOffset(yaw, pitch, aspect, pupilRadius, maxOffset) {
             var qx = Math.sin(yaw) * maxOffset, qy = Math.sin(pitch) * maxOffset;
@@ -252,181 +220,30 @@ namespace GlbMerger
         };
 
         // Lid colour eyedropper (EyeAnchorEditor.StartLidEyedropper): the next click samples the
-        // texture under it. The GLB's images load as blob URLs, so the canvas isn't tainted.
+        // texture under it.
         var pickMode = false;
         window.setPickMode = function (on) {
             pickMode = on;
-            document.querySelector('#hint').textContent = on
-                ? 'Click the skin next to an eye to take the lid colour.'
-                : 'Click an eye to place the selected anchor. Drag to orbit, wheel to zoom.';
+            setHint(on ? 'Click the skin next to an eye to take the lid colour.' : null);
         };
-        var sampleCanvases = new Map();
-        function materialOf(hit) {
-            return Array.isArray(hit.object.material) ? hit.object.material[hit.face.materialIndex] : hit.object.material;
-        }
 
-        // The lid skin's roughness / metalness under the click: the material's factors times its
-        // metallicRoughness texture (glTF: G = roughness, B = metalness), if it has one.
-        function sampleMR(hit) {
-            var mat = materialOf(hit);
-            if (!mat || mat.roughness === undefined) return null;
-            var tex = mat.roughnessMap || mat.metalnessMap;
-            var t = tex ? sampleTexture(hit, tex) : null;
-            return [mat.roughness * (t ? t[1] : 1), mat.metalness * (t ? t[2] : 1)];
-        }
-
-        function sampleTexture(hit, map) {
-            if (!map || !map.image || !hit.uv) return null;
-            var img = map.image, cv = sampleCanvases.get(img);
-            if (!cv) {
-                cv = document.createElement('canvas');
-                cv.width = img.width; cv.height = img.height;
-                cv.getContext('2d').drawImage(img, 0, 0);
-                sampleCanvases.set(img, cv);
+        // A click: the lid eyedropper takes the nearest surface's colour; otherwise the selected
+        // anchor is centred on the chosen surface (Shift: through glasses).
+        function onPick(first, chosen, event) {
+            if (pickMode) {
+                setPickMode(false);
+                try {
+                    var mat = materialOf(first);
+                    var rgb = sampleTexture(first, mat && mat.map);
+                    if (rgb) post({ action: 'colorPicked', rgb: rgb, mr: sampleMR(first) });
+                    else showError('No texture under that point to sample.');
+                } catch (err) { showError('Could not sample the texture: ' + err.message); }
+                return;
             }
-            var uv = hit.uv.clone();
-            map.transformUv(uv);
-            var x = Math.min(Math.max(Math.floor(uv.x * cv.width) - 1, 0), cv.width - 3);
-            var y = Math.min(Math.max(Math.floor(uv.y * cv.height) - 1, 0), cv.height - 3);
-            var d = cv.getContext('2d').getImageData(x, y, 3, 3).data, rgb = [0, 0, 0];
-            for (var i = 0; i < 9; i++) { rgb[0] += d[i * 4]; rgb[1] += d[i * 4 + 1]; rgb[2] += d[i * 4 + 2]; }
-            return [rgb[0] / 2295, rgb[1] / 2295, rgb[2] / 2295];   // 9 texels x 255
+            post({ action: 'eyeClicked', p: meshPointFromHit(chosen) });
         }
 
-        try {
-            var canvas = document.querySelector('#viewport');
-            var renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: true });
-            renderer.setPixelRatio(window.devicePixelRatio);
-            renderer.setSize(window.innerWidth, window.innerHeight);
-            renderer.outputEncoding = THREE.sRGBEncoding;
-
-            var scene = new THREE.Scene();
-            scene.background = new THREE.Color(0x1a1c1e);
-            var camera = new THREE.PerspectiveCamera(35, window.innerWidth / window.innerHeight, 0.001, 10000);
-            var controls = new THREE.OrbitControls(camera, renderer.domElement);
-            controls.enableDamping = true;
-
-            scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1.2));
-            scene.add(new THREE.AmbientLight(0xffffff, 0.6));
-            var dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
-            dirLight.position.set(2, 5, 7.5);
-            scene.add(dirLight);
-
-            var meshes = [];
-            var headBone = null;
-            var modelHeight = 1;
-
-            function normalise(name) {
-                var s = (name || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-                return s.indexOf('mixamorig') === 0 ? s.substring(9) : s;
-            }
-
-            window.frameHead = function () {
-                if (meshes.length === 0) return;
-                var target = new THREE.Vector3();
-                if (headBone) headBone.getWorldPosition(target);
-                else new THREE.Box3().setFromObject(scene).getCenter(target);
-                var forward = new THREE.Vector3(0, 0, 1).transformDirection(meshes[0].matrixWorld);
-                controls.target.copy(target);
-                camera.position.copy(target).addScaledVector(forward, modelHeight * 0.45);
-                controls.update();
-            };
-
-            // The clicked point back in raw POSITION space: barycentric weights on the triangle
-            // as drawn (skinned), applied to its bind-pose corners - right whether or not the
-            // rest pose matches the bind pose.
-            function meshPointFromHit(hit) {
-                var mesh = hit.object, pos = mesh.geometry.attributes.position, f = hit.face;
-                var ids = [f.a, f.b, f.c], drawn = [];
-                for (var k = 0; k < 3; k++) {
-                    var v = new THREE.Vector3();
-                    if (mesh.isSkinnedMesh) mesh.boneTransform(ids[k], v);
-                    else v.fromBufferAttribute(pos, ids[k]);
-                    drawn.push(v.applyMatrix4(mesh.matrixWorld));
-                }
-                var bary = new THREE.Vector3();
-                THREE.Triangle.getBarycoord(hit.point, drawn[0], drawn[1], drawn[2], bary);
-                var w = [bary.x, bary.y, bary.z], out = [0, 0, 0];
-                for (var k = 0; k < 3; k++) {
-                    out[0] += w[k] * pos.getX(ids[k]);
-                    out[1] += w[k] * pos.getY(ids[k]);
-                    out[2] += w[k] * pos.getZ(ids[k]);
-                }
-                return out;
-            }
-
-            var loader = new THREE.GLTFLoader();
-            loader.load('https://appassets.local/" + previewFileName + @"', function (gltf) {
-                scene.add(gltf.scene);
-                gltf.scene.traverse(function (obj) {
-                    if (obj.isMesh) {
-                        meshes.push(obj);
-                        var mats = Array.isArray(obj.material) ? obj.material : [obj.material];
-                        mats.forEach(patchMaterial);
-                    }
-                    if (obj.isBone && !headBone && normalise(obj.name) === 'head') headBone = obj;
-                });
-                gltf.scene.updateMatrixWorld(true);
-                var box = new THREE.Box3().setFromObject(gltf.scene);
-                modelHeight = Math.max(box.max.y - box.min.y, 1e-3);
-                camera.near = modelHeight * 0.001;
-                camera.far = modelHeight * 100;
-                camera.updateProjectionMatrix();
-                frameHead();
-                post({ action: 'loaded' });
-            }, undefined, function (error) {
-                showError('Failed to load preview: ' + (error && error.message ? error.message : error));
-            });
-
-            window.addEventListener('resize', function () {
-                camera.aspect = window.innerWidth / window.innerHeight;
-                camera.updateProjectionMatrix();
-                renderer.setSize(window.innerWidth, window.innerHeight);
-            });
-
-            // A press that moved more than a few pixels was an orbit drag, not a click.
-            var raycaster = new THREE.Raycaster();
-            var pickVec = new THREE.Vector2();
-            var pressX = 0, pressY = 0;
-            canvas.addEventListener('pointerdown', function (event) { pressX = event.clientX; pressY = event.clientY; });
-            canvas.addEventListener('click', function (event) {
-                if (Math.abs(event.clientX - pressX) > 4 || Math.abs(event.clientY - pressY) > 4) return;
-                var rect = canvas.getBoundingClientRect();
-                pickVec.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
-                pickVec.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
-                raycaster.setFromCamera(pickVec, camera);
-                var hits = raycaster.intersectObjects(meshes, false);
-                if (hits.length === 0 || !hits[0].face) return;
-                if (pickMode) {
-                    setPickMode(false);
-                    try {
-                        var mat = materialOf(hits[0]);
-                        var rgb = sampleTexture(hits[0], mat && mat.map);
-                        if (rgb) post({ action: 'colorPicked', rgb: rgb, mr: sampleMR(hits[0]) });
-                        else showError('No texture under that point to sample.');
-                    } catch (err) { showError('Could not sample the texture: ' + err.message); }
-                    return;
-                }
-                // Shift: through the first surface (glasses) to the next one behind it.
-                var hit = hits[0];
-                if (event.shiftKey)
-                    for (var h = 1; h < hits.length; h++)
-                        if (hits[h].face && hits[h].distance > hits[0].distance + 1e-4 * modelHeight) { hit = hits[h]; break; }
-                post({ action: 'eyeClicked', p: meshPointFromHit(hit) });
-            });
-
-            var lidClock = new THREE.Clock();
-            (function animate() {
-                requestAnimationFrame(animate);
-                updateLids(Math.min(lidClock.getDelta(), 0.1));
-                controls.update();
-                renderer.render(scene, camera);
-            })();
-        } catch (err) {
-            showError('Setup error: ' + err.message);
-        }
-    </script>
-</body>
-</html>";
+        function onFrame(dt) { updateLids(dt); }
+";
     }
 }

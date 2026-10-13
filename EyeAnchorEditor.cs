@@ -10,7 +10,8 @@ using System.Windows.Forms;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
 using SharpGLTF.Schema2;
-using SharpGLTF.Transforms;
+using static GlbMerger.FaceAnchors;
+using EyeState = GlbMerger.AnchorRegion;
 
 namespace GlbMerger
 {
@@ -49,7 +50,6 @@ namespace GlbMerger
     public partial class EyeAnchorEditor : UserControl, IUnappliedChanges
     {
         private static readonly string[] AnchorNames = { "EyeAnchorL", "EyeAnchorR" };
-        private const string UnusedSuffix = "_unused";
 
         // Starting size for a freshly clicked eye, as a percent of the model's height.
         private static readonly Vector3 DefaultRadiiPct = new(2.2f, 1.8f, 3.0f);
@@ -60,13 +60,6 @@ namespace GlbMerger
         private readonly Matrix4x4 _meshToHead;   // row-vector: mesh space -> head-local (its inverse bind)
         private readonly float _modelHeight;
 
-        private struct EyeState
-        {
-            public bool Set;
-            public Vector3 Centre;     // mesh units
-            public Vector3 RadiiPct;   // percent of model height; Z = depth behind the centre
-            public float FrontPct;     // depth in front of the centre, percent of model height, <= RadiiPct.Z
-        }
         private readonly EyeState[] _eyes = new EyeState[2];
         private readonly EyeState[] _savedEyes = new EyeState[2];
         // Model-wide, both eyes.
@@ -149,56 +142,8 @@ namespace GlbMerger
 
         private int Side => _radioRight.Checked ? 1 : 0;
 
-        // ---- Rig lookups ------------------------------------------------------------------
-
-        // The game's convention (BoneNames::Normalise): lowercase alphanumerics, minus a
-        // "mixamorig" prefix, compared exactly - so "mixamorig:Head" matches but "HeadTop_End"
-        // does not.
-        private static string Normalise(string? name)
-        {
-            if (string.IsNullOrEmpty(name)) return "";
-            var s = new string(name.Where(char.IsLetterOrDigit).Select(char.ToLowerInvariant).ToArray());
-            return s.StartsWith("mixamorig", StringComparison.Ordinal) ? s.Substring("mixamorig".Length) : s;
-        }
-
-        private static Node? FindHead(ModelRoot model) =>
-            model.LogicalNodes.FirstOrDefault(n => Normalise(n.Name) == "head");
-
-        // The node's inverse-bind matrix when it is a skin joint - the same mapping the game uses
-        // (EyeRig.cpp BindToMesh) - else the inverse of its rest world matrix.
-        private static Matrix4x4 MeshToNode(ModelRoot model, Node? node)
-        {
-            if (node == null) return Matrix4x4.Identity;
-            foreach (var skin in model.LogicalSkins)
-                for (int i = 0; i < skin.JointsCount; i++)
-                {
-                    var (joint, inverseBind) = skin.GetJoint(i);
-                    if (joint == node) return inverseBind;
-                }
-            return Matrix4x4.Invert(node.WorldMatrix, out var inv) ? inv : Matrix4x4.Identity;
-        }
-
-        private static float MeasureModelHeight(ModelRoot model)
-        {
-            float minY = float.MaxValue, maxY = float.MinValue;
-            foreach (var mesh in model.LogicalMeshes)
-                foreach (var prim in mesh.Primitives)
-                {
-                    var positions = prim.GetVertexAccessor("POSITION")?.AsVector3Array();
-                    if (positions == null) continue;
-                    foreach (var p in positions) { minY = Math.Min(minY, p.Y); maxY = Math.Max(maxY, p.Y); }
-                }
-            return maxY > minY ? maxY - minY : 1f;
-        }
-
-        private Node? FindAnchorNode(int side, bool includeUnused)
-        {
-            string name = AnchorNames[side];
-            return _model.LogicalNodes.FirstOrDefault(n => string.Equals(n.Name, name, StringComparison.OrdinalIgnoreCase))
-                ?? (includeUnused
-                    ? _model.LogicalNodes.FirstOrDefault(n => string.Equals(n.Name, name + UnusedSuffix, StringComparison.OrdinalIgnoreCase))
-                    : null);
-        }
+        private Node? FindAnchorNode(int side, bool includeUnused) =>
+            FaceAnchors.FindAnchorNode(_model, AnchorNames[side], includeUnused);
 
         // ---- Load / save ------------------------------------------------------------------
 
@@ -209,19 +154,7 @@ namespace GlbMerger
                 var node = FindAnchorNode(side, includeUnused: false);
                 if (node == null) continue;
 
-                // Row-vector: local -> parent-local -> mesh.
-                var meshToParent = MeshToNode(_model, node.VisualParent);
-                if (!Matrix4x4.Invert(meshToParent, out var parentToMesh)) continue;
-                var m = node.LocalTransform.Matrix * parentToMesh;
-
-                var radii = new Vector3(new Vector3(m.M11, m.M12, m.M13).Length(),
-                                        new Vector3(m.M21, m.M22, m.M23).Length(),
-                                        new Vector3(m.M31, m.M32, m.M33).Length());
-                var radiiPct = radii / _modelHeight * 100f;
-                _eyes[side] = new EyeState
-                {
-                    Set = true, Centre = m.Translation, RadiiPct = radiiPct, FrontPct = ReadFront(node) * radiiPct.Z,
-                };
+                _eyes[side] = ReadRegion(_model, node, _modelHeight);
                 ReadStyle(node);
             }
         }
@@ -243,43 +176,19 @@ namespace GlbMerger
                 ReadUnit(o, "lashWidth", ref _style.LashWidth);
                 ReadUnit(o, "lashStrength", ref _style.LashStrength);
                 ReadUnit(o, "cleanup", ref _style.Cleanup);
-                ReadLimit(o, "limitAbove", ref _style.LimitAbove);
-                ReadLimit(o, "limitBelow", ref _style.LimitBelow);
-                if (o["tilt"] is JsonValue tv && tv.TryGetValue(out double tilt))
-                    _style.Tilt = Math.Clamp((float)tilt, -45f, 45f);
-                if (o["irisColor"] is JsonArray c && c.Count == 3)
-                    _style.IrisColor = Color.FromArgb(ToByte(c[0]), ToByte(c[1]), ToByte(c[2]));
+                ReadClamped(o, "limitAbove", ref _style.LimitAbove, 0f, 3f);
+                ReadClamped(o, "limitBelow", ref _style.LimitBelow, 0f, 3f);
+                ReadClamped(o, "tilt", ref _style.Tilt, -45f, 45f);
+                _style.IrisColor = ReadColor(o, "irisColor") ?? _style.IrisColor;
                 if (o["lidRoughness"] is JsonValue lr && lr.TryGetValue(out double rough))
                     _style.LidRoughness = Math.Clamp((float)rough, 0f, 1f);
                 if (o["lidMetalness"] is JsonValue lm && lm.TryGetValue(out double metal))
                     _style.LidMetalness = Math.Clamp((float)metal, 0f, 1f);
-                if (o["lidColor"] is JsonArray l && l.Count == 3)
-                    _style.LidColor = Color.FromArgb(ToByte(l[0]), ToByte(l[1]), ToByte(l[2]));
+                if (ReadColor(o, "lidColor") is Color lid) _style.LidColor = lid;
             }
             catch (InvalidOperationException) { }
             catch (FormatException) { }
         }
-
-        private static float ReadFront(Node node)
-        {
-            float front = 1f;
-            if (node.Extras is JsonObject o)
-                try { ReadUnit(o, "front", ref front); } catch (InvalidOperationException) { }
-            return front;
-        }
-
-        private static void ReadLimit(JsonObject o, string key, ref float field)
-        {
-            if (o[key] is JsonValue v && v.TryGetValue(out double value)) field = Math.Clamp((float)value, 0f, 3f);
-        }
-
-        private static void ReadUnit(JsonObject o, string key, ref float field)
-        {
-            if (o[key] is JsonValue v && v.TryGetValue(out double value)) field = Math.Clamp((float)value, 0f, 1f);
-        }
-
-        private static int ToByte(JsonNode? n) => (int)Math.Round(Math.Clamp(n!.GetValue<double>(), 0, 1) * 255);
-        private static double Unit(int channel) => Math.Round(channel / 255.0, 4);
 
         private JsonObject StyleExtras()
         {
@@ -293,7 +202,7 @@ namespace GlbMerger
             extras["limitBelow"] = Math.Round(_style.LimitBelow, 3);
             extras["tilt"] = Math.Round(_style.Tilt, 2);
             if (_style.LidColor is Color lid)
-                extras["lidColor"] = new JsonArray(Unit(lid.R), Unit(lid.G), Unit(lid.B));
+                extras["lidColor"] = ColorJson(lid);
             if (_style.LidRoughness is float lr && _style.LidMetalness is float lm)
             {
                 extras["lidRoughness"] = Math.Round(lr, 3);
@@ -310,7 +219,7 @@ namespace GlbMerger
             ["irisRadius"] = Math.Round(_style.IrisRadius, 3),
             ["rimWidth"] = Math.Round(_style.RimWidth, 3),
             ["rimStrength"] = Math.Round(_style.RimStrength, 3),
-            ["irisColor"] = new JsonArray(Unit(_style.IrisColor.R), Unit(_style.IrisColor.G), Unit(_style.IrisColor.B)),
+            ["irisColor"] = ColorJson(_style.IrisColor),
         };
 
         private void SaveAnchors()
@@ -326,27 +235,12 @@ namespace GlbMerger
             for (int side = 0; side < 2; side++)
             {
                 var existing = FindAnchorNode(side, includeUnused: true);
-                if (!_eyes[side].Set)
-                {
-                    // SharpGLTF can't detach a node: a cleared anchor is renamed out of the game's
-                    // sight instead, and reused if this eye is placed again.
-                    if (existing != null) existing.Name = AnchorNames[side] + UnusedSuffix;
-                    continue;
-                }
+                if (!_eyes[side].Set) { Retire(existing, AnchorNames[side]); continue; }
 
-                // Anchor in mesh space (scale then place), carried into head-local by the head's
-                // inverse bind - the exact inverse of how the game reads it back.
-                var radii = _eyes[side].RadiiPct * (_modelHeight / 100f);
-                var meshAnchor = Matrix4x4.CreateScale(radii) * Matrix4x4.CreateTranslation(_eyes[side].Centre);
-                if (!Matrix4x4.Decompose(meshAnchor * _meshToHead, out var scale, out var rotation, out var translation))
-                    continue;
-
-                var node = existing ?? _head.CreateNode(AnchorNames[side]);
-                node.Name = AnchorNames[side];
-                node.LocalTransform = new AffineTransform(scale, rotation, translation);
+                var node = WriteRegion(_head, _meshToHead, existing, AnchorNames[side], _eyes[side], _modelHeight);
+                if (node == null) continue;
                 var extras = StyleExtras();
-                var eye = _eyes[side];
-                extras["front"] = Math.Round(eye.RadiiPct.Z > 0 ? Math.Clamp(eye.FrontPct / eye.RadiiPct.Z, 0f, 1f) : 1f, 3);
+                extras["front"] = FrontRatio(_eyes[side]);
                 node.Extras = extras;
                 saved++;
             }
@@ -466,12 +360,7 @@ namespace GlbMerger
             finally { _suppressEvents = false; }
         }
 
-        private static void SetClamped(NumericUpDown n, float v) =>
-            n.Value = Math.Clamp((decimal)v, n.Minimum, n.Maximum);
-
         // ---- Viewer bridge ----------------------------------------------------------------
-
-        private static string Inv(float v) => v.ToString("R", CultureInfo.InvariantCulture);
 
         private void PushEyes()
         {
@@ -491,7 +380,7 @@ namespace GlbMerger
                           $"\"pupilRadius\":{Inv(_style.PupilRadius)},\"maxOffset\":{Inv(_style.MaxOffset)}," +
                           $"\"fill\":{Inv(_style.Fill)},\"rimWidth\":{Inv(_style.RimWidth)}," +
                           $"\"irisRadius\":{Inv(_style.IrisRadius)}," +
-                          $"\"irisColor\":[{Inv(_style.IrisColor.R / 255f)},{Inv(_style.IrisColor.G / 255f)},{Inv(_style.IrisColor.B / 255f)}]," +
+                          $"\"irisColor\":{ColorJs(_style.IrisColor)}," +
                           $"\"rimStrength\":{Inv(_style.RimStrength)}," +
                           $"\"lidColor\":{LidColorJson()},\"lidMR\":{LidMRJson()},\"lidRest\":{Inv(_style.LidRest)},\"lowerRest\":{Inv(_style.LowerRest)}," +
                           $"\"lashWidth\":{Inv(_style.LashWidth)},\"lashStrength\":{Inv(_style.LashStrength)},\"cleanup\":{Inv(_style.Cleanup)}," +
@@ -529,8 +418,6 @@ namespace GlbMerger
             }
         }
 
-        private static int ToByte(float unit) => (int)Math.Round(Math.Clamp(unit, 0f, 1f) * 255f);
-
         private sealed class ViewerMessage
         {
             public string? Action { get; set; }
@@ -541,9 +428,7 @@ namespace GlbMerger
 
         // ---- Lids -------------------------------------------------------------------------
 
-        private string LidColorJson() => _style.LidColor is Color c
-            ? $"[{Inv(c.R / 255f)},{Inv(c.G / 255f)},{Inv(c.B / 255f)}]"
-            : "null";
+        private string LidColorJson() => _style.LidColor is Color c ? ColorJs(c) : "null";
 
         private string LidMRJson() => _style.LidRoughness is float r && _style.LidMetalness is float m
             ? $"[{Inv(r)},{Inv(m)}]"
