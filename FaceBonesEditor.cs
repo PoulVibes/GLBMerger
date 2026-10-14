@@ -43,6 +43,7 @@ namespace GlbMerger
         private readonly AnchorRegion[] _regions = new AnchorRegion[4];
         private readonly float[] _core = { DefaultCore, DefaultCore, DefaultCore, DefaultCore };
         private float _chinDrop = DefaultChinDrop;
+        private readonly float[] _browTilt = new float[2];   // degrees; positive raises the region's outer end
         private bool _dirty;
 
         private readonly HelpTips _help;
@@ -91,6 +92,7 @@ namespace GlbMerger
                 ReadUnit(o, "core", ref _core[f]);
                 if (f == Mouth) { ReadMouthStyle(o); ReadMouthPoints(o); }
                 if (f == Chin) ReadClamped(o, "drop", ref _chinDrop, 0f, 2f);
+                if (f < Mouth) ReadClamped(o, "tilt", ref _browTilt[f], -60f, 60f);
             }
         }
 
@@ -112,6 +114,7 @@ namespace GlbMerger
                 var extras = new JsonObject { ["front"] = FrontRatio(_regions[f]), ["core"] = Math.Round(_core[f], 3) };
                 if (f == Mouth) { WriteMouthStyle(extras); WriteMouthPoints(extras); }
                 if (f == Chin) extras["drop"] = Math.Round(_chinDrop, 3);
+                if (f < Mouth) extras["tilt"] = Math.Round(_browTilt[f], 2);
                 node.Extras = extras;
             }
 
@@ -120,6 +123,8 @@ namespace GlbMerger
                 {
                     Name = FeatureNames[f], Region = _regions[f], Core = _core[f], Drop = f == Chin ? _chinDrop : 0f,
                     MouthPoints = f == Mouth ? MouthPointsForRig() : null,
+                    TiltDeg = f < Mouth ? _browTilt[f] : 0f,
+                    ChinStartY = f == Chin ? MouthOpenBottomY() : null,
                 })
                 .ToList();
             string result = FaceBoneRigger.Apply(_model, _head, _meshToHead, _modelHeight, features);
@@ -168,7 +173,18 @@ namespace GlbMerger
             var g = _regions[f];
             var r = g.RadiiPct * (_modelHeight / 100f);
             return $"{{\"on\":{(g.Set ? "true" : "false")},\"c\":[{Inv(g.Centre.X)},{Inv(g.Centre.Y)},{Inv(g.Centre.Z)}]," +
-                   $"\"r\":[{Inv(r.X)},{Inv(r.Y)},{Inv(r.Z)}],\"f\":{Inv(g.FrontPct * _modelHeight / 100f)}}}";
+                   $"\"r\":[{Inv(r.X)},{Inv(r.Y)},{Inv(r.Z)}],\"f\":{Inv(g.FrontPct * _modelHeight / 100f)}," +
+                   $"\"t\":{Inv(RegionTurn(f))}}}";
+        }
+
+        // A brow region's tilt as a turn about z, radians: positive tilt raises the end away from the
+        // other brow, as FaceBoneRigger turns it.
+        private float RegionTurn(int f)
+        {
+            if (f >= Mouth || !_regions[f].Set) return 0f;
+            float midline = _regions[0].Set && _regions[1].Set ? 0.5f * (_regions[0].Centre.X + _regions[1].Centre.X) : 0f;
+            float outer = _regions[f].Centre.X >= midline ? 1f : -1f;
+            return outer * _browTilt[f] * MathF.PI / 180f;
         }
 
         private void PushState()
@@ -179,6 +195,7 @@ namespace GlbMerger
                           $"\"strength\":{Inv(_sliderStrength.Value / 100f)}," +
                           $"\"showRegion\":{(_chkShowRegion.Checked ? "true" : "false")}," +
                           $"\"showWeights\":{(_chkShowWeights.Checked ? "true" : "false")},\"selected\":{Selected}," +
+                          $"\"showPoints\":{(_chkShowPoints.Checked ? "true" : "false")}," +
                           $"\"chinDrop\":{Inv(_chinDrop)},\"mouth\":{MouthJson()}," +
                           $"\"mouthPoints\":{MouthPointsJson()},\"pickPoints\":{(_pickingMouthPoints ? "true" : "false")}}}";
             _webView.CoreWebView2.ExecuteScriptAsync($"setFace({json});");
@@ -206,7 +223,7 @@ namespace GlbMerger
             if (m.Action == "mouthPoint" && m.P is { Length: 3 } mp) OnMouthPointClicked(new Vector3(mp[0], mp[1], mp[2]));
             if (m.Action == "mouthPointMoved" && m.P is { Length: 3 } mv && m.I is int i)
                 OnMouthPointMoved(i, new Vector3(mv[0], mv[1], mv[2]));
-            if (m.Action == "colorPicked" && m.Rgb is { Length: 3 } rgb) OnMouthColorPicked(m.Target, rgb);
+            if (m.Action == "colorPicked" && m.Rgb is { Length: 3 } rgb) OnMouthColorPicked(m.Target, rgb, m.Mr, m.MrOnly == true);
         }
 
         private sealed class ViewerMessage
@@ -217,6 +234,8 @@ namespace GlbMerger
             public int? Bones { get; set; }    // loaded: face bones found
             public string? Target { get; set; } // colorPicked: which mouth colour
             public float[]? Rgb { get; set; }   // colorPicked: the texture's sRGB under the click
+            public float[]? Mr { get; set; }    // colorPicked: roughness, metalness there
+            public bool? MrOnly { get; set; }   // colorPicked: only the roughness / metalness wanted
         }
 
         private string _previewPath = "";

@@ -53,10 +53,25 @@ struct MouthParams
     float creaseAngle;                  // radians the crease's middle turns up from straight out
     float creaseOffset;                 // how far outside the opening's corner
     vec3  creaseColor;
+    float baseOpen;                     // how open the painted mouth is; > 0: lips drawn round the
+                                        // opening, there even shut, so it can close over the paint
+    float lipOpacity;                   // 0..1: how much the lips cover the paint under them
+    float lipArc;                       // the bottom lip's curve: 1 round, below flatter, above deeper in the middle
+    float alwaysDrawn;                  // 1: the drawn mouth never hands back to the paint, even at rest
 };
 
 // 1 where d < 0, antialiased over aa.
 float MouthIn(float d, float aa) { return 1.0 - smoothstep(-aa, aa, d); }
+
+// How far the drawn mouth has taken over from the painted one: none while the
+// mouth is as painted (shut, or a painted-open mouth at its painting), fully
+// once it has moved 3% from it -- opening a painted-shut mouth, or opening or
+// shutting a painted-open one -- or always, for a mouth set always drawn (then
+// with lips that meet on a seam when shut, as a painted-open mouth's).
+float MouthSwap(MouthParams p)
+{
+    return max(smoothstep(0.0, 0.03, abs(p.open - p.baseOpen)), step(0.5, p.alwaysDrawn));
+}
 
 // Where the opening is at feature point f (region units): the painted lip
 // line runs hl either side; the opening along it is narrower when rounded,
@@ -64,6 +79,7 @@ float MouthIn(float d, float aa) { return 1.0 - smoothstep(-aa, aa, d); }
 struct MouthShape
 {
     float hl, hw, arc, depth, lift, line, top, bottom, dOuter;
+    float lipsShut;                     // a baked-open mouth's lips, outside the opening (0 otherwise)
 };
 
 MouthShape MouthShapeAt(vec2 f, MouthParams p)
@@ -78,7 +94,8 @@ MouthShape MouthShapeAt(vec2 f, MouthParams p)
     s.lift   = p.round * 0.35 * s.depth;
     s.line   = mix(p.lip.x, p.lip.y, tl * tl);       // the painted lip line
     s.top    = s.line + s.lift * s.arc;
-    s.bottom = s.top - s.depth * s.arc;
+    s.lipsShut = p.baseOpen > 0.0 || p.alwaysDrawn > 0.5 ? p.lipThickness * (1.0 + 0.5 * p.round) : 0.0;
+    s.bottom = s.top - s.depth * pow(s.arc, max(p.lipArc, 0.05)) - 2.0 * s.lipsShut * sqrt(s.arc);
     s.dOuter = max(max(f.y - s.top, s.bottom - f.y), abs(f.x) - s.hw);
     return s;
 }
@@ -116,16 +133,19 @@ vec4 MouthPaint(vec2 f, float aa, MouthParams p, MouthShape g)
     if (max(open, ring) <= 0.0) return vec4(0.0);
 
     // Lips: a band inside the outline, the lower one fuller, both thinning to
-    // the corners and never taking more than half the opening.
-    float lipMid = min(p.lipThickness * (1.0 + 0.5 * p.round), g.depth * 0.25);   // pursed: fuller
+    // the corners and never taking more than half the opening -- or, round a
+    // baked-open mouth, their full thickness outside it, there even shut.
+    float lipMid = g.lipsShut > 0.0 ? g.lipsShut
+                                    : min(p.lipThickness * (1.0 + 0.5 * p.round), g.depth * 0.25);   // pursed: fuller
     float lipT   = lipMid * sqrt(g.arc);
     float upperT = lipT * 0.8, lowerT = lipT * 1.2;
     float inTop  = g.top - upperT, inBottom = g.bottom + lowerT;
     float inner  = MouthIn(max(max(f.y - inTop, inBottom - f.y), abs(f.x) - g.hw), aa);
 
     // The mouth behind: dark, darkest up under the palate.
-    float ih        = max(g.depth - lipMid * 2.0, 1e-4);          // the inside's height in the middle
-    float midBottom = p.lip.x + g.lift - g.depth + lipMid * 1.2;  // and its bottom there
+    float shut      = g.lipsShut * 2.0;                            // lips added round a baked-open mouth
+    float ih        = max(g.depth + shut - lipMid * 2.0, 1e-4);   // the inside's height in the middle
+    float midBottom = p.lip.x + g.lift - g.depth - shut + lipMid * 1.2;   // and its bottom there
     vec3  c  = p.interior * mix(1.0, 0.6, clamp((f.y - midBottom) / ih, 0.0, 1.0));
 
     // Tongue: a low mound across most of the opening, its top dipping at the
@@ -168,22 +188,43 @@ vec4 MouthPaint(vec2 f, float aa, MouthParams p, MouthShape g)
                + p.lips * 0.35 * exp(-pow((lv - 0.45) / 0.22, 2.0)) * (1.0 - isUp);
     c = mix(lipC, c, inner);
 
+    // A baked-open mouth closing: where its lips meet, a seam in the outline colour.
+    float seam = MouthIn(abs(f.y - 0.5 * (inTop + inBottom)) - max(0.5 * p.edge, aa), aa)
+               * MouthIn(abs(f.x) - g.hw, aa) * (1.0 - smoothstep(0.0, 0.15, g.depth)) * step(1e-4, g.lipsShut);
+    c = mix(c, p.outline, seam);
+
     // The outline round the outside: the opening keeps its full size, the
-    // line grows outward from it.
+    // line grows outward from it. The lips cover the paint lipOpacity of the
+    // way; the inside of the mouth and the seam fully.
+    float alpha = max(mix(p.lipOpacity, 1.0, max(inner, seam)) * open, ring * 0.85);
     c = mix(p.outline, c, open);
-    return vec4(c, max(open, ring * 0.85));
+    return vec4(c, alpha * MouthSwap(p));
 }
 
-// Whenever the mouth is open, the painted closed mouth is covered in skin, so
+// Whenever the drawn mouth is in (MouthSwap), the painted one is covered in skin, so
 // none of it shows round the drawn one -- a baked-on smile past an O shape's
 // corners, painted lips below the opening: everything within maskMargin of the
 // painted lip line (its whole width) or of the opening, solid skin colour.
+float MouthMaskZone(vec2 f, float aa, MouthParams p, MouthShape g)
+{
+    if (p.maskMargin <= 0.0) return 0.0;
+    float dLine = length(vec2(max(abs(f.x) - g.hl, 0.0), f.y - g.line));
+    float d     = min(dLine, max(g.dOuter, 0.0));
+    // A painted-open mouth: its painted opening too (the drawn one at baseOpen
+    // is lined up with it), however far the drawn one has shut.
+    if (p.baseOpen > 0.0)
+    {
+        MouthParams painted = p;
+        painted.open  = p.baseOpen;
+        painted.round = 0.0;
+        d = min(d, max(MouthShapeAt(f, painted).dOuter, 0.0));
+    }
+    return MouthIn(d - p.maskMargin, aa) * MouthSwap(p);
+}
+
 vec3 MouthMask(vec3 albedo, vec2 f, float aa, MouthParams p, MouthShape g)
 {
-    if (p.maskMargin <= 0.0) return albedo;
-    float dLine = length(vec2(max(abs(f.x) - g.hl, 0.0), f.y - g.line));
-    float zone  = MouthIn(min(dLine, max(g.dOuter, 0.0)) - p.maskMargin, aa) * smoothstep(0.0, 0.03, p.open);
-    return mix(albedo, p.skin, zone);
+    return mix(albedo, p.skin, MouthMaskZone(f, aa, p, g));
 }
 // A crease at each corner of the opening while it's open, like the ones a
 // smile leaves: a short arc just outside the corner, bulging away from the
@@ -203,7 +244,7 @@ vec3 MouthCreases(vec3 albedo, vec2 f, float aa, MouthParams p, MouthShape g)
     float s    = clamp(ang / (0.5 * span), -1.0, 1.0);                          // along it, end to end
     float at   = p.creaseAngle + s * 0.5 * span;
     float dist = length(q - (o + R * vec2(cos(at), sin(at))));
-    float ink  = MouthIn(dist - 0.5 * p.creaseWidth * (1.0 - s * s), aa) * smoothstep(0.0, 0.03, p.open);
+    float ink  = MouthIn(dist - 0.5 * p.creaseWidth * (1.0 - s * s), aa) * MouthSwap(p);
     return mix(albedo, p.creaseColor, ink);
 }
 // ---- end MouthPaint ----
@@ -223,9 +264,12 @@ vec3 MouthCreases(vec3 albedo, vec2 f, float aa, MouthParams p, MouthShape g)
             'uniform vec4 mouthMisc;',    // teeth width, round, tongue up, bite
             'uniform vec4 mouthOutline;', // outline + lower tooth height
             'uniform vec4 mouthSkin;',    // skin + mask margin
+            'uniform vec4 mouthSkinMR;',  // the skin's roughness, metalness, known (1/0), -
+            'float gMouthSurface;',       // how much of this fragment the mouth covers: mask or drawn mouth
             'uniform vec4 mouthTooth;',   // tooth width, tooth gap, crease length, crease width
             'uniform vec4 mouthCrease;',  // crease curve, angle (radians), offset, -
             'uniform vec3 mouthCreaseColor;',
+            'uniform vec4 mouthLipLook;', // lip opacity, lip arc, -, -
             MOUTH_CORE,
             // MouthOverlay.glsl's ApplyMouth, with the lip line drawn on top for lining up.
             'vec3 ApplyMouth(vec3 albedo) {',
@@ -246,11 +290,13 @@ vec3 MouthCreases(vec3 albedo, vec2 f, float aa, MouthParams p, MouthShape g)
             '        p.toothWidth = mouthTooth.x; p.toothGap = mouthTooth.y;',
             '        p.creaseLength = mouthTooth.z; p.creaseWidth = mouthTooth.w;',
             '        p.creaseCurve = mouthCrease.x; p.creaseAngle = mouthCrease.y; p.creaseOffset = mouthCrease.z;',
-            '        p.creaseColor = mouthCreaseColor;',
+            '        p.creaseColor = mouthCreaseColor; p.baseOpen = mouthCrease.w;',
+            '        p.lipOpacity = mouthLipLook.x; p.lipArc = mouthLipLook.y; p.alwaysDrawn = mouthLipLook.z;',
             '        MouthShape g = MouthShapeAt(f.xy, p);',
             '        albedo = mix(albedo, MouthCreases(MouthMask(albedo, f.xy, aa, p, g), f.xy, aa, p, g), slab);',
             '        vec4 m = MouthPaint(f.xy, aa, p, g);',
             '        albedo = mix(albedo, m.rgb, m.a * slab);',
+            '        gMouthSurface = max(MouthMaskZone(f.xy, aa, p, g), m.a) * slab;',
             '    }',
             '    float hw = max(mouthLip.z, 1e-4);',
             '    float t = clamp(f.x / hw, -1.0, 1.0);',
@@ -270,7 +316,12 @@ vec3 MouthCreases(vec3 albedo, vec2 f, float aa, MouthParams p, MouthShape g)
             '    return mix(c, vec3(1.0, 0.1, 0.6), clamp(vFaceW, 0.0, 1.0) * 0.7 * featShow.z);',
             '}', ''
         ].join('\n');
-        var FRAG_BODY = '\ndiffuseColor.rgb = TintFace(ApplyMouth(diffuseColor.rgb));\n';
+        var FRAG_BODY = '\ngMouthSurface = 0.0;\ndiffuseColor.rgb = TintFace(ApplyMouth(diffuseColor.rgb));\n';
+        // Where the mouth covers the paint, the skin's roughness and metalness, not the paint's (a
+        // painted grin's teeth can be glossier than the face). Preview only: the game's shading has no
+        // roughness or metalness maps.
+        var MOUTH_MR_ROUGH = '\nroughnessFactor = mix(roughnessFactor, mouthSkinMR.x, gMouthSurface * mouthSkinMR.z);\n';
+        var MOUTH_MR_METAL = '\nmetalnessFactor = mix(metalnessFactor, mouthSkinMR.y, gMouthSurface * mouthSkinMR.z);\n';
 
         function vec4s(n) { var a = []; for (var i = 0; i < n; i++) a.push(new THREE.Vector4()); return a; }
         var U = {
@@ -287,16 +338,21 @@ vec3 MouthCreases(vec3 albedo, vec2 f, float aa, MouthParams p, MouthShape g)
             mouthMisc: { value: new THREE.Vector4() },
             mouthOutline: { value: new THREE.Vector4() },
             mouthSkin: { value: new THREE.Vector4() },
+            mouthSkinMR: { value: new THREE.Vector4() },
             mouthTooth: { value: new THREE.Vector4() },
             mouthCrease: { value: new THREE.Vector4() },
-            mouthCreaseColor: { value: new THREE.Vector3() }
+            mouthCreaseColor: { value: new THREE.Vector3() },
+            mouthLipLook: { value: new THREE.Vector4(1, 1, 0, 0) }
         };
 
         function patchMaterial(mat) {
             mat.onBeforeCompile = function (shader) {
                 for (var k in U) shader.uniforms[k] = U[k];
                 shader.vertexShader = VERT_HEAD + shader.vertexShader.replace('#include <skinning_vertex>', '#include <skinning_vertex>' + VERT_BODY);
-                shader.fragmentShader = FRAG_HEAD + shader.fragmentShader.replace('#include <map_fragment>', '#include <map_fragment>' + FRAG_BODY);
+                shader.fragmentShader = FRAG_HEAD + shader.fragmentShader
+                    .replace('#include <map_fragment>', '#include <map_fragment>' + FRAG_BODY)
+                    .replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>' + MOUTH_MR_ROUGH)
+                    .replace('#include <metalnessmap_fragment>', '#include <metalnessmap_fragment>' + MOUTH_MR_METAL);
             };
             mat.needsUpdate = true;
         }
@@ -339,7 +395,7 @@ vec3 MouthCreases(vec3 albedo, vec2 f, float aa, MouthParams p, MouthShape g)
         }
 
         // A move (body axes, mesh units) and a turn about body z, as FaceBones::MotionFor.
-        function motionFor(d, face, s, open) {
+        function motionFor(d, face, s, openFromRest) {
             var move = [0, 0, 0], turn = 0;
             if (d.face === 'brow') {
                 var innerDrop = (0.40 * w(face, 'sad') - 0.40 * w(face, 'furrow')) * s * d.unit;
@@ -353,7 +409,7 @@ vec3 MouthCreases(vec3 albedo, vec2 f, float aa, MouthParams p, MouthShape g)
                 move[0] = a * (0.12 * w(face, 'grit') - 0.30 * w(face, 'pucker')) * s * d.halfWidth;
             } else if (d.face === 'chin') {
                 // The panel's Chin drop, not the saved one, so it can be tuned before saving.
-                move[1] = -(state ? state.chinDrop : d.drop) * open * d.unit;
+                move[1] = -(state ? state.chinDrop : d.drop) * openFromRest * d.unit;
             }
             return { move: move, turn: turn };
         }
@@ -457,7 +513,7 @@ vec3 MouthCreases(vec3 albedo, vec2 f, float aa, MouthParams p, MouthShape g)
 
         function applyFace() {
             var face = faceFor(state), s = state ? state.strength : 1;
-            var open = state ? mouthOpen(state) : 0;
+            var open = state ? mouthOpen(state) - (state.mouth.baseOpen || 0) : 0;   // from the painted opening
             faceBones.forEach(function (fb) {
                 var m = motionFor(fb.d, face, s, open);
                 fb.bone.position.copy(fb.restPos).add(new THREE.Vector3(m.move[0], m.move[1], m.move[2]).applyMatrix3(fb.toLocal));
@@ -474,6 +530,7 @@ vec3 MouthCreases(vec3 albedo, vec2 f, float aa, MouthParams p, MouthShape g)
                 if (!R.on || R.r[1] <= 0 || R.r[2] <= 0) { row.set(0, 0, 1, 0); continue; }
                 var back = R.r[2], front = Math.min(R.f, back), half = Math.max(0.5 * (front + back), 1e-6);
                 U.featMat.value[f].makeTranslation(-R.c[0], -R.c[1], -R.c[2])
+                    .premultiply(new THREE.Matrix4().makeRotationZ(-(R.t || 0)))   // a tilted brow region
                     .premultiply(new THREE.Matrix4().makeTranslation(0, 0, -0.5 * (front - back)))
                     .premultiply(new THREE.Matrix4().makeScale(1 / R.r[1], 1 / R.r[1], 1 / half));
                 row.set(1, 0, R.r[0] / R.r[1], 0);
@@ -481,7 +538,8 @@ vec3 MouthCreases(vec3 albedo, vec2 f, float aa, MouthParams p, MouthShape g)
             U.featShow.value.set(s.showRegion ? 1 : 0, s.selected, s.showWeights ? 1 : 0, 0);
             applyMouth(s);
             applyFace();
-            showMouthPoints(s.mouthPoints || []);
+            // The dots and line: their own toggle (Show mouth points), and always while picking.
+            showMouthPoints(s.showPoints || s.pickPoints ? (s.mouthPoints || []) : []);
             if (s.pickPoints) {
                 setHint('Click the mouth: point ' + ((s.mouthPoints || []).length + 1) +
                         ' of 5 - both corners and three along the lip line between them.');
@@ -491,27 +549,41 @@ vec3 MouthCreases(vec3 albedo, vec2 f, float aa, MouthParams p, MouthShape g)
 
         // As MouthStencil::Pack: the preset's opening times the strength, unless Test open is up.
         // The chin drops by the same opening (FaceBones::Apply).
+        // As EffectiveMouthOpen (FaceExpression.cpp): an expression only opens a painted-open mouth
+        // wider; a held mouth shape (talking) sets it outright. Test open is in charge once moved off
+        // the painted opening it starts at.
+        function testing(M) { return Math.abs(M.testOpen - (M.baseOpen || 0)) > 0.005; }
         function mouthOpen(s) {
-            var forced = s.mouth.testOpen > 0;
-            return Math.min(Math.max(forced ? s.mouth.testOpen : w(faceFor(s), 'open') * s.strength, 0), 1);
+            var M = s.mouth, base = M.baseOpen || 0;
+            if (testing(M)) return Math.min(Math.max(M.testOpen, 0), 1);
+            var o = Math.min(Math.max(w(faceFor(s), 'open') * s.strength, 0), 1);
+            var rest = Math.max(o, base), talk = s.viseme >= 0 ? 1 : 0;
+            return rest + (o - rest) * talk;
         }
         function linear(c, a) { return new THREE.Vector4(srgbToLinear(c[0]), srgbToLinear(c[1]), srgbToLinear(c[2]), a); }
         function applyMouth(s) {
-            var M = s.mouth, face = faceFor(s), forced = M.testOpen > 0;
+            var M = s.mouth, face = faceFor(s), forced = testing(M);
             var open = mouthOpen(s);
-            U.mouthA.value.set(M.on && open > 1e-3 ? 1 : 0, open, M.edge, s.showRegion && M.on ? 1 : 0);
+            U.mouthA.value.set(M.on && (M.alwaysDrawn > 0.5 || Math.abs(open - (M.baseOpen || 0)) > 1e-3) ? 1 : 0, open, M.edge,
+                               s.showRegion && M.on ? 1 : 0);
             U.mouthLip.value.set(M.lipY, M.lipCornerY, M.lipHalfWidth, M.openDepth);
-            U.mouthInt.value.copy(linear(M.interior, forced ? M.teethUpper : w(face, 'teethUpper')));
-            U.mouthTeeth.value.copy(linear(M.teeth, forced ? M.teethLower : w(face, 'teethLower')));
+            // The teeth showing at rest unless a held mouth shape (talking) sets them, as MouthStencil::Pack.
+            var talk = s.viseme >= 0 ? 1 : 0;
+            function teeth(shown, rest) { var t = Math.max(shown, rest || 0); return t + (shown - t) * talk; }
+            U.mouthInt.value.copy(linear(M.interior, forced ? M.teethUpper : teeth(w(face, 'teethUpper'), M.restTeethUpper)));
+            U.mouthTeeth.value.copy(linear(M.teeth, forced ? M.teethLower : teeth(w(face, 'teethLower'), M.restTeethLower)));
             U.mouthTongue.value.copy(linear(M.tongue, M.teethHeight));
             U.mouthLips.value.copy(linear(M.lips, M.lipThickness));
             U.mouthMisc.value.set(M.teethWidth, Math.min(w(face, 'round'), 1), Math.min(w(face, 'tongueUp'), 1), M.bite);
             U.mouthOutline.value.copy(linear(M.outline, M.lowerTeethHeight));
             U.mouthSkin.value.copy(M.skin ? linear(M.skin, M.maskMargin) : new THREE.Vector4(0, 0, 0, 0));   // no skin: no mask
+            if (M.skinRoughness != null && M.skinMetalness != null) U.mouthSkinMR.value.set(M.skinRoughness, M.skinMetalness, 1, 0);
+            else U.mouthSkinMR.value.set(0, 0, 0, 0);
             U.mouthTooth.value.set(M.toothWidth, M.toothGap, M.creaseLength, M.creaseWidth);
-            U.mouthCrease.value.set(M.creaseCurve, M.creaseAngle * Math.PI / 180, M.creaseOffset, 0);
+            U.mouthCrease.value.set(M.creaseCurve, M.creaseAngle * Math.PI / 180, M.creaseOffset, M.baseOpen || 0);
             var cc = linear(M.crease, 0);
             U.mouthCreaseColor.value.set(cc.x, cc.y, cc.z);
+            U.mouthLipLook.value.set(M.lipOpacity != null ? M.lipOpacity : 1, M.lipArc != null ? M.lipArc : 1, M.alwaysDrawn || 0, 0);
         }
 
         // Colour eyedropper (FaceBonesEditor.StartMouthEyedropper): the next click samples the texture
@@ -525,18 +597,22 @@ vec3 MouthCreases(vec3 albedo, vec2 f, float aa, MouthParams p, MouthShape g)
         // The mask's skin colour when none's been picked: the texture on the cheek just past the
         // mouth region's side, found by a ray straight at the face from in front (bind pose, mesh
         // +z forward, as the anchors are). Tries both sides; posts it as a Skin pick.
-        window.sampleSkinBeside = function () {
+        window.sampleSkinBeside = function (mrOnly) {
             var R = state && state.regions[2];
             if (!R || !R.on || !meshes.length) return;
-            for (var side = 1; side >= -1; side -= 2) {
-                var x = R.c[0] + side * R.r[0] * 1.3;
-                var from = meshToWorld([x, R.c[1], R.c[2] + modelHeight]);
-                var to = meshToWorld([x, R.c[1], R.c[2]]);
+            // Past a corner first; a mouth as wide as the face (a painted grin) has no cheek there, so
+            // then closer in, and up on the cheek above the corner.
+            var tries = [[1.3, 0], [1.0, 1.5], [0.8, 2.5], [0.6, 3.5]];
+            for (var t = 0; t < tries.length * 2; t++) {
+                var side = t % 2 ? -1 : 1, at = tries[t >> 1];
+                var x = R.c[0] + side * R.r[0] * at[0], y = R.c[1] + R.r[1] * at[1];
+                var from = meshToWorld([x, y, R.c[2] + modelHeight]);
+                var to = meshToWorld([x, y, R.c[2]]);
                 var hits = new THREE.Raycaster(from, to.clone().sub(from).normalize()).intersectObjects(meshes, true);
                 if (!hits.length) continue;
                 var mat = materialOf(hits[0]);
                 var rgb = sampleTexture(hits[0], mat && mat.map);
-                if (rgb) { post({ action: 'colorPicked', target: 'Skin', rgb: rgb }); return; }
+                if (rgb) { post({ action: 'colorPicked', target: 'Skin', rgb: rgb, mr: sampleMR(hits[0]), mrOnly: !!mrOnly }); return; }
             }
         };
 
@@ -547,7 +623,7 @@ vec3 MouthCreases(vec3 albedo, vec2 f, float aa, MouthParams p, MouthShape g)
                 try {
                     var mat = materialOf(first);
                     var rgb = sampleTexture(first, mat && mat.map);
-                    if (rgb) post({ action: 'colorPicked', target: target, rgb: rgb });
+                    if (rgb) post({ action: 'colorPicked', target: target, rgb: rgb, mr: sampleMR(first) });
                     else showError('No texture under that point to sample.');
                 } catch (err) { showError('Could not sample the texture: ' + err.message); }
                 return;

@@ -25,7 +25,8 @@ namespace GlbMerger
     // Weights: full inside `core` of the region (ellipse radius), fading to none at its edge, and
     // across the region's depth slab. The mouth's follow its curve instead (MouthCurve): shared between
     // neighbouring bones by where a vertex lies along it, fading with distance from it. The chin's fades across its width as the others do, but up and down it
-    // ramps in from nothing at the region's top edge (the lips) to full at its middle and stays full
+    // ramps in from nothing at the region's top edge (the lips) -- or below the drawn mouth fully open,
+    // when that reaches lower -- to full halfway to the bottom and stays full
     // to the bottom, so the chin moves and the skin above it stretches; where it overlaps the mouth's
     // region the two share the vertex. Re-running is safe: every face-bone influence is stripped (the vertex's
     // other weights renormalised, which restores them exactly) before the new ones go in, scaled
@@ -39,6 +40,9 @@ namespace GlbMerger
             public float Core = 0.4f;
             public float Drop;               // chin: x its half-height at a full open
             public Vector3[]? MouthPoints;   // mouth: the five picked along it, mesh units; null = from the region
+            public float TiltDeg;            // brow: the region turned, degrees; positive raises its outer end
+            public float? ChinStartY;        // chin: mesh y its pull starts below -- under the drawn mouth fully
+                                             // open, so the opening rides the jaw rigidly; null = the region's top
         }
 
         private const float CornerAt = 0.9f;   // a brow bone's distance from the centre, x the half-width
@@ -71,9 +75,10 @@ namespace GlbMerger
             foreach (var skin in model.LogicalSkins)
             {
                 var faceJoints = Rebind(skin, nodes, specs);
+                int headJoint = HeadJoint(skin, head);
                 foreach (var meshNode in model.LogicalNodes.Where(n => n.Skin == skin && n.Mesh != null))
                     foreach (var prim in meshNode.Mesh.Primitives)
-                        verts += Reweight(prim, faceJoints, specs);
+                        verts += Reweight(prim, faceJoints, headJoint, specs);
                 skins++;
             }
             return $"{specs.Count} face bone(s); {verts} vertices weighted to them across {skins} skin(s).";
@@ -93,7 +98,6 @@ namespace GlbMerger
                 var c = f.Region.Centre;
                 var r = f.Region.RadiiPct * (modelHeight / 100f);
                 float front = f.Region.FrontPct * (modelHeight / 100f);
-                Func<Vector3, float> falloff = v => Falloff(v - c, r, front, f.Core);
 
                 if (f.Name == "Chin")
                 {
@@ -101,7 +105,7 @@ namespace GlbMerger
                     {
                         Name = "FaceChin", Position = c,
                         Extras = new JsonObject { ["face"] = "chin", ["unit"] = r.Y, ["drop"] = f.Drop },
-                        Weight = v => ChinFalloff(v - c, r, front, f.Core),
+                        Weight = v => ChinFalloff(v - c, r, front, f.Core, ChinTop(c, r, f.ChinStartY)),
                     });
                 }
                 else if (f.Name == "Mouth")
@@ -110,17 +114,21 @@ namespace GlbMerger
                 }
                 else
                 {
-                    // The inner end faces the other brow (or the model's centre line).
+                    // The inner end faces the other brow (or the model's centre line). A tilted region turns
+                    // about its centre, its outer end up for a positive tilt: the bone sits at that end, and
+                    // the weights are measured along the turned axes.
                     float inner = c.X >= midline ? -1f : 1f;
+                    float turn = -inner * f.TiltDeg * MathF.PI / 180f;
+                    var across = new Vector3(MathF.Cos(turn), MathF.Sin(turn), 0f);
                     specs.Add(new BoneSpec
                     {
                         Name = "Face" + f.Name,
-                        Position = c - new Vector3(inner * CornerAt * r.X, 0f, 0f),
+                        Position = c - inner * CornerAt * r.X * across,
                         Extras = new JsonObject
                         {
                             ["face"] = "brow", ["unit"] = r.Y, ["reach"] = 2f * CornerAt * r.X, ["inner"] = inner,
                         },
-                        Weight = falloff,
+                        Weight = v => Falloff(Unturn(v - c, turn), r, front, f.Core),
                     });
                 }
             }
@@ -148,6 +156,13 @@ namespace GlbMerger
             }
         }
 
+        // `d` in a region turned `turn` radians about z: back into its own axes.
+        private static Vector3 Unturn(Vector3 d, float turn)
+        {
+            float cs = MathF.Cos(turn), sn = MathF.Sin(turn);
+            return new Vector3(d.X * cs + d.Y * sn, -d.X * sn + d.Y * cs, d.Z);
+        }
+
         // Full inside `core` of the region's ellipse, none past its edge; likewise through the slab.
         private static float Falloff(Vector3 d, Vector3 r, float front, float core)
         {
@@ -158,11 +173,18 @@ namespace GlbMerger
 
         // Across and through the slab as Falloff; down from the top edge, nothing to full at the middle,
         // then full to just past the bottom (the jaw's underside goes with it).
-        private static float ChinFalloff(Vector3 d, Vector3 r, float front, float core)
+        // Where (in the region's -1 top .. +1 bottom) the chin's pull starts: its top edge, or lower when
+        // the drawn mouth reaches below it fully open -- a pull that varied across the drawn mouth would
+        // bend it along the mesh's triangles (a zigzag lower lip) as the jaw drops. At most 0.6 down, so
+        // the chin always has some ramp to full.
+        private static float ChinTop(Vector3 c, Vector3 r, float? startY) =>
+            startY is float y ? Math.Clamp((c.Y - y) / r.Y, -1f, 0.6f) : -1f;
+
+        private static float ChinFalloff(Vector3 d, Vector3 r, float front, float core, float top)
         {
             float across = 1f - SmoothStep(core, 1f, MathF.Abs(d.X / r.X));
             float down = -d.Y / r.Y;   // -1 top edge .. +1 bottom edge
-            float vertical = SmoothStep(-1f, 0f, down) * (1f - SmoothStep(1f, 1.4f, down));
+            float vertical = SmoothStep(top, 0.5f * (top + 1f), down) * (1f - SmoothStep(1f, 1.4f, down));
             float depth = d.Z >= 0f ? d.Z / Math.Max(front, 1e-6f) : -d.Z / r.Z;
             return across * vertical * (1f - SmoothStep(0.6f, 1f, depth));
         }
@@ -226,7 +248,15 @@ namespace GlbMerger
 
         // ---- Weights ---------------------------------------------------------------------------------
 
-        private static int Reweight(MeshPrimitive prim, Dictionary<string, int> faceJoints, List<BoneSpec> specs)
+        // The head's joint in the skin, or -1.
+        private static int HeadJoint(Skin skin, Node head)
+        {
+            for (int i = 0; i < skin.JointsCount; i++)
+                if (skin.GetJoint(i).Joint == head) return i;
+            return -1;
+        }
+
+        private static int Reweight(MeshPrimitive prim, Dictionary<string, int> faceJoints, int headJoint, List<BoneSpec> specs)
         {
             if (!prim.VertexAccessors.TryGetValue("POSITION", out var posAcc) ||
                 !prim.VertexAccessors.TryGetValue("JOINTS_0", out var jAcc) ||
@@ -244,7 +274,7 @@ namespace GlbMerger
             {
                 var face = specs.Select(s => (Joint: faceJoints[s.Name], W: s.Weight(positions[v])))
                                 .Where(x => x.W > 1e-4f).ToList();
-                (newJoints[v], newWeights[v]) = Blend(joints[v], weights[v], faceSet, face);
+                (newJoints[v], newWeights[v]) = Blend(joints[v], weights[v], faceSet, headJoint, face);
                 if (face.Count > 0) touched++;
             }
 
@@ -254,8 +284,12 @@ namespace GlbMerger
         }
 
         // The vertex's own influences minus any face bone's (renormalised), scaled to leave room for
-        // `face`, the face ones added, the four biggest kept, summing to one.
-        private static (Vector4, Vector4) Blend(Vector4 j, Vector4 w, HashSet<int> faceSet, List<(int Joint, float W)> face)
+        // `face`, the face ones added, the four biggest kept, summing to one. A vertex an earlier save
+        // gave wholly to face bones has no influences of its own left: what the face bones don't take
+        // now goes back to the head, rather than the vertex keeping its old face weights (a stale pull
+        // there drags the paint when the bone moves -- the chin's zigzagging a lower lip).
+        private static (Vector4, Vector4) Blend(Vector4 j, Vector4 w, HashSet<int> faceSet, int headJoint,
+                                                List<(int Joint, float W)> face)
         {
             var own = new List<(int Joint, float W)>();
             for (int k = 0; k < 4; k++)
@@ -264,6 +298,7 @@ namespace GlbMerger
                 float weight = Get(w, k);
                 if (weight > 0f && !faceSet.Contains(joint)) own.Add((joint, weight));
             }
+            if (own.Count == 0 && headJoint >= 0) own.Add((headJoint, 1f));
             float ownSum = own.Sum(x => x.W);
             float faceSum = Math.Min(face.Sum(x => x.W), 1f);
             float faceScale = face.Count > 0 ? faceSum / face.Sum(x => x.W) : 0f;

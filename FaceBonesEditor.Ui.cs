@@ -23,7 +23,8 @@ namespace GlbMerger
         private readonly List<RadioButton> _radioFeature = new();
         private NumericUpDown _numX = null!, _numY = null!, _numZ = null!;
         private NumericUpDown _numW = null!, _numH = null!, _numD = null!, _numF = null!, _numCore = null!, _numChinDrop = null!;
-        private CheckBox _chkSameSize = null!, _chkShowRegion = null!, _chkShowWeights = null!;
+        private NumericUpDown _numTilt = null!;
+        private CheckBox _chkSameSize = null!, _chkShowRegion = null!, _chkShowWeights = null!, _chkShowPoints = null!;
         private ComboBox _comboExpression = null!, _comboViseme = null!;
         private TrackBar _sliderStrength = null!;
         private Label _lblStatus = null!, _lblBones = null!;
@@ -128,6 +129,9 @@ namespace GlbMerger
                 "How far behind the region's centre vertices are weighted.");
             _numF = AddNumber(flow, "Front depth %", 0m, 20m, 2, 0.05m,
                 "How far in front of the centre - at most Back depth. Lower it to leave glasses unweighted.");
+            _numTilt = AddNumber(flow, "Brow tilt °", -60m, 60m, 0, 1m,
+                "Brows only: turns the region to lie along a slanted brow. Positive raises its outer end (away from " +
+                "the other brow), negative lowers it. With Same size on, both brows tilt alike.");
             _numCore = AddNumber(flow, "Weight core %", 0m, 95m, 0, 5m,
                 "Vertices inside this much of the region move fully with its bone; past it the weight fades to " +
                 "none at the edge. Higher keeps the whole feature rigid; lower spreads the stretch wider. " +
@@ -153,6 +157,11 @@ namespace GlbMerger
             _chkShowWeights = new CheckBox { Text = "Show face weights (saved)", AutoSize = true, Checked = false, Margin = new Padding(3, 0, 3, 8) };
             _chkShowWeights.CheckedChanged += (s, e) => PushState();
             flow.Controls.Add(_chkShowWeights);
+            _chkShowPoints = new CheckBox { Text = "Show mouth points", AutoSize = true, Checked = true, Margin = new Padding(3, 0, 3, 8) };
+            _chkShowPoints.CheckedChanged += (s, e) => PushState();
+            flow.Controls.Add(_chkShowPoints);
+            _help.Add(_chkShowPoints, "The yellow dots on the mouth points and the line through them. They show while " +
+                                      "picking points whatever this says; hidden, they can't be dragged.");
 
             var exprRow = MakeRow();
             exprRow.Controls.Add(new Label { Text = "Expression", Width = 110, Margin = new Padding(3, 6, 3, 3) });
@@ -204,11 +213,13 @@ namespace GlbMerger
                 _suppressEvents = true;
                 try { RefreshMouthUi(); } finally { _suppressEvents = false; }
             }
+            if (f < Mouth) _browTilt[f] = (float)_numTilt.Value;
             if (f < Mouth && _chkSameSize.Checked && _regions[1 - f].Set)
             {
                 _regions[1 - f].RadiiPct = radii;
                 _regions[1 - f].FrontPct = _regions[f].FrontPct;
                 _core[1 - f] = _core[f];
+                _browTilt[1 - f] = _browTilt[f];
             }
             _dirty = true;
             PushState();
@@ -229,6 +240,8 @@ namespace GlbMerger
                 }
                 SetClamped(_numCore, _core[Selected] * 100f);
                 SetClamped(_numChinDrop, _chinDrop * 100f);
+                SetClamped(_numTilt, Selected < Mouth ? _browTilt[Selected] : 0f);
+                _numTilt.Enabled = Selected < Mouth && region.Set;
                 RefreshMouthUi();
                 RefreshMouthPointUi();
                 _chkSameSize.Enabled = Selected < Mouth;
