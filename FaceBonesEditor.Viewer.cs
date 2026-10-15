@@ -12,17 +12,22 @@ namespace GlbMerger
         private const string ViewerScript = @"
         // ---- Region and weight tint ----
         var VERT_HEAD = [
-            'uniform vec4 faceBoneIdx[2];',   // skeleton indices of the face bones, -1 = none
+            'uniform vec4 faceBoneIdx[4];',   // skeleton indices of the face bones, -1 = none
             'varying vec3 vBindPos;',
+            'uniform float mouthHeadIdx;',    // sculpted lips: the head bone's skeleton index, -1 = none
+            'varying vec3 vMouthDef;',        // the skinned position back through the head (model.vert)
             'varying float vFaceW;', ''
         ].join('\n');
         var VERT_BODY = [
             '',
             'vBindPos = position;',
             'vFaceW = 0.0;',
+            'vMouthDef = position;',
             '#ifdef USE_SKINNING',
+            'if (mouthHeadIdx >= 0.0)',
+            '    vMouthDef = (bindMatrixInverse * inverse(getBoneMatrix(mouthHeadIdx)) * bindMatrix * vec4(transformed, 1.0)).xyz;',
             'for (int k = 0; k < 4; ++k) {',
-            '    for (int f = 0; f < 8; ++f) {',
+            '    for (int f = 0; f < 16; ++f) {',
             '        float fi = faceBoneIdx[f / 4][f - (f / 4) * 4];',
             '        if (fi >= 0.0 && abs(skinIndex[k] - fi) < 0.5) vFaceW += skinWeight[k];',
             '    }',
@@ -58,6 +63,9 @@ struct MouthParams
     float lipOpacity;                   // 0..1: how much the lips cover the paint under them
     float lipArc;                       // the bottom lip's curve: 1 round, below flatter, above deeper in the middle
     float alwaysDrawn;                  // 1: the drawn mouth never hands back to the paint, even at rest
+    float sculpted;                     // 1: lips sculpted in the mesh, parted by the jaw (MouthSculpted)
+    float seamBand;                     // sculpted: the lip line's band, region units either side, the
+                                        // triangles bridging the lips lie in
 };
 
 // 1 where d < 0, antialiased over aa.
@@ -247,6 +255,97 @@ vec3 MouthCreases(vec3 albedo, vec2 f, float aa, MouthParams p, MouthShape g)
     float ink  = MouthIn(dist - 0.5 * p.creaseWidth * (1.0 - s * s), aa) * MouthSwap(p);
     return mix(albedo, p.creaseColor, ink);
 }
+// A mouth whose lips are sculpted in the mesh: the jaw (GLBMerger SculptedJaw) parts the model's
+// own lips, the triangles that bridged them stretching open, and the inside of the mouth is drawn in
+// that gap -- to clean curves, not the lips' own triangle edges. Worked in the mouth frame moved with
+// the head only (d: the skinned position taken back through the head joint). Each lip's edge is the
+// painted lip line moved as its five bones moved it (moves: per point, xy the upper lip's, zw the
+// lower's -- the lower bones ride the chin -- from rest x restX; SculptedLips::Pack), blended as the
+// rig blends them. Toward the corners the jaw fades out (chin: the chin region's centre x, half-width,
+// core, as SculptedJaw), handing the lower lip back to the upper bones, so the gap closes there.
+float MouthJawShare(float x, float hl, vec3 chin)
+{
+    return (1.0 - smoothstep(0.6, 1.0, abs(x) / hl))
+         * (1.0 - smoothstep(chin.z, 1.0, abs(x - chin.x) / max(chin.y, 1e-4)));
+}
+
+float MouthLineAt(float x, MouthParams p)
+{
+    float t = clamp(x / max(p.lip.z, 1e-4), -1.0, 1.0);
+    return mix(p.lip.x, p.lip.y, t * t);
+}
+
+// A lip's move at x (lower: the lower lip's): its points' moves under a smooth hat in the position
+// along them, 0 at the first point .. 4 at the last, found by x through the points as moved.
+vec2 MouthLipMove(float x, float restX[5], vec4 moves[5], bool lower)
+{
+    float xs[5];
+    for (int k = 0; k < 5; ++k) xs[k] = restX[k] + (lower ? moves[k].z : moves[k].x);
+    float s = x <= xs[0] ? 0.0 : 4.0;
+    for (int k = 0; k < 4; ++k)
+        if (x > xs[k] && x <= xs[k + 1]) s = float(k) + (x - xs[k]) / max(xs[k + 1] - xs[k], 1e-5);
+    vec2 o = vec2(0.0);
+    for (int k = 0; k < 5; ++k)
+        o += (1.0 - smoothstep(0.0, 1.0, abs(s - float(k)))) * (lower ? moves[k].zw : moves[k].xy);
+    return o;
+}
+
+// The gap's edges at x: (top, bottom).
+vec2 MouthGapAt(float x, float restX[5], vec4 moves[5], vec3 chin, MouthParams p)
+{
+    vec2 up = MouthLipMove(x, restX, moves, false);
+    vec2 lo = mix(up, MouthLipMove(x, restX, moves, true), MouthJawShare(x, max(p.lip.z, 1e-4), chin));
+    return vec2(MouthLineAt(x - up.x, p) + up.y, MouthLineAt(x - lo.x, p) + lo.y);
+}
+
+// Only within seamBand of the lip line twice over in the bind pose (f). Dark, darkest up under the
+// palate, the upper teeth hanging from the gap's top, the lower ones and a tongue at its bottom.
+vec4 MouthSculpted(vec2 f, vec2 d, float restX[5], vec4 moves[5], vec3 chin, float aa, MouthParams p)
+{
+    float hl  = max(p.lip.z, 1e-4);
+    vec2  e   = MouthGapAt(d.x, restX, moves, chin, p);   // top, bottom
+    float D   = e.x - e.y;
+    float aaD = length(fwidth(d)) * 0.75;
+    float gap = step(1e-3, p.open) * step(1e-4, D)
+              * MouthIn(d.y - e.x, aaD) * MouthIn(e.y - d.y, aaD)
+              * MouthIn(abs(f.y - MouthLineAt(f.x, p)) - 2.0 * max(p.seamBand, 1e-3), aa);
+    if (gap <= 0.0) return vec4(0.0);
+
+    float u = clamp((e.x - d.y) / D, 0.0, 1.0);   // 0 the upper lip .. 1 the lower
+    vec3  c = p.interior * mix(0.55, 1.0, u);
+
+    // Tongue: MouthPaint's, in region units so it keeps its shape however the gap narrows -- a low
+    // mound on a level base at the gap's bottom in the middle, its top dipping at the midline groove
+    // into two rounded lobes, lighter on its crown; or, tip up, a narrower one reaching for the upper
+    // teeth. Inside the lower teeth's arch, which stands in front of it; narrower for a round mouth.
+    float R      = hl * p.teethWidth;
+    vec2  mid    = MouthGapAt(0.0, restX, moves, chin, p);
+    float ih     = max(mid.x - mid.y, 1e-4);   // the gap's height in the middle
+    float tw     = min(hl * (1.0 - 0.55 * p.round) * mix(0.72, 0.45, p.tongueUp), R * 0.85);
+    float tx     = clamp(d.x / tw, -1.0, 1.0);
+    float crown  = mid.y + ih * mix(0.55, 0.95, p.tongueUp) * sqrt(max(1.0 - tx * tx, 0.0));
+    float groove = ih * 0.07 * (1.0 - p.tongueUp) * exp(-pow(d.x / (tw * 0.16), 2.0));
+    float dTop   = d.y - (crown - groove);
+    float tongue = MouthIn(dTop, aaD) * MouthIn(abs(d.x) - tw, aaD);
+    float tShade = mix(0.7, 1.05, sqrt(max(1.0 - tx * tx, 0.0)))           // rounding off at the sides
+                 * mix(1.0, 0.82, exp(-pow(d.x / (tw * 0.05), 2.0)))       // the groove's line
+                 * mix(1.0, 0.85, smoothstep(0.0, ih * 0.3, -dTop));       // lit on the crown
+    c = mix(c, p.tongue * tShade, tongue);
+
+    // Teeth: MouthPaint's, sized in region units from the lips' edges -- the same however far the
+    // mouth opens -- the upper row down from the top one, the lower up from the bottom; bite as there.
+    float over   = max(p.bite, 0.0), under = max(-p.bite, 0.0);
+    float tw0    = 0.3 * p.toothWidth;
+    vec2  lower  = MouthTeethRow(d.x, d.y - e.y, p.lowerTooth * p.teethLower * (1.0 + 0.4 * under),
+                                 R * mix(0.85, 1.0, under), tw0 * 0.8, p.toothGap, aaD);
+    vec2  upper  = MouthTeethRow(d.x, e.x - d.y, p.upperTooth * p.teethUpper * (1.0 + 0.4 * over),
+                                 R, tw0, p.toothGap, aaD);
+    vec3  lowerC = p.teeth * lower.x;
+    vec3  upperC = p.teeth * upper.x * mix(0.8, 1.0, smoothstep(0.0, p.upperTooth * 0.3, e.x - d.y));
+    if (p.bite >= 0.0) { c = mix(c, lowerC, lower.y); c = mix(c, upperC, upper.y); }
+    else               { c = mix(c, upperC, upper.y); c = mix(c, lowerC, lower.y); }
+    return vec4(c, gap);
+}
 // ---- end MouthPaint ----
 `;
         var FRAG_HEAD = [
@@ -269,7 +368,12 @@ vec3 MouthCreases(vec3 albedo, vec2 f, float aa, MouthParams p, MouthShape g)
             'uniform vec4 mouthTooth;',   // tooth width, tooth gap, crease length, crease width
             'uniform vec4 mouthCrease;',  // crease curve, angle (radians), offset, -
             'uniform vec3 mouthCreaseColor;',
-            'uniform vec4 mouthLipLook;', // lip opacity, lip arc, -, -
+            'uniform vec4 mouthLipLook;', // lip opacity, lip arc, always drawn, sculpted
+            'uniform float mouthSeamBand;',
+            'uniform vec3 mouthChin;',    // sculpted: the chin region (centre x, half-width, core), mouth units
+            'uniform float mouthRestX[5];',   // sculpted: the lip points' rest x (SculptedLips::Pack)
+            'uniform vec4 mouthLipMove[5];',  // ... and their moves: upper xy, lower xy
+            'varying vec3 vMouthDef;',
             MOUTH_CORE,
             // MouthOverlay.glsl's ApplyMouth, with the lip line drawn on top for lining up.
             'vec3 ApplyMouth(vec3 albedo) {',
@@ -292,11 +396,19 @@ vec3 MouthCreases(vec3 albedo, vec2 f, float aa, MouthParams p, MouthShape g)
             '        p.creaseCurve = mouthCrease.x; p.creaseAngle = mouthCrease.y; p.creaseOffset = mouthCrease.z;',
             '        p.creaseColor = mouthCreaseColor; p.baseOpen = mouthCrease.w;',
             '        p.lipOpacity = mouthLipLook.x; p.lipArc = mouthLipLook.y; p.alwaysDrawn = mouthLipLook.z;',
+            '        p.sculpted = mouthLipLook.w; p.seamBand = mouthSeamBand;',
+            '        if (p.sculpted > 0.5) {',
+            '            vec3 d = (featMat[2] * vec4(vMouthDef, 1.0)).xyz;',
+            '            vec4 sc = MouthSculpted(f.xy, d.xy, mouthRestX, mouthLipMove, mouthChin, aa, p);',
+            '            albedo = mix(albedo, sc.rgb, sc.a * slab);',
+            '            gMouthSurface = sc.a * slab;',
+            '        } else {',
             '        MouthShape g = MouthShapeAt(f.xy, p);',
             '        albedo = mix(albedo, MouthCreases(MouthMask(albedo, f.xy, aa, p, g), f.xy, aa, p, g), slab);',
             '        vec4 m = MouthPaint(f.xy, aa, p, g);',
             '        albedo = mix(albedo, m.rgb, m.a * slab);',
             '        gMouthSurface = max(MouthMaskZone(f.xy, aa, p, g), m.a) * slab;',
+            '        }',
             '    }',
             '    float hw = max(mouthLip.z, 1e-4);',
             '    float t = clamp(f.x / hw, -1.0, 1.0);',
@@ -325,7 +437,7 @@ vec3 MouthCreases(vec3 albedo, vec2 f, float aa, MouthParams p, MouthShape g)
 
         function vec4s(n) { var a = []; for (var i = 0; i < n; i++) a.push(new THREE.Vector4()); return a; }
         var U = {
-            faceBoneIdx: { value: [new THREE.Vector4(-1, -1, -1, -1), new THREE.Vector4(-1, -1, -1, -1)] },
+            faceBoneIdx: { value: [0, 1, 2, 3].map(function () { return new THREE.Vector4(-1, -1, -1, -1); }) },
             featMat: { value: [new THREE.Matrix4(), new THREE.Matrix4(), new THREE.Matrix4(), new THREE.Matrix4()] },
             featRow: { value: vec4s(4) },
             featShow: { value: new THREE.Vector4() },
@@ -342,7 +454,12 @@ vec3 MouthCreases(vec3 albedo, vec2 f, float aa, MouthParams p, MouthShape g)
             mouthTooth: { value: new THREE.Vector4() },
             mouthCrease: { value: new THREE.Vector4() },
             mouthCreaseColor: { value: new THREE.Vector3() },
-            mouthLipLook: { value: new THREE.Vector4(1, 1, 0, 0) }
+            mouthLipLook: { value: new THREE.Vector4(1, 1, 0, 0) },
+            mouthSeamBand: { value: 0.2 },
+            mouthHeadIdx: { value: -1 },
+            mouthRestX: { value: [0, 0, 0, 0, 0] },
+            mouthLipMove: { value: [0, 1, 2, 3, 4].map(function () { return new THREE.Vector4(); }) },
+            mouthChin: { value: new THREE.Vector3(0, 1000, 0.4) }
         };
 
         function patchMaterial(mat) {
@@ -402,16 +519,65 @@ vec3 MouthCreases(vec3 albedo, vec2 f, float aa, MouthParams p, MouthShape g)
                 turn = d.reach > 0 ? d.inner * Math.atan2(innerDrop, d.reach) : 0;
                 move[1] = 0.35 * w(face, 'raise') * s * d.unit;
                 move[0] = d.inner * 0.05 * w(face, 'furrow') * s * d.unit;
-            } else if (d.face === 'mouth') {
+            } else if (d.face === 'mouth' || d.face === 'mouthLower') {
                 // Shaped by where along the mouth the bone sits: a smile lifts the corners, the middle dips.
                 var a = d.across, a2 = a * a;
                 move[1] = ((0.45 * w(face, 'smile') - 0.40 * w(face, 'frown')) * a2 - 0.10 * w(face, 'smile') * (1 - a2)) * s * d.unit;
                 move[0] = a * (0.12 * w(face, 'grit') - 0.30 * w(face, 'pucker')) * s * d.halfWidth;
+                move[1] += roundLift(d, w(face, 'round'), openFromRest);
             } else if (d.face === 'chin') {
                 // The panel's Chin drop, not the saved one, so it can be tuned before saving.
                 move[1] = -(state ? state.chinDrop : d.drop) * openFromRest * d.unit;
             }
             return { move: move, turn: turn };
+        }
+
+        // Sculpted lips, as FaceBones::RoundLift: rounding (oh, oo) closes the lower lip's corners back up
+        // the chin's drop and lifts the upper lip's middle. Only on a rig with lower-lip bones.
+        function roundLift(d, round, openFromRest) {
+            if (!lipRig || lipRig.lower.length !== 5 || openFromRest <= 0) return 0;
+            var r = Math.min(Math.max(round, 0), 1), hw = 1 - 0.55 * r;
+            var keep = Math.sqrt(Math.max(1 - (d.across / hw) * (d.across / hw), 0));
+            var drop = (state ? state.chinDrop : lipRig.chinD.drop) * lipRig.chinD.unit * openFromRest;
+            return d.face === 'mouthLower' ? drop * r * (1 - keep) : 0.35 * r * drop * keep;
+        }
+
+        // The bones the sculpted-lips curves are read off (SculptedLips): the head, the chin, and the
+        // five points on each lip, corner to corner.
+        var lipRig = null;
+        function noteLipBone(m, b, i) {
+            var f = b.userData.face;
+            if (f !== 'chin' && f !== 'mouth' && f !== 'mouthLower') return;
+            if (!lipRig) lipRig = { mesh: m, head: -1, chin: -1, chinD: null, upper: [], lower: [] };
+            if (lipRig.mesh !== m) return;
+            if (f === 'chin') { lipRig.chin = i; lipRig.chinD = b.userData; lipRig.head = m.skeleton.bones.indexOf(b.parent); }
+            else (f === 'mouth' ? lipRig.upper : lipRig.lower).push({ i: i, across: b.userData.across });
+        }
+        function finishLipRig() {
+            if (!lipRig) return;
+            [lipRig.upper, lipRig.lower].forEach(function (l) { l.sort(function (a, b) { return a.across - b.across; }); });
+            if (lipRig.chin < 0 || lipRig.head < 0 || lipRig.upper.length !== 5) { lipRig = null; return; }
+            U.mouthHeadIdx.value = lipRig.head;
+        }
+        // Each lip point's move this frame relative to the head, in the mouth frame, off the bones'
+        // matrices as the vertex shader skins them -- as SculptedLips::Pack.
+        function updateLipMoves() {
+            if (!lipRig) return;
+            scene.updateMatrixWorld(true);
+            var m = lipRig.mesh, sk = m.skeleton, F = U.featMat.value[2], L = new THREE.Matrix3().setFromMatrix4(F);
+            function boneMat(i) { return new THREE.Matrix4().multiplyMatrices(sk.bones[i].matrixWorld, sk.boneInverses[i]); }
+            var toHead = new THREE.Matrix4().multiplyMatrices(m.bindMatrixInverse, boneMat(lipRig.head).invert());
+            for (var k = 0; k < 5; k++) {
+                var ui = lipRig.upper[k].i, li = lipRig.lower.length === 5 ? lipRig.lower[k].i : lipRig.chin;
+                var rest = new THREE.Vector3().setFromMatrixPosition(sk.boneInverses[ui].clone().invert()).applyMatrix4(m.bindMatrixInverse);
+                var moved = function (i) {
+                    var M = toHead.clone().multiply(boneMat(i)).multiply(m.bindMatrix);
+                    return rest.clone().applyMatrix4(M).sub(rest).applyMatrix3(L);
+                };
+                var a = moved(ui), b = moved(li);
+                U.mouthLipMove.value[k].set(a.x, a.y, b.x, b.y);
+                U.mouthRestX.value[k] = rest.clone().applyMatrix4(F).x;
+            }
         }
 
         var faceBones = [];   // { bone, d (extras), restPos, restQuat, toLocal (mesh -> parent-local), axis }
@@ -422,7 +588,8 @@ vec3 MouthCreases(vec3 albedo, vec2 f, float aa, MouthParams p, MouthShape g)
                 if (!m.skeleton) return;
                 m.skeleton.bones.forEach(function (b, i) {
                     if (!b.userData || !b.userData.face) return;
-                    if (idx.length < 8 && idx.indexOf(i) < 0) idx.push(i);
+                    if (idx.length < 16 && idx.indexOf(i) < 0) idx.push(i);
+                    noteLipBone(m, b, i);
                     if (faceBones.some(function (x) { return x.bone === b; })) return;
                     // Mesh units -> the parent's frame at rest, as FaceBones::Build.
                     var meshToWorld = new THREE.Matrix4().multiplyMatrices(b.matrixWorld, m.skeleton.boneInverses[i]);
@@ -432,7 +599,8 @@ vec3 MouthCreases(vec3 albedo, vec2 f, float aa, MouthParams p, MouthShape g)
                                      toLocal: toLocal, axis: new THREE.Vector3(0, 0, 1).applyMatrix3(toLocal).normalize() });
                 });
             });
-            for (var k = 0; k < 8; k++) U.faceBoneIdx.value[k >> 2].setComponent(k & 3, k < idx.length ? idx[k] : -1);
+            for (var k = 0; k < 16; k++) U.faceBoneIdx.value[k >> 2].setComponent(k & 3, k < idx.length ? idx[k] : -1);
+            finishLipRig();
             initMouthPointDrag();
             post({ action: 'loaded', bones: faceBones.length });
         }
@@ -519,6 +687,7 @@ vec3 MouthCreases(vec3 albedo, vec2 f, float aa, MouthParams p, MouthShape g)
                 fb.bone.position.copy(fb.restPos).add(new THREE.Vector3(m.move[0], m.move[1], m.move[2]).applyMatrix3(fb.toLocal));
                 fb.bone.quaternion.copy(new THREE.Quaternion().setFromAxisAngle(fb.axis, m.turn).multiply(fb.restQuat));
             });
+            updateLipMoves();
         }
 
         // ---- State from C# (FaceBonesEditor.PushState) ----
@@ -564,7 +733,8 @@ vec3 MouthCreases(vec3 albedo, vec2 f, float aa, MouthParams p, MouthShape g)
         function applyMouth(s) {
             var M = s.mouth, face = faceFor(s), forced = testing(M);
             var open = mouthOpen(s);
-            U.mouthA.value.set(M.on && (M.alwaysDrawn > 0.5 || Math.abs(open - (M.baseOpen || 0)) > 1e-3) ? 1 : 0, open, M.edge,
+            var drawn = M.sculpted > 0.5 ? open > 1e-3 : (M.alwaysDrawn > 0.5 || Math.abs(open - (M.baseOpen || 0)) > 1e-3);
+            U.mouthA.value.set(M.on && drawn ? 1 : 0, open, M.edge,
                                s.showRegion && M.on ? 1 : 0);
             U.mouthLip.value.set(M.lipY, M.lipCornerY, M.lipHalfWidth, M.openDepth);
             // The teeth showing at rest unless a held mouth shape (talking) sets them, as MouthStencil::Pack.
@@ -583,7 +753,14 @@ vec3 MouthCreases(vec3 albedo, vec2 f, float aa, MouthParams p, MouthShape g)
             U.mouthCrease.value.set(M.creaseCurve, M.creaseAngle * Math.PI / 180, M.creaseOffset, M.baseOpen || 0);
             var cc = linear(M.crease, 0);
             U.mouthCreaseColor.value.set(cc.x, cc.y, cc.z);
-            U.mouthLipLook.value.set(M.lipOpacity != null ? M.lipOpacity : 1, M.lipArc != null ? M.lipArc : 1, M.alwaysDrawn || 0, 0);
+            U.mouthLipLook.value.set(M.lipOpacity != null ? M.lipOpacity : 1, M.lipArc != null ? M.lipArc : 1, M.alwaysDrawn || 0, M.sculpted || 0);
+            U.mouthSeamBand.value = M.seamBand || 0.2;
+            // The chin region across the mouth, as SculptedLips::Build.
+            var C = s.regions[3], Mr = s.regions[2];
+            if (C.on && Mr.on && Mr.r[1] > 0) {
+                var cx = new THREE.Vector3(C.c[0], C.c[1], C.c[2]).applyMatrix4(U.featMat.value[2]).x;
+                U.mouthChin.value.set(cx, Math.max(C.r[0] / Mr.r[1], 1e-4), Math.min(Math.max(C.core != null ? C.core : 0.4, 0), 0.99));
+            } else U.mouthChin.value.set(0, 1000, 0.4);
         }
 
         // Colour eyedropper (FaceBonesEditor.StartMouthEyedropper): the next click samples the texture

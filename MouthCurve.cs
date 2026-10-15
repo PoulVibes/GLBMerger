@@ -33,6 +33,19 @@ namespace GlbMerger
         // Where point k sits across the mouth: -1 at the -x corner, +1 at the +x one.
         public float Across(int k) => (_p[k].X - MidX) / HalfSpan;
 
+        // Where x falls across the mouth: -1 .. 1 corner to corner, beyond past them.
+        public float AcrossAt(float x) => (x - MidX) / HalfSpan;
+
+        // The lip line straight up or down from x: the polyline's point there, held level past the corners.
+        public Vector3 PointAt(float x)
+        {
+            if (x <= _p[0].X) return _p[0];
+            for (int i = 0; i < PointCount - 1; i++)
+                if (x <= _p[i + 1].X)
+                    return Vector3.Lerp(_p[i], _p[i + 1], (x - _p[i].X) / Math.Max(_p[i + 1].X - _p[i].X, 1e-6f));
+            return _p[PointCount - 1];
+        }
+
         // The five a region alone implies, for a mouth no one has picked points on: corners at 90% of its
         // half-width, the others halfway in, all level with its centre.
         public static Vector3[] FromRegion(Vector3 centre, Vector3 radii)

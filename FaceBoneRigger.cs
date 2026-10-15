@@ -18,6 +18,8 @@ namespace GlbMerger
     //                           in order of x (MouthCurve); a mouth with no points gets the five its
     //                           region implies
     //   FaceChin               - at the chin region's centre; drops as the mouth opens
+    //   FaceMouthLow1..5       - sculpted lips only: on the mouth's points again, under the chin,
+    //                           holding the lower lip
     // Each carries its motion's scale in its extras ("face", "unit" = the region's half-height,
     // and per kind "reach"/"inner" or "across"/"halfWidth"). A bone's inverse bind is just the
     // inverse of its mesh-space position, so it skins the mesh to itself at rest.
@@ -41,6 +43,7 @@ namespace GlbMerger
             public float Drop;               // chin: x its half-height at a full open
             public Vector3[]? MouthPoints;   // mouth: the five picked along it, mesh units; null = from the region
             public float TiltDeg;            // brow: the region turned, degrees; positive raises its outer end
+            public bool SculptedLips;        // mouth: lips sculpted in the mesh -- the jaw parts them (SculptedJaw)
             public float? ChinStartY;        // chin: mesh y its pull starts below -- under the drawn mouth fully
                                              // open, so the opening rides the jaw rigidly; null = the region's top
         }
@@ -51,17 +54,20 @@ namespace GlbMerger
         {
             public required string Name;
             public Vector3 Position;            // mesh units
+            public string? Parent;              // another bone's name; null = the head
             public required JsonObject Extras;
             public Func<Vector3, float> Weight = _ => 0f;
         }
 
         private static readonly string[] MouthBoneNames = { "FaceMouth1", "FaceMouth2", "FaceMouth3", "FaceMouth4", "FaceMouth5" };
+        private static readonly string[] MouthLowBoneNames = { "FaceMouthLow1", "FaceMouthLow2", "FaceMouthLow3", "FaceMouthLow4", "FaceMouthLow5" };
 
         // Every face bone this rigger has ever made: the current ones, and the three-bone mouth
         // (corners and middle) it made before the mouth was picked as points, which a re-save retires.
         public static readonly string[] AllBoneNames =
         {
             "FaceBrowL", "FaceBrowR", "FaceMouth1", "FaceMouth2", "FaceMouth3", "FaceMouth4", "FaceMouth5", "FaceChin",
+            "FaceMouthLow1", "FaceMouthLow2", "FaceMouthLow3", "FaceMouthLow4", "FaceMouthLow5",   // after the chin, their parent
             "FaceMouthL", "FaceMouthR", "FaceMouthMid",
         };
 
@@ -92,6 +98,8 @@ namespace GlbMerger
             var browL = features.FirstOrDefault(f => f.Name == "BrowL" && f.Region.Set);
             var browR = features.FirstOrDefault(f => f.Name == "BrowR" && f.Region.Set);
             float midline = browL != null && browR != null ? 0.5f * (browL.Region.Centre.X + browR.Region.Centre.X) : 0f;
+            var jaw = SculptedJawFor(features, modelHeight);
+            var lip = LipWeightFor(features, modelHeight);
 
             foreach (var f in features.Where(f => f.Region.Set))
             {
@@ -105,12 +113,14 @@ namespace GlbMerger
                     {
                         Name = "FaceChin", Position = c,
                         Extras = new JsonObject { ["face"] = "chin", ["unit"] = r.Y, ["drop"] = f.Drop },
-                        Weight = v => ChinFalloff(v - c, r, front, f.Core, ChinTop(c, r, f.ChinStartY)),
+                        // Sculpted: the jaw, less the lower lip its own bones hold.
+                        Weight = jaw != null && lip != null ? v => jaw.Weight(v) * (1f - LipShare(lip, v))
+                               : v => ChinFalloff(v - c, r, front, f.Core, ChinTop(c, r, f.ChinStartY)),
                     });
                 }
                 else if (f.Name == "Mouth")
                 {
-                    specs.AddRange(MouthBones(f, c, r, front));
+                    specs.AddRange(MouthBones(f, c, r, lip!, jaw));
                 }
                 else
                 {
@@ -135,23 +145,67 @@ namespace GlbMerger
             return specs;
         }
 
+        // Sculpted lips with a chin to part them: the jaw that takes the lower lip, else null.
+        private static SculptedJaw? SculptedJawFor(IReadOnlyList<Feature> features, float modelHeight)
+        {
+            var mouth = features.FirstOrDefault(f => f.Name == "Mouth" && f.Region.Set && f.SculptedLips);
+            var chin = features.FirstOrDefault(f => f.Name == "Chin" && f.Region.Set);
+            if (mouth == null || chin == null) return null;
+            var mr = mouth.Region.RadiiPct * (modelHeight / 100f);
+            var curve = new MouthCurve(mouth.MouthPoints ?? MouthCurve.FromRegion(mouth.Region.Centre, mr));
+            return new SculptedJaw(curve, chin.Region.Centre, chin.Region.RadiiPct * (modelHeight / 100f),
+                                   chin.Region.FrontPct * (modelHeight / 100f), chin.Core);
+        }
+
+        // The mouth bones' weights: bone k's share of vertex v along the curve, fading off it. Null with
+        // no mouth.
+        private static Func<Vector3, int, float>? LipWeightFor(IReadOnlyList<Feature> features, float modelHeight)
+        {
+            var f = features.FirstOrDefault(x => x.Name == "Mouth" && x.Region.Set);
+            if (f == null) return null;
+            var c = f.Region.Centre;
+            var r = f.Region.RadiiPct * (modelHeight / 100f);
+            float front = f.Region.FrontPct * (modelHeight / 100f);
+            var curve = new MouthCurve(f.MouthPoints ?? MouthCurve.FromRegion(c, r));
+            return (v, k) => curve.Weight(v, k, r.Y, r.Z, front, f.Core);
+        }
+
+        private static float LipShare(Func<Vector3, int, float> lip, Vector3 v)
+        {
+            float sum = 0f;
+            for (int k = 0; k < MouthCurve.PointCount; k++) sum += lip(v, k);
+            return Math.Min(sum, 1f);
+        }
+
         // One bone on each of the mouth's five points; "across" (-1..1 corner to corner) is where along
-        // the mouth it sits, which is what the game's motions are shaped by.
-        private static IEnumerable<BoneSpec> MouthBones(Feature f, Vector3 c, Vector3 r, float front)
+        // the mouth it sits, which is what the game's motions are shaped by. With sculpted lips the jaw
+        // splits the mouth: the upper lip stays with these, and the lower goes to five more on the same
+        // points under the chin (FaceMouthLow1..5), so it drops with the jaw and still moves as the mouth
+        // does -- pucker, smile, the corners closing for an "oo".
+        private static IEnumerable<BoneSpec> MouthBones(Feature f, Vector3 c, Vector3 r, Func<Vector3, int, float> lip, SculptedJaw? jaw)
         {
             var curve = new MouthCurve(f.MouthPoints ?? MouthCurve.FromRegion(c, r));
+            JsonObject Extras(string kind, int k) => new JsonObject
+            {
+                ["face"] = kind, ["unit"] = r.Y, ["across"] = Math.Round(curve.Across(k), 4), ["halfWidth"] = curve.HalfSpan,
+            };
             for (int k = 0; k < MouthCurve.PointCount; k++)
             {
                 int bone = k;
                 yield return new BoneSpec
                 {
-                    Name = MouthBoneNames[k], Position = curve[k],
-                    Extras = new JsonObject
-                    {
-                        ["face"] = "mouth", ["unit"] = r.Y, ["across"] = Math.Round(curve.Across(k), 4),
-                        ["halfWidth"] = curve.HalfSpan,
-                    },
-                    Weight = v => curve.Weight(v, bone, r.Y, r.Z, front, f.Core),
+                    Name = MouthBoneNames[k], Position = curve[k], Extras = Extras("mouth", k),
+                    Weight = jaw == null ? v => lip(v, bone) : v => lip(v, bone) * (1f - jaw.Weight(v)),
+                };
+            }
+            if (jaw == null) yield break;
+            for (int k = 0; k < MouthCurve.PointCount; k++)
+            {
+                int bone = k;
+                yield return new BoneSpec
+                {
+                    Name = MouthLowBoneNames[k], Position = curve[k], Parent = "FaceChin", Extras = Extras("mouthLower", k),
+                    Weight = v => lip(v, bone) * jaw.Weight(v),
                 };
             }
         }
@@ -198,7 +252,8 @@ namespace GlbMerger
         // ---- Nodes and skin ------------------------------------------------------------------------
 
         // Each wanted bone as a child of the head, at its mesh-space spot (through the head's inverse
-        // bind, as the anchors are); every face bone NOT wanted any more loses its "face" extras so the
+        // bind, as the anchors are) -- or of another face bone (the lower lip's, of the chin), offset from
+        // it in mesh units, its frame; every face bone NOT wanted any more loses its "face" extras so the
         // game leaves it alone.
         private static Dictionary<string, Node> PlaceBones(ModelRoot model, Node head, Matrix4x4 meshToHead, List<BoneSpec> specs)
         {
@@ -209,9 +264,15 @@ namespace GlbMerger
                 var spec = specs.FirstOrDefault(s => s.Name == name);
                 if (spec == null) { if (existing != null) existing.Extras = null; continue; }
 
-                var node = existing ?? head.CreateNode(name);
-                Matrix4x4.Decompose(Matrix4x4.CreateTranslation(spec.Position) * meshToHead, out var s, out var q, out var t);
-                node.LocalTransform = new AffineTransform(s, q, t);
+                var parentSpec = spec.Parent != null ? specs.First(x => x.Name == spec.Parent) : null;
+                var node = existing ?? (parentSpec != null ? nodes[parentSpec.Name] : head).CreateNode(name);
+                if (parentSpec != null)
+                    node.LocalTransform = new AffineTransform(Vector3.One, Quaternion.Identity, spec.Position - parentSpec.Position);
+                else
+                {
+                    Matrix4x4.Decompose(Matrix4x4.CreateTranslation(spec.Position) * meshToHead, out var s, out var q, out var t);
+                    node.LocalTransform = new AffineTransform(s, q, t);
+                }
                 node.Extras = spec.Extras;
                 nodes[name] = node;
             }

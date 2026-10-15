@@ -125,6 +125,7 @@ namespace GlbMerger
                     MouthPoints = f == Mouth ? MouthPointsForRig() : null,
                     TiltDeg = f < Mouth ? _browTilt[f] : 0f,
                     ChinStartY = f == Chin ? MouthOpenBottomY() : null,
+                    SculptedLips = f == Mouth && _mouth.Enabled && _mouth.SculptedLips,
                 })
                 .ToList();
             string result = FaceBoneRigger.Apply(_model, _head, _meshToHead, _modelHeight, features);
@@ -174,7 +175,7 @@ namespace GlbMerger
             var r = g.RadiiPct * (_modelHeight / 100f);
             return $"{{\"on\":{(g.Set ? "true" : "false")},\"c\":[{Inv(g.Centre.X)},{Inv(g.Centre.Y)},{Inv(g.Centre.Z)}]," +
                    $"\"r\":[{Inv(r.X)},{Inv(r.Y)},{Inv(r.Z)}],\"f\":{Inv(g.FrontPct * _modelHeight / 100f)}," +
-                   $"\"t\":{Inv(RegionTurn(f))}}}";
+                   $"\"t\":{Inv(RegionTurn(f))},\"core\":{Inv(_core[f])}}}";
         }
 
         // A brow region's tilt as a turn about z, radians: positive tilt raises the end away from the
