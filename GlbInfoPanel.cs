@@ -774,10 +774,11 @@ namespace GlbMerger
         // earlier drop.
         private void RebuildAnimationGrid()
         {
-            var previousSettings = new Dictionary<string, (bool Include, string MergedAs, bool InPlace, bool GroundFix, bool FixBoneLength, bool FixHipRotation, decimal YRotation, decimal YOffset, decimal StartFrame, decimal EndFrame, bool First, bool Loop, decimal LoopFrame)>();
+            var previousSettings = new Dictionary<string, (bool Include, string MergedAs, bool InPlace, bool GroundFix, bool FixBoneLength, bool FixHipRotation, decimal YRotation, decimal YOffset, decimal StartFrame, decimal EndFrame, bool EndAtLastFrame, bool First, bool Loop, decimal LoopFrame)>();
             foreach (DataGridViewRow row in grdAnimations.Rows)
             {
                 var name = (string)row.Cells["Name"].Value!;
+                decimal endFrame = row.Cells["EndFrame"].Value is decimal ef ? ef : 0m;
                 previousSettings[name] = (
                     row.Cells["Include"].Value is bool inc && inc,
                     (string?)row.Cells["MergedAs"].Value ?? name,
@@ -788,7 +789,10 @@ namespace GlbMerger
                     row.Cells["YRotation"].Value is decimal yr ? yr : 0m,
                     row.Cells["YOffset"].Value is decimal yo ? yo : 0m,
                     row.Cells["StartFrame"].Value is decimal sf ? sf : 0m,
-                    row.Cells["EndFrame"].Value is decimal ef ? ef : 0m,
+                    endFrame,
+                    // Whether End sat on the clip's own last frame, i.e. was never trimmed - see
+                    // AddRow below.
+                    row.Cells["EndFrame"] is NumericUpDownCell endCell && endCell.MaximumOverride == endFrame,
                     row.Cells["First"].Value is bool f && f,
                     row.Cells["Loop"].Value is bool lp && lp,
                     row.Cells["LoopFrame"].Value is decimal lf ? lf : 0m);
@@ -807,7 +811,12 @@ namespace GlbMerger
                 if (previousSettings.TryGetValue(name, out var s))
                 {
                     decimal start = Math.Clamp(s.StartFrame, 0m, lastFrame);
-                    decimal end = Math.Clamp(s.EndFrame, start, lastFrame);
+                    // An untouched End follows the clip's CURRENT last frame. Re-dropping a source
+                    // whose same-named clip has a different keyframe count (another model's Idle, a
+                    // re-export with fewer keys) used to keep the old count's last frame here, which
+                    // GetFrameTrimByAnimation then reported as a real trim - silently cropping e.g. a
+                    // 10.6s Idle to 1.9s mid-motion, so it snapped back to frame 0 on every loop.
+                    decimal end = s.EndAtLastFrame ? lastFrame : Math.Clamp(s.EndFrame, start, lastFrame);
                     decimal loopFrame = Math.Clamp(s.LoopFrame, 0m, lastFrame);
                     rowIndex = grdAnimations.Rows.Add(s.Include, name, s.MergedAs, s.InPlace, s.Loop, s.GroundFix, s.FixBoneLength, s.FixHipRotation, s.YRotation, s.YOffset, start, end, loopFrame, s.First);
                 }
