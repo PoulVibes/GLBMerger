@@ -204,8 +204,9 @@ namespace GlbMerger
         // Multi-source BFS from every covered texel, flooding outward up to maxRadius texels and
         // stamping each newly-reached texel with the color of whichever covered texel it was
         // reached from, carrying color outward one texel-ring at a time. Returns how many texels
-        // were filled.
-        private static int DilateColor(int width, int height, byte[] pixels, bool[] covered, int maxRadius)
+        // were filled. When given, `filled` is set for every texel the flood reached (covered ones
+        // included).
+        internal static int DilateColor(int width, int height, byte[] pixels, bool[] covered, int maxRadius, bool[]? filled = null)
         {
             if (maxRadius <= 0) return 0;
 
@@ -235,6 +236,7 @@ namespace GlbMerger
                     if (dist[nIdx] != -1) continue;
 
                     dist[nIdx] = d + 1;
+                    if (filled != null) filled[nIdx] = true;
                     pixels[nIdx * 4 + 0] = pixels[idx * 4 + 0];
                     pixels[nIdx * 4 + 1] = pixels[idx * 4 + 1];
                     pixels[nIdx * 4 + 2] = pixels[idx * 4 + 2];

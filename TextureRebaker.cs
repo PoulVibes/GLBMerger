@@ -475,7 +475,7 @@ namespace GlbMerger
 
         // Bilinear, wrapping (glTF's default sampler repeats), texel centres at half-integers -
         // so a UV that lands exactly on a texel centre reads that texel back unchanged.
-        private static void SampleBilinear(byte[] src, int width, int height, Vector2 uv, byte[] dst, int dstOffset)
+        internal static void SampleBilinear(byte[] src, int width, int height, Vector2 uv, byte[] dst, int dstOffset)
         {
             float fx = uv.X * width - 0.5f;
             float fy = uv.Y * height - 0.5f;

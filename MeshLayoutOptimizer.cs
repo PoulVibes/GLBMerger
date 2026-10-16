@@ -280,7 +280,7 @@ namespace GlbMerger
         // the typed helper; integer ones (JOINTS_0 is UNSIGNED_BYTE or UNSIGNED_SHORT in every real
         // file) have to be re-encoded byte for byte, because writing them as floats would produce a
         // glTF that violates the spec and that runtimes reject.
-        private static Action? BuildPermutedRewrite(MeshPrimitive prim, string name, Accessor accessor, int[] newToOld)
+        internal static Action? BuildPermutedRewrite(MeshPrimitive prim, string name, Accessor accessor, int[] newToOld)
         {
             if (accessor.Encoding == EncodingType.FLOAT)
             {

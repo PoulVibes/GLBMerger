@@ -44,6 +44,8 @@ namespace GlbMerger
         private RadioButton _radioForward = null!, _radioSide = null!, _radioDown = null!;
         private Label _lblStatus = null!, _lblBoneRight = null!, _lblBoneLeft = null!;
         private Button _btnPause = null!, _btnCopyOther = null!;
+        private CheckBox _chkBallTest = null!;
+        private Label _lblBallTest = null!;
         private WebView2 _webView = null!;
         private bool _viewerReady;
         private bool _paused;
@@ -320,6 +322,19 @@ namespace GlbMerger
             animRow.Controls.Add(_btnPause);
             flow.Controls.Add(animRow);
 
+            // Handoff / pre-snap ball-hold test: rides the football on the
+            // locked hand's BallAnchor, exactly as the game places it
+            // (Renderer::CarriedBallPose -> ModelRenderer::HandWorld). The
+            // game's handoff reach and the under-center QB's pre-snap hold
+            // both use this model's Forward pose (ApplyBakedStiffArmPoses
+            // seeds ArmIKConfig::rightHandoff/leftHandoff from it), so
+            // Forward + this box is what those moments look like in play.
+            _chkBallTest = new CheckBox { Text = "Ball-in-hand test (handoff / pre-snap hold)", AutoSize = true, Margin = new Padding(3, 2, 3, 2) };
+            _chkBallTest.CheckedChanged += (s, e) => { PushBallTest(); RefreshBallTestLabel(); };
+            flow.Controls.Add(_chkBallTest);
+            _lblBallTest = new Label { AutoSize = true, MaximumSize = new System.Drawing.Size(320, 0), Margin = new Padding(3, 0, 3, 10) };
+            flow.Controls.Add(_lblBallTest);
+
             // Row geometry is computed from these constants rather than
             // eyeballed per-call - the previous version hand-picked a 54px
             // row pitch but left the GroupBox's own fixed Height at the
@@ -492,6 +507,38 @@ namespace GlbMerger
         {
             RefreshUiFromState();
             PushLockedSide();
+            RefreshBallTestLabel();
+        }
+
+        // Same "contains 'ballanchor'" child match ModelRenderer::FindHandJoints uses.
+        private static bool HasBallAnchor(Node? hand)
+        {
+            if (hand == null) return false;
+            foreach (var child in hand.VisualChildren)
+                if (child.Name != null && child.Name.IndexOf("ballanchor", StringComparison.OrdinalIgnoreCase) >= 0)
+                    return true;
+            return false;
+        }
+
+        private void RefreshBallTestLabel()
+        {
+            if (!_chkBallTest.Checked) { _lblBallTest.Text = ""; return; }
+            var (side, pose) = CurrentSelection();
+            var hand = side == 0 ? _rightWrist : _leftWrist;
+            string where = side == 0 ? "right" : "left";
+            string anchor = HasBallAnchor(hand)
+                ? $"Ball rides the {where} hand's BallAnchor."
+                : $"No BallAnchor on the {where} hand - the game falls back to its hardcoded offset, so this preview hides the ball.";
+            string poseNote = pose == 0
+                ? " Forward is the pose the game's handoff and pre-snap hold use."
+                : " The game's handoff and pre-snap hold use Forward, not this pose.";
+            _lblBallTest.Text = anchor + poseNote;
+        }
+
+        private void PushBallTest()
+        {
+            if (!_viewerReady) return;
+            _webView.CoreWebView2.ExecuteScriptAsync($"setBallTest({(_chkBallTest.Checked ? "true" : "false")});");
         }
 
         private void RefreshUiFromState()
@@ -675,11 +722,18 @@ namespace GlbMerger
             _webView.CoreWebView2.NavigationCompleted += (s, e) =>
             {
                 _viewerReady = e.IsSuccess;
-                if (_viewerReady) PushLockedSide();
+                if (_viewerReady) { PushLockedSide(); PushBallTest(); }
             };
 
             _model.SaveGLB(previewPath);
             var previewFileName = Path.GetFileName(previewPath);
+
+            // Same ball prop and copy-next-to-the-preview approach as BallAnchorEditor.
+            string ballSourcePath = Path.Combine(AppContext.BaseDirectory, "Assets", "Football1.glb");
+            string ballPreviewPath = Path.Combine(tempFolder, "glbmerger_ball_prop.glb");
+            bool haveBall = File.Exists(ballSourcePath);
+            if (haveBall) File.Copy(ballSourcePath, ballPreviewPath, overwrite: true);
+            var ballFileName = haveBall ? Path.GetFileName(ballPreviewPath) : "";
 
             string htmlContent = @"
             <!DOCTYPE html>
@@ -822,6 +876,62 @@ namespace GlbMerger
 
                         window.setPaused = function (value) { paused = value; };
 
+                        // Ball-in-hand test (see the C# checkbox). Sized like
+                        // BallAnchorEditor's fitBallScale: the game draws the
+                        // ball kBallScale (0.675) tall against a kPlayerHeight
+                        // (4.8) player.
+                        var ballTest = false;
+                        var ballPivot = null, ballNativeHeight = null, characterHeight = null;
+                        var kBallHeightFraction = 0.675 / 4.8;
+                        var _anchorPos = new THREE.Vector3(), _anchorQuat = new THREE.Quaternion();
+
+                        window.setBallTest = function (on) { ballTest = on; };
+
+                        function fitBallScale() {
+                            if (!ballPivot || characterHeight === null || ballNativeHeight === null) return;
+                            ballPivot.scale.setScalar(ballNativeHeight > 1e-6 ? kBallHeightFraction * characterHeight / ballNativeHeight : 1);
+                        }
+
+                        function findBallAnchor(wrist) {
+                            for (var i = 0; i < wrist.children.length; i++) {
+                                var c = wrist.children[i];
+                                if (c.name && c.name.toLowerCase().indexOf('ballanchor') >= 0) return c;
+                            }
+                            return null;
+                        }
+
+                        // Rides the locked hand's BallAnchor - its world
+                        // transform is the game's HandWorld result.
+                        function updateBall() {
+                            if (!ballPivot) return;
+                            var wrist = lockedWristName ? bonesByName[lockedWristName] : null;
+                            var anchor = (ballTest && wrist) ? findBallAnchor(wrist) : null;
+                            ballPivot.visible = !!anchor;
+                            if (!anchor) return;
+                            anchor.getWorldPosition(_anchorPos);
+                            anchor.getWorldQuaternion(_anchorQuat);
+                            ballPivot.position.copy(_anchorPos);
+                            ballPivot.quaternion.copy(_anchorQuat);
+                        }
+" + (string.IsNullOrEmpty(ballFileName) ? @"
+                        showError('Ball-in-hand test: Assets/Football1.glb was not found next to the exe - showing no ball prop.');
+" : @"
+                        new THREE.GLTFLoader().load('https://appassets.local/" + ballFileName + @"', function (gltf) {
+                            var ballObj = gltf.scene;
+                            // Center on the mesh's geometric middle (FootballRenderer's normalize).
+                            var bbox = new THREE.Box3().setFromObject(ballObj);
+                            var bcenter = bbox.getCenter(new THREE.Vector3());
+                            ballNativeHeight = bbox.getSize(new THREE.Vector3()).y;
+                            ballObj.position.set(-bcenter.x, -bcenter.y, -bcenter.z);
+                            ballPivot = new THREE.Group();
+                            ballPivot.add(ballObj);
+                            ballPivot.visible = false;
+                            scene.add(ballPivot);
+                            fitBallScale();
+                        }, undefined, function (error) {
+                            showError('Failed to load ball prop: ' + (error && error.message ? error.message : error));
+                        });
+") + @"
                         var loader = new THREE.GLTFLoader();
                         loader.load('https://appassets.local/" + previewFileName + @"', function (gltf) {
                             try {
@@ -877,6 +987,9 @@ namespace GlbMerger
                                 var center = box.getCenter(new THREE.Vector3());
                                 var maxDim = (Math.max(size.x, size.y, size.z) || 1) * 2.5;
 
+                                characterHeight = size.y;
+                                fitBallScale();
+
                                 controls.target.copy(center);
                                 camera.position.copy(center).add(new THREE.Vector3(maxDim, maxDim * 0.6, maxDim));
                                 camera.near = maxDim / 1000;
@@ -913,6 +1026,8 @@ namespace GlbMerger
                             var delta = clock.getDelta();
                             if (mixer && !paused) mixer.update(delta);
                             applyLock();
+                            scene.updateMatrixWorld(true);
+                            updateBall();
                             controls.update();
                             renderer.render(scene, camera);
                         }
