@@ -67,6 +67,11 @@ namespace GlbMerger
         private readonly Node? _rightElbow, _leftElbow;
         private readonly Node? _rightShoulder, _leftShoulder;
 
+        // Display cm per raw hand-local unit, per side (see ModelUnits) - the
+        // position fields show cm so the same entry moves every model's ball
+        // the same distance regardless of its rig's native units.
+        private readonly float _rightUnits, _leftUnits;
+
         // Arm-pose editing: which arm pose the ball's carry/handoff
         // animation locks to, per ModelRenderer::ArmIKConfig - authored here
         // alongside the ball offset itself since both only make sense
@@ -159,6 +164,8 @@ namespace GlbMerger
             _leftElbow = _leftHand?.VisualParent;
             _rightShoulder = _rightElbow?.VisualParent;
             _leftShoulder = _leftElbow?.VisualParent;
+            _rightUnits = ModelUnits.DisplayPerLocal(_rightHand);
+            _leftUnits = ModelUnits.DisplayPerLocal(_leftHand);
 
             Dock = DockStyle.Fill;
 
@@ -453,7 +460,7 @@ namespace GlbMerger
             int handPanelHeight = rotBlockTop + 3 * kRotRowPitch + 10;
 
             _handEditPanel = new Panel { Width = 310, Height = handPanelHeight, Margin = new Padding(0) };
-            var lblPos = new Label { Text = "Position (relative to hand bone):", Left = 0, Top = 0, AutoSize = true };
+            var lblPos = new Label { Text = "Position (cm, relative to hand bone):", Left = 0, Top = 0, AutoSize = true };
             var lblX = new Label { Text = "X:", Left = 0, Top = posBlockTop, Width = 20 };
             var lblY = new Label { Text = "Y:", Left = 0, Top = posBlockTop + kPosRowPitch, Width = 20 };
             var lblZ = new Label { Text = "Z:", Left = 0, Top = posBlockTop + 2 * kPosRowPitch, Width = 20 };
@@ -622,7 +629,7 @@ namespace GlbMerger
             var numeric = new NumericUpDown
             {
                 Left = left, Top = top, Width = 120,
-                Minimum = -9999m, Maximum = 9999m, DecimalPlaces = 0, Increment = 1m, Value = 0m
+                Minimum = -9999m, Maximum = 9999m, DecimalPlaces = 1, Increment = 1m, Value = 0m
             };
             numeric.ValueChanged += (s, e) => OnValueChanged();
             return numeric;
@@ -672,11 +679,12 @@ namespace GlbMerger
             bool right = _radioRight.Checked;
             var pos = right ? _rightPos : _leftPos;
             var rot = right ? _rightRotDeg : _leftRotDeg;
+            float units = right ? _rightUnits : _leftUnits;
 
             _suppressEvents = true;
-            _numPosX.Value = Math.Clamp((decimal)pos.X, _numPosX.Minimum, _numPosX.Maximum);
-            _numPosY.Value = Math.Clamp((decimal)pos.Y, _numPosY.Minimum, _numPosY.Maximum);
-            _numPosZ.Value = Math.Clamp((decimal)pos.Z, _numPosZ.Minimum, _numPosZ.Maximum);
+            _numPosX.Value = Math.Clamp((decimal)(pos.X * units), _numPosX.Minimum, _numPosX.Maximum);
+            _numPosY.Value = Math.Clamp((decimal)(pos.Y * units), _numPosY.Minimum, _numPosY.Maximum);
+            _numPosZ.Value = Math.Clamp((decimal)(pos.Z * units), _numPosZ.Minimum, _numPosZ.Maximum);
             _sliderRotX.Value = rot.X;
             _sliderRotY.Value = rot.Y;
             _sliderRotZ.Value = rot.Z;
@@ -693,7 +701,8 @@ namespace GlbMerger
         {
             if (_suppressEvents) return;
             bool right = _radioRight.Checked;
-            var pos = ((float)_numPosX.Value, (float)_numPosY.Value, (float)_numPosZ.Value);
+            float units = right ? _rightUnits : _leftUnits;
+            var pos = ((float)_numPosX.Value / units, (float)_numPosY.Value / units, (float)_numPosZ.Value / units);
             var rot = (_sliderRotX.Value, _sliderRotY.Value, _sliderRotZ.Value);
             if (right) { _rightPos = pos; _rightRotDeg = rot; }
             else       { _leftPos  = pos; _leftRotDeg  = rot; }
@@ -815,8 +824,11 @@ namespace GlbMerger
         private void CopyAnchorFromOtherHand()
         {
             bool right = _radioRight.Checked;
-            if (right) { _rightPos = _leftPos; _rightRotDeg = _leftRotDeg; }
-            else       { _leftPos  = _rightPos; _leftRotDeg  = _rightRotDeg; }
+            // Rescaled through cm so the copy lands the same real distance
+            // from the hand even if the two hand bones' world scales differ.
+            static (float, float, float) Rescale((float X, float Y, float Z) p, float k) => (p.X * k, p.Y * k, p.Z * k);
+            if (right) { _rightPos = Rescale(_leftPos, _leftUnits / _rightUnits); _rightRotDeg = _leftRotDeg; }
+            else       { _leftPos  = Rescale(_rightPos, _rightUnits / _leftUnits); _leftRotDeg  = _rightRotDeg; }
             RefreshUiFromState();
             _lblStatus.Text = "Copied from other hand (unmirrored) — remember to Save.";
         }
@@ -1095,8 +1107,12 @@ namespace GlbMerger
                 var anchor = FindExistingAnchor(hand);
                 if (anchor == null) return;
 
+                // Converted via cm (see ModelUnits) so a cm-rig library model's
+                // anchor lands at the same real distance on a metre-rig model
+                // (and vice versa) instead of 100x too far/near.
                 var t = anchor.LocalTransform.GetDecomposed();
-                var pos = (t.Translation.X, t.Translation.Y, t.Translation.Z);
+                float k = ModelUnits.DisplayPerLocal(hand) / (right ? _rightUnits : _leftUnits);
+                var pos = (t.Translation.X * k, t.Translation.Y * k, t.Translation.Z * k);
                 var deg = QuaternionToDegrees(t.Rotation);
                 if (right) { _rightPos = pos; _rightRotDeg = deg; } else { _leftPos = pos; _leftRotDeg = deg; }
                 any = true;

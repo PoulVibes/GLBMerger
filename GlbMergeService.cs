@@ -300,9 +300,25 @@ namespace GlbMerger
             // name, e.g. a Mixamo retarget onto a rig sharing the same joint names) at once - each
             // FBX keeps its own root axis-correction, since different FBX exports can use
             // different DCC-tool conventions.
+            // Every clip from another file gets its scale tracks re-expressed against the
+            // structural model's own rest scale - the Model Adjuster's branch Size lives there,
+            // and a donor's track (usually 1.0) would otherwise override it in every merged
+            // clip. Slot 1's own clips are already relative to it. See ScaleKeySync.
+            var targetRestScalesByName = ScaleKeySync.RestScales(nodeMap.Keys);
+
             var clips1 = new List<AnimationClipData>();
-            if (model1 != null) clips1.AddRange(ExtractGlbAnimationClips(model1));
-            if (fbxAnims1 != null) clips1.AddRange(RetargetFbxClips(fbxAnims1, targetReferenceTranslationsByName));
+            if (model1 != null)
+            {
+                var nativeClips1 = ExtractGlbAnimationClips(model1);
+                ScaleKeySync.SyncToRest(nativeClips1, targetRestScalesByName);   // heals an earlier merge's stale tracks
+                clips1.AddRange(nativeClips1);
+            }
+            if (fbxAnims1 != null)
+            {
+                var fbxClips1 = RetargetFbxClips(fbxAnims1, targetReferenceTranslationsByName);
+                ScaleKeySync.ToTargetRest(fbxClips1, null, targetRestScalesByName);
+                clips1.AddRange(fbxClips1);
+            }
 
             var clips2 = new List<AnimationClipData>();
             if (model2 != null)
@@ -318,10 +334,15 @@ namespace GlbMerger
                         sourceHipsBindRotation.Value, targetHipsBindRotation.Value,
                         targetHipsChildNames,
                         new HashSet<string>(fixHipRotationAnims2 ?? new List<string>()));
+                ScaleKeySync.ToTargetRest(nativeClips2, ScaleKeySync.RestScales(otherNodesByName.Values), targetRestScalesByName);
                 clips2.AddRange(nativeClips2);
             }
             foreach (var fbxSource in fbxAnims2 ?? Enumerable.Empty<FbxAnimationSource>())
-                clips2.AddRange(RetargetFbxClips(fbxSource, targetReferenceTranslationsByName));
+            {
+                var fbxClips2 = RetargetFbxClips(fbxSource, targetReferenceTranslationsByName);
+                ScaleKeySync.ToTargetRest(fbxClips2, null, targetRestScalesByName);
+                clips2.AddRange(fbxClips2);
+            }
 
             // Cloned before correcting: a GlbAnimationSource is kept around across repeated
             // "Process Merge" clicks (the user isn't expected to re-pick library files every
@@ -341,6 +362,7 @@ namespace GlbMerger
                         librarySource.HipsBindRotation.Value, targetHipsBindRotation.Value,
                         targetHipsChildNames,
                         new HashSet<string>(fixHipRotationAnims2 ?? new List<string>()));
+                ScaleKeySync.ToTargetRest(clips, librarySource.BindScalesByName, targetRestScalesByName);
                 clips2.AddRange(clips);
             }
 
@@ -1210,6 +1232,7 @@ namespace GlbMerger
             {
                 Clips = clips,
                 BindTranslationsByName = bindTranslationsByName,
+                BindScalesByName = ScaleKeySync.RestScales(nodesByName.Values),
                 HipsBindRotation = hipsBindRotation,
                 LoopByClipName = loopByClipName
             };
@@ -1502,7 +1525,7 @@ namespace GlbMerger
                     ApplyYRotation(clip, yDegrees);
 
                 if (yOffsetByName != null && yOffsetByName.TryGetValue(clip.Name, out var yOffset) && yOffset != 0f)
-                    ApplyYOffset(clip, yOffset);
+                    ApplyYOffset(clip, yOffset, targetsByName);
 
                 foreach (var nodeChannel in clip.NodeChannels)
                 {
@@ -1659,11 +1682,22 @@ namespace GlbMerger
         }
 
         // Manual additive vertical nudge on top of whatever automatic correction already ran, for
-        // the residual cases where it doesn't quite land right.
-        private static void ApplyYOffset(AnimationClipData clip, float offset)
+        // the residual cases where it doesn't quite land right. 'offsetCm' is world centimetres
+        // (see ModelUnits), converted to Hips' raw parent-local units so the same entry nudges a
+        // cm-authored rig and a metre-authored one by the same real amount.
+        private static void ApplyYOffset(AnimationClipData clip, float offsetCm, IReadOnlyDictionary<string, NodeBuilder> targetsByName)
         {
             var hipsChannel = clip.NodeChannels.FirstOrDefault(c => c.NodeName == "Hips");
             if (hipsChannel?.Translation == null) return;
+
+            float cmPerUnit = 100f;
+            if (targetsByName.TryGetValue("Hips", out var hips) && hips.Parent != null
+                && Matrix4x4.Decompose(hips.Parent.WorldMatrix, out var parentScale, out _, out _))
+            {
+                float s = (MathF.Abs(parentScale.X) + MathF.Abs(parentScale.Y) + MathF.Abs(parentScale.Z)) / 3f;
+                if (s > 1e-9f && float.IsFinite(s)) cmPerUnit = s * 100f;
+            }
+            float offset = offsetCm / cmPerUnit;
 
             hipsChannel.Translation = hipsChannel.Translation.ToDictionary(
                 k => k.Key,

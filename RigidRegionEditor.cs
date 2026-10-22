@@ -140,13 +140,18 @@ namespace GlbMerger
             _chkPaintMode.CheckedChanged += (s, e) => PushPaintMode();
             flow.Controls.Add(_chkPaintMode);
 
-            _lblBrush = new Label { Text = "Brush size: 5%", AutoSize = true, Margin = new Padding(3, 0, 3, 0) };
+            // Slider units are tenths of a percent so the brush can go down to 0.1%.
+            _lblBrush = new Label { Text = "Brush size: 5.0%", AutoSize = true, Margin = new Padding(3, 0, 3, 0) };
             _sliderBrush = new TrackBar
             {
-                Width = 300, Height = 45, Minimum = 1, Maximum = 40, Value = 5,
-                TickFrequency = 5, Margin = new Padding(3, 0, 3, 4),
+                Width = 300, Height = 45, Minimum = 1, Maximum = 400, Value = 50,
+                TickFrequency = 50, SmallChange = 1, LargeChange = 10, Margin = new Padding(3, 0, 3, 4),
             };
-            _sliderBrush.ValueChanged += (s, e) => { _lblBrush.Text = $"Brush size: {_sliderBrush.Value}%"; PushBrushRadius(); };
+            _sliderBrush.ValueChanged += (s, e) =>
+            {
+                _lblBrush.Text = $"Brush size: {(_sliderBrush.Value / 10f).ToString("0.0", CultureInfo.InvariantCulture)}%";
+                PushBrushRadius();
+            };
             flow.Controls.Add(_lblBrush);
             flow.Controls.Add(_sliderBrush);
 
@@ -1712,7 +1717,7 @@ keepCutouts(mat);
         private void PushBrushRadius()
         {
             if (!_viewerReady || _webView.CoreWebView2 == null) return;
-            float fraction = _sliderBrush.Value / 100f;
+            float fraction = _sliderBrush.Value / 1000f;
             _ = _webView.CoreWebView2.ExecuteScriptAsync(
                 $"setBrushRadius({fraction.ToString(CultureInfo.InvariantCulture)});");
         }

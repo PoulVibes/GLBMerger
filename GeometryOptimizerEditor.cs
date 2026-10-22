@@ -409,7 +409,7 @@ namespace GlbMerger
             _btnAnalyze.Click += async (s, e) => await RunAnalyzeAsync(apply: false);
             simplifyActions.Controls.Add(_btnAnalyze);
 
-            _btnApply = MakeButton("Apply to Merge");
+            _btnApply = MakeButton("Apply Simplification");
             _btnApply.Click += async (s, e) => await RunAnalyzeAsync(apply: true);
             simplifyActions.Controls.Add(_btnApply);
 

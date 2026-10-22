@@ -384,14 +384,14 @@ namespace GlbMerger
 
         // ---- Writing the attributes back, in their own encodings ----------------------------------
 
-        private static void WriteJoints(MeshPrimitive prim, Accessor old, Vector4[] values, int maxJoint)
+        internal static void WriteJoints(MeshPrimitive prim, Accessor old, Vector4[] values, int maxJoint)
         {
             // A byte can't index past 255 joints; widen if a new face bone needs it.
             var encoding = old.Encoding == EncodingType.UNSIGNED_BYTE && maxJoint > 255 ? EncodingType.UNSIGNED_SHORT : old.Encoding;
             WriteIntegers(prim, "JOINTS_0", values, encoding, normalized: false);
         }
 
-        private static void WriteWeights(MeshPrimitive prim, Accessor old, Vector4[] values)
+        internal static void WriteWeights(MeshPrimitive prim, Accessor old, Vector4[] values)
         {
             if (old.Encoding == EncodingType.FLOAT) { prim.WithVertexAccessor("WEIGHTS_0", values); return; }
             float max = old.Encoding == EncodingType.UNSIGNED_BYTE ? 255f : 65535f;

@@ -36,6 +36,15 @@ namespace GlbMerger
 
         private Panel _movePanel = null!;
         private Panel _addRiggingPanel = null!;
+        private Panel _normalizePanel = null!;
+        private ComboBox? _normalizeRefCombo;
+        private DataGridView _clipGrid = null!;
+        private Label _lblNormalizeSummary = null!;
+        private CheckBox _chkFoldExtras = null!;
+        private Button _btnNormalize = null!;
+        // The reference loaded by the last Analyze - Normalize applies against exactly this one,
+        // so changing the dropdown afterwards clears it rather than mixing two references.
+        private ModelRoot? _normalizeReference;
         private ComboBox _boneDropdown = null!;
         private ComboBox _animDropdown = null!;
         private NumericUpDown _numX = null!, _numY = null!, _numZ = null!;
@@ -104,12 +113,18 @@ namespace GlbMerger
             _movePanel = BuildMovePanel();
             _movePanel.Left = 0;
             _movePanel.Top = y;
-            y += _movePanel.Height + gap;
+            y += _movePanel.Height + gap * 3;
+
+            _normalizePanel = BuildNormalizePanel();
+            _normalizePanel.Left = 0;
+            _normalizePanel.Top = y;
+            y += _normalizePanel.Height + gap;
 
             _lblStatus = new Label { Left = 12, Top = y, Width = 340, Height = 48, AutoSize = false, ForeColor = System.Drawing.Color.LightGreen };
 
             controlPanel.Controls.Add(_addRiggingPanel);
             controlPanel.Controls.Add(_movePanel);
+            controlPanel.Controls.Add(_normalizePanel);
             controlPanel.Controls.Add(_lblStatus);
 
             _webView = new WebView2 { Dock = DockStyle.Fill };
@@ -237,12 +252,159 @@ namespace GlbMerger
             return panel;
         }
 
+        // Rebakes this rig's joint frames onto a reference rig's (see RigNormalizer) - for a model
+        // whose rig uses different local axes from the one its library clips were authored on,
+        // which otherwise twists every copied clip's limbs.
+        private Panel BuildNormalizePanel()
+        {
+            var panel = new Panel { Width = 348, AutoSize = false };
+            int y = 0;
+            const int gap = 6;
+
+            var lblTitle = new Label { Text = "Normalize Rig to Reference", Left = 0, Top = y, AutoSize = true, Font = new System.Drawing.Font(Font, System.Drawing.FontStyle.Bold) };
+            y += lblTitle.Height + 2;
+
+            var lblHelp = new Label
+            {
+                Text = "Re-orients every joint shared with a reference rig to the reference's own " +
+                       "joint axes, so clips copied from it play untwisted. The mesh and joint " +
+                       "positions don't move. Analyze first, check how each clip was made, then " +
+                       "Normalize. Do this before adding face bones or copying more clips.",
+                Left = 0, Top = y, Width = 340, AutoSize = false, Height = 72,
+            };
+            y += lblHelp.Height + gap;
+
+            var lblRef = new Label { Text = "Reference rig (the clips' original model):", Left = 0, Top = y, AutoSize = true };
+            y += lblRef.Height + 2;
+            _normalizeRefCombo = new ComboBox { Left = 0, Top = y, Width = 240, DropDownStyle = ComboBoxStyle.DropDownList };
+            FillLibraryCombo(_normalizeRefCombo);
+            _normalizeRefCombo.SelectedIndexChanged += (s, e) => ClearNormalizeAnalysis();
+            var btnChangeDir = new Button { Text = "...", Left = 246, Top = y, Width = 30 };
+            btnChangeDir.Click += (s, e) => ChangeLibraryDirectory();
+            y += _normalizeRefCombo.Height + gap;
+
+            var btnAnalyze = new Button { Text = "Analyze", Left = 0, Top = y, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowOnly, MinimumSize = new System.Drawing.Size(340, 0) };
+            btnAnalyze.Click += (s, e) => AnalyzeNormalize();
+            y += btnAnalyze.Height + gap;
+
+            _lblNormalizeSummary = new Label { Left = 0, Top = y, Width = 340, Height = 64, AutoSize = false };
+            y += _lblNormalizeSummary.Height + 2;
+
+            // Per clip: which joint frames its keys were authored in. Analyze fills in a best
+            // guess; a wrong one only ever affects that one clip, so it's left editable.
+            _clipGrid = new DataGridView
+            {
+                Left = 0, Top = y, Width = 340, Height = 220,
+                AllowUserToAddRows = false, AllowUserToDeleteRows = false, AllowUserToResizeRows = false,
+                RowHeadersVisible = false, SelectionMode = DataGridViewSelectionMode.CellSelect,
+                AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill, EditMode = DataGridViewEditMode.EditOnEnter,
+            };
+            _clipGrid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Clip", ReadOnly = true, FillWeight = 55 });
+            var conventionColumn = new DataGridViewComboBoxColumn { HeaderText = "Made as", FillWeight = 45, FlatStyle = FlatStyle.Flat };
+            foreach (var c in Enum.GetValues<ClipConvention>()) conventionColumn.Items.Add(RigNormalizer.Describe(c));
+            _clipGrid.Columns.Add(conventionColumn);
+            y += _clipGrid.Height + gap;
+
+            _chkFoldExtras = new CheckBox { Text = "Fold extra joints into nearest shared joint", Left = 0, Top = y, AutoSize = true, Checked = true };
+            y += _chkFoldExtras.Height + gap;
+
+            _btnNormalize = new Button { Text = "Normalize Rig to Reference", Left = 0, Top = y, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowOnly, MinimumSize = new System.Drawing.Size(340, 0), Enabled = false };
+            _btnNormalize.Click += (s, e) => ApplyNormalize();
+            y += _btnNormalize.Height + gap;
+
+            panel.Height = y;
+            panel.Controls.AddRange(new Control[] { lblTitle, lblHelp, lblRef, _normalizeRefCombo, btnChangeDir, btnAnalyze, _lblNormalizeSummary, _clipGrid, _chkFoldExtras, _btnNormalize });
+            return panel;
+        }
+
+        private void ClearNormalizeAnalysis()
+        {
+            _normalizeReference = null;
+            _clipGrid.Rows.Clear();
+            _lblNormalizeSummary.Text = "";
+            _btnNormalize.Enabled = false;
+        }
+
+        private void AnalyzeNormalize()
+        {
+            ClearNormalizeAnalysis();
+            if (_normalizeRefCombo?.SelectedItem is not LibraryDirectoryHelper.LibraryEntry entry)
+            {
+                MessageBox.Show(this, "Pick a reference model from the dropdown first.", "Rigging Editor",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            ModelRoot reference;
+            RigNormalizer.Analysis analysis;
+            try
+            {
+                reference = ModelRoot.Load(entry.Path);
+                analysis = RigNormalizer.Analyze(_model, reference);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, $"Couldn't analyze against '{Path.GetFileName(entry.Path)}':\n{ex.Message}", "Rigging Editor",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            _normalizeReference = reference;
+            foreach (var (clip, detected) in analysis.Clips)
+                _clipGrid.Rows.Add(clip, RigNormalizer.Describe(detected));
+
+            var fold = analysis.FoldMap.Count == 0 ? "No extra joints."
+                : "Extra joints: " + string.Join(", ", analysis.FoldMap.Select(kv => $"{kv.Key} \u2192 {kv.Value}")) + ".";
+            _lblNormalizeSummary.Text = analysis.AlreadyNormalized
+                ? $"Already matches this reference ({analysis.SharedJoints.Count} shared joints). {fold}"
+                : $"{analysis.SharedJoints.Count} shared joints; axes differ by up to {analysis.MaxFrameDifferenceDegrees:0}\u00b0. {fold}";
+            _btnNormalize.Enabled = true;
+        }
+
+        private void ApplyNormalize()
+        {
+            if (_normalizeReference == null) return;
+
+            var conventions = new Dictionary<string, ClipConvention>();
+            foreach (DataGridViewRow row in _clipGrid.Rows)
+            {
+                if (row.Cells[0].Value is not string clip) continue;
+                var label = row.Cells[1].Value as string;
+                conventions[clip] = Enum.GetValues<ClipConvention>().FirstOrDefault(c => RigNormalizer.Describe(c) == label);
+            }
+
+            string report;
+            try
+            {
+                report = RigNormalizer.Apply(_model, _normalizeReference, conventions, _chkFoldExtras.Checked);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, $"Normalize failed:\n{ex.Message}", "Rigging Editor",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            ClearNormalizeAnalysis();
+            _pendingOffsets.Clear();
+            PopulateBoneList();
+            OnBoneSelected();
+            _lblStatus.Text = report;
+            ReloadPreview();
+        }
+
+        private void FillLibraryCombo(ComboBox combo)
+        {
+            combo.Items.Clear();
+            foreach (var file in LibraryDirectoryHelper.ListGlbFiles(_settings.AnimationLibraryDirectory))
+                combo.Items.Add(new LibraryDirectoryHelper.LibraryEntry { Path = file });
+            if (combo.Items.Count > 0) combo.SelectedIndex = 0;
+        }
+
         private void RefreshLibraryCombo()
         {
-            _libraryCombo.Items.Clear();
-            foreach (var file in LibraryDirectoryHelper.ListGlbFiles(_settings.AnimationLibraryDirectory))
-                _libraryCombo.Items.Add(new LibraryDirectoryHelper.LibraryEntry { Path = file });
-            if (_libraryCombo.Items.Count > 0) _libraryCombo.SelectedIndex = 0;
+            FillLibraryCombo(_libraryCombo);
+            if (_normalizeRefCombo != null) FillLibraryCombo(_normalizeRefCombo);
         }
 
         private void ChangeLibraryDirectory()
@@ -266,6 +428,7 @@ namespace GlbMerger
             bool hasSkin = _model.LogicalSkins.Count > 0;
             _addRiggingPanel.Visible = !hasSkin;
             _movePanel.Visible = hasSkin;
+            _normalizePanel.Visible = hasSkin;
         }
 
         // Same rationale as JointOrientationEditor's own MakeNumericPosition: a NumericUpDown
@@ -295,6 +458,7 @@ namespace GlbMerger
                 .GroupBy(n => n.Name!)
                 .ToDictionary(g => g.Key, g => g.First());
 
+            _boneDropdown.Items.Clear();
             _boneDropdown.Items.AddRange(_jointNames);
             if (_jointNames.Length > 0) _boneDropdown.SelectedIndex = 0;
         }

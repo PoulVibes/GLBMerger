@@ -115,7 +115,7 @@ namespace GlbMerger
         var eyeUniforms = {
             eyeL: { value: new THREE.Matrix4() }, eyeR: { value: new THREE.Matrix4() },
             eyeRowL: { value: new THREE.Vector4() }, eyeRowR: { value: new THREE.Vector4() },
-            eyeLook0: { value: new THREE.Vector4(0.05, 0.04, 0.04, 0.45) },
+            eyeLook0: { value: new THREE.Vector4(0.008, 0.006, 0.006, 0.45) },
             eyeLook1: { value: new THREE.Vector4(0.96, 0.96, 0.94, 1.0) },
             eyeLook2: { value: new THREE.Vector4(0.15, 0.32, 0.05, 0.0) },
             eyeLook3: { value: new THREE.Vector4(1.0, 1.0, 0.15, 0.2) },

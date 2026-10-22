@@ -219,7 +219,7 @@ namespace GlbMerger
             // for the residual cases where the automatic ground correction doesn't quite land.
             grdAnimations.Columns.Add(new NumericUpDownColumn
             {
-                Name = "YOffset", HeaderText = "Offset", FillWeight = 25,
+                Name = "YOffset", HeaderText = "Offset (cm)", FillWeight = 25,
                 Minimum = -9999m, Maximum = 9999m, Increment = 1m, DecimalPlaces = 2
             });
 

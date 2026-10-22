@@ -42,6 +42,10 @@ namespace GlbMerger
     {
         public required List<AnimationClipData> Clips { get; init; }
         public required Dictionary<string, Vector3> BindTranslationsByName { get; init; }
+        // Per-bone rest scale, so merged clips' scale tracks can be re-expressed against the
+        // target's own (see ScaleKeySync.ToTargetRest). Null = unknown: each track's first key
+        // stands in.
+        public Dictionary<string, Vector3>? BindScalesByName { get; init; }
         public Quaternion? HipsBindRotation { get; init; }
 
         // Whatever loop/pause setting (and seconds-offset to resume at) this library GLB's own

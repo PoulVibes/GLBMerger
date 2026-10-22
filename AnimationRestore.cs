@@ -59,7 +59,10 @@ namespace GlbMerger
                         node.WithRotationAnimation(clip, Keys(ch.GetRotationSampler().GetLinearKeys()));
                         break;
                     case PropertyPath.scale:
-                        node.WithScaleAnimation(clip, Keys(ch.GetScaleSampler().GetLinearKeys()));
+                        // Relative to each side's rest scale, so a branch Size set since that
+                        // export survives the restore (see ScaleKeySync).
+                        node.WithScaleAnimation(clip, ScaleKeySync.ToTargetRest(
+                            Keys(ch.GetScaleSampler().GetLinearKeys()), RestScale(ch.TargetNode!), RestScale(node)));
                         break;
                     default:
                         continue;   // morph weights: no player clip animates them
@@ -72,6 +75,12 @@ namespace GlbMerger
 
         private static Animation? FindAnimation(ModelRoot model, string name) =>
             model.LogicalAnimations.FirstOrDefault(a => (a.Name ?? $"Anim_{a.LogicalIndex}") == name);
+
+        private static System.Numerics.Vector3 RestScale(Node node)
+        {
+            System.Numerics.Matrix4x4.Decompose(node.LocalMatrix, out var scale, out _, out _);
+            return scale;
+        }
 
         private static (float, T)[] Keys<T>(IEnumerable<(float Key, T Value)> keys) =>
             keys.OrderBy(k => k.Key).Select(k => (k.Key, k.Value)).ToArray();

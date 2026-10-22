@@ -804,9 +804,16 @@ namespace GlbMerger
         // +/-5 range would be too small to ever produce a visible correction. Left unitless and
         // wide so it works regardless of the model's own scale; the user can always type a precise
         // value even though the increment steps coarsely.
+        // Display cm per raw translation unit for this bone (see ModelUnits) - the position
+        // fields show cm so one entry moves every model the same distance, whether its rig is
+        // authored in cm under a 0.01 Armature or straight in metres. Pending/committed offsets
+        // stay in raw units, since that's what the preview and the save both apply.
+        private float PosUnits(string boneName) =>
+            ModelUnits.DisplayPerLocal(_model.LogicalNodes.First(n => n.Name == boneName).VisualParent);
+
         private (Label, NumericUpDown, CheckBox, CheckBox) MakeNumericPosition(string text, ref int y)
         {
-            var lbl = new Label { Text = $"{text}: 0", Left = 12, Top = y, AutoSize = true };
+            var lbl = new Label { Text = $"{text} (cm): 0", Left = 12, Top = y, AutoSize = true };
             y += lbl.Height + 2;
             var numeric = new NumericUpDown
             {
@@ -818,7 +825,7 @@ namespace GlbMerger
             var chkMirror = new CheckBox { Text = "Mirror", Left = 142, Top = y + 2, AutoSize = true };
             var chkInverse = new CheckBox { Text = "Inv", Left = 212, Top = y + 2, AutoSize = true };
             y += numeric.Height + 6;
-            numeric.ValueChanged += (s, e) => { lbl.Text = $"{text}: {numeric.Value}"; ApplyCorrection(); };
+            numeric.ValueChanged += (s, e) => { lbl.Text = $"{text} (cm): {numeric.Value}"; ApplyCorrection(); };
             return (lbl, numeric, chkMirror, chkInverse);
         }
 
@@ -985,12 +992,14 @@ namespace GlbMerger
             // Clamped defensively - pending values only ever come from these same controls, but a
             // value sitting exactly on the NumericUpDown's Min/Max boundary can round the wrong way
             // through the float/decimal conversion and throw when assigned back.
-            _numPosX.Value = Math.Clamp((decimal)px, _numPosX.Minimum, _numPosX.Maximum);
-            _numPosY.Value = Math.Clamp((decimal)py, _numPosY.Minimum, _numPosY.Maximum);
-            _numPosZ.Value = Math.Clamp((decimal)pz, _numPosZ.Minimum, _numPosZ.Maximum);
-            _lblPosX.Text = $"X Position: {px}";
-            _lblPosY.Text = $"Y Position: {py}";
-            _lblPosZ.Text = $"Z Position: {pz}";
+            // Pending offsets are raw local units; the fields show cm (see PosUnits).
+            float units = PosUnits(boneName);
+            _numPosX.Value = Math.Clamp((decimal)(px * units), _numPosX.Minimum, _numPosX.Maximum);
+            _numPosY.Value = Math.Clamp((decimal)(py * units), _numPosY.Minimum, _numPosY.Maximum);
+            _numPosZ.Value = Math.Clamp((decimal)(pz * units), _numPosZ.Minimum, _numPosZ.Maximum);
+            _lblPosX.Text = $"X Position (cm): {_numPosX.Value}";
+            _lblPosY.Text = $"Y Position (cm): {_numPosY.Value}";
+            _lblPosZ.Text = $"Z Position (cm): {_numPosZ.Value}";
             _suppressSliderEvents = false;
             // Restores whatever not-yet-saved offset was already dialed in for this bone, so
             // switching away and back doesn't lose it - the live 3D view is left untouched too,
@@ -1183,7 +1192,9 @@ namespace GlbMerger
             GetOrCacheOriginalKeys(boneName, isStaticPose, anim, node);
             GetOrCacheOriginalTranslationKeys(boneName, isStaticPose, anim, node);
 
-            _pendingTranslationOffsets[boneName] = ((float)_numPosX.Value, (float)_numPosY.Value, (float)_numPosZ.Value);
+            float units = PosUnits(boneName);
+            var rawPos = ((float)_numPosX.Value / units, (float)_numPosY.Value / units, (float)_numPosZ.Value / units);
+            _pendingTranslationOffsets[boneName] = rawPos;
             _lblStatus.Text = "";
 
             if (_chkDistributeSpine.Enabled && _chkDistributeSpine.Checked)
@@ -1197,7 +1208,7 @@ namespace GlbMerger
             if (_viewerReady)
             {
                 _webView.CoreWebView2.ExecuteScriptAsync(
-                    $"setLiveTranslationCorrection('{EscapeJs(boneName)}', {Inv((float)_numPosX.Value)}, {Inv((float)_numPosY.Value)}, {Inv((float)_numPosZ.Value)});");
+                    $"setLiveTranslationCorrection('{EscapeJs(boneName)}', {Inv(rawPos.Item1)}, {Inv(rawPos.Item2)}, {Inv(rawPos.Item3)});");
             }
 
             ApplyMirrorIfNeeded(boneName, isStaticPose, anim);
@@ -1275,9 +1286,11 @@ namespace GlbMerger
                 var (mpx, mpy, mpz) = _pendingTranslationOffsets.TryGetValue(mirrorName, out var existingPos) ? existingPos : (0f, 0f, 0f);
                 // Default mirror sign per axis - lateral X negated, Y/Z copied as-is. "Inv"
                 // flips that default for just its own axis.
-                if (posFlags.X) mpx = posInverse.X ? (float)_numPosX.Value : -(float)_numPosX.Value;
-                if (posFlags.Y) mpy = posInverse.Y ? -(float)_numPosY.Value : (float)_numPosY.Value;
-                if (posFlags.Z) mpz = posInverse.Z ? -(float)_numPosZ.Value : (float)_numPosZ.Value;
+                // Fields are cm; converted into the mirror bone's own raw units.
+                float mu = PosUnits(mirrorName);
+                if (posFlags.X) mpx = (posInverse.X ? (float)_numPosX.Value : -(float)_numPosX.Value) / mu;
+                if (posFlags.Y) mpy = (posInverse.Y ? -(float)_numPosY.Value : (float)_numPosY.Value) / mu;
+                if (posFlags.Z) mpz = (posInverse.Z ? -(float)_numPosZ.Value : (float)_numPosZ.Value) / mu;
                 _pendingTranslationOffsets[mirrorName] = (mpx, mpy, mpz);
 
                 if (_viewerReady)

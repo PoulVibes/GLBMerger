@@ -798,7 +798,7 @@ namespace GlbMerger
                 if (!OfferCleanup(beforeSave: true)) return;
 
                 Cursor = Cursors.WaitCursor;
-                try { latestMergedModel.SaveGLB(dlg.FileName); }
+                try { GlbPrune.Save(latestMergedModel, dlg.FileName); }
                 finally { Cursor = Cursors.Default; }
 
                 long written = new FileInfo(dlg.FileName).Length;
@@ -835,7 +835,7 @@ namespace GlbMerger
             try
             {
                 Cursor = Cursors.WaitCursor;
-                try { latestMergedModel.SaveGLB(targetPath); }
+                try { GlbPrune.Save(latestMergedModel, targetPath); }
                 finally { Cursor = Cursors.Default; }
             }
             catch (Exception ex)
