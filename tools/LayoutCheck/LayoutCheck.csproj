@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Opens every Model Editor mode at the window sizes the app actually uses and reports controls
+       that can't be reached or read. See docs/UI_LAYOUT.md. GlbMerger.csproj excludes tools/ via
+       DefaultItemExcludes, since it would otherwise compile every .cs file under its folder. -->
+  <PropertyGroup>
+    <!-- Exe rather than WinExe so the report prints to the terminal it was run from. -->
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- WebView2's WPF assembly drags in a WindowsBase version clash that is harmless here and
+         otherwise buries the report under a page of build warnings. -->
+    <MSBuildWarningsAsMessages>MSB3277</MSBuildWarningsAsMessages>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\GlbMerger.csproj" />
+  </ItemGroup>
+
+</Project>
