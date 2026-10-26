@@ -16,6 +16,10 @@ static class Program
             return SyncScaleKeys(args);
         if (args.Length > 0 && args[0] == "--prune")
             return PruneFiles(args);
+        if (args.Length > 0 && args[0] == "--ground-fix")
+            return GroundFix(args);
+        if (args.Length > 0 && args[0] == "--trim-clip")
+            return TrimClip(args);
 
         ApplicationConfiguration.Initialize();
         Application.Run(new MainForm());
@@ -78,6 +82,95 @@ static class Program
                 Console.WriteLine($"{path}: {s.Samplers} sampler(s), {s.Accessors} accessor(s), "
                     + $"{s.BufferViews} buffer view(s), {s.Bytes / 1024.0:F1} KB {(dryRun ? "unused" : "removed")}");
                 if (!dryRun && s.Any) WriteReplacing(bytes, path);
+            }
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(ex.Message);
+            return 1;
+        }
+    }
+
+    // Headless: GlbMerger --ground-fix [--dry-run] <Clip1,Clip2,...> <a.glb> [b.glb ...]
+    // Raises each named clip's Hips wherever its skinned mesh dips under the floor, in place -
+    // the Animation Trim editor's Keep Above Ground, for a batch of player models. See
+    // AnimationGroundFix. Inches assume the game's 6 ft player.
+    private static int GroundFix(string[] args)
+    {
+        bool dryRun = args.Contains("--dry-run");
+        var rest = args.Skip(1).Where(a => a != "--dry-run").ToList();
+        if (rest.Count < 2)
+        {
+            Console.Error.WriteLine("usage: GlbMerger --ground-fix [--dry-run] <Clip1,Clip2,...> <a.glb> [b.glb ...]");
+            return 2;
+        }
+        var clips = rest[0].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+        try
+        {
+            foreach (var path in rest.Skip(1))
+            {
+                var model = ModelRoot.Load(path);
+                bool changed = false;
+                Console.WriteLine(path);
+                foreach (var clip in clips)
+                {
+                    if (!model.LogicalAnimations.Any(a => a.Name == clip)) { Console.WriteLine($"  {clip,-14} not in this file"); continue; }
+                    var r = dryRun ? AnimationGroundFix.Measure(model, clip) : AnimationGroundFix.Apply(model, clip);
+                    string In(float units) => AnimationGroundFix.Result.Inches(units, r.Height).ToString("0.0", System.Globalization.CultureInfo.InvariantCulture);
+                    Console.WriteLine($"  {clip,-14} under {In(r.DeepestBefore),5} in at {r.DeepestAt:0.00}s (floor: {r.FloorFrom}), "
+                        + $"{r.FramesRaised}/{r.Keys} frames raised, up to {In(r.LargestRaise)} in, {In(r.EndRaise)} on the last"
+                        + (dryRun ? " (dry run)" : $", now under {In(r.DeepestAfter)} in"));
+                    changed |= !dryRun && r.LargestRaise > 0f;
+                }
+                if (changed) SaveReplacing(model, path);
+            }
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(ex.Message);
+            return 1;
+        }
+    }
+
+    // Headless: GlbMerger --trim-clip [--dry-run] <Clip> <firstFrame> <lastFrame> <a.glb> [b.glb ...]
+    // Crops one clip to [first, last] in place - the Animation Trim editor's Save Animation
+    // Adjustments without the loop/smoothing options, for a batch of player models. Frames are that
+    // editor's numbering (every distinct keyframe time across the clip's channels). A loop setting
+    // already on the clip is kept, its loop-back time clamped into the shorter clip.
+    private static int TrimClip(string[] args)
+    {
+        bool dryRun = args.Contains("--dry-run");
+        var rest = args.Skip(1).Where(a => a != "--dry-run").ToList();
+        if (rest.Count < 4 || !int.TryParse(rest[1], out int first) || !int.TryParse(rest[2], out int last) || last <= first)
+        {
+            Console.Error.WriteLine("usage: GlbMerger --trim-clip [--dry-run] <Clip> <firstFrame> <lastFrame> <a.glb> [b.glb ...]");
+            return 2;
+        }
+        string clip = rest[0];
+
+        try
+        {
+            foreach (var path in rest.Skip(3))
+            {
+                var model = ModelRoot.Load(path);
+                var anim = model.LogicalAnimations.FirstOrDefault(a => a.Name == clip);
+                if (anim == null) { Console.WriteLine($"{path}: {clip} not in this file"); continue; }
+
+                var times = AnimationGroundFix.FrameTimes(anim);
+                if (last >= times.Length) { Console.WriteLine($"{path}: {clip} has only {times.Length} frames - skipped"); continue; }
+                Console.WriteLine($"{path}: {clip} frames {first}-{last} of {times.Length - 1} "
+                    + $"({times[first]:0.000}s-{times[last]:0.000}s, was {times[^1]:0.000}s){(dryRun ? " (dry run)" : "")}");
+                if (dryRun) continue;
+
+                bool hadLoop = GlbMergeService.HasAnimationLoopExtras(model, clip);
+                var (loop, loopTime) = GlbMergeService.GetAnimationLoop(model, clip);
+                GlbMergeService.TrimAnimation(model, clip, first, last);
+                if (hadLoop)
+                    GlbMergeService.SetAnimationLoop(model, clip, loop, Math.Clamp(loopTime - times[first], 0f, times[last] - times[first]));
+                SaveReplacing(model, path);
             }
             return 0;
         }

@@ -11,7 +11,9 @@ using SharpGLTF.Schema2;
 
 namespace GlbMerger
 {
-    // Plays the merged result back and crops an animation down to a chosen first/last frame.
+    // Plays the merged result back and crops an animation down to a chosen first/last frame, and
+    // raises a clip out of the floor wherever its mesh dips under it (Keep Above Ground,
+    // AnimationGroundFix; the same edit as the headless `GlbMerger --ground-fix`).
     // Trimming mutates the shared in-memory merge result directly (same in-place-edit pattern as
     // the other three editors), so there's no separate "commit"/export step of its own - whatever
     // is in the model when MainForm's Save button is next clicked is what ends up in the file.
@@ -44,7 +46,7 @@ namespace GlbMerger
         private TrackBar _sliderStart = null!, _sliderEnd = null!;
         private NumericUpDown _numSpeed = null!;
         private Label _lblStart = null!, _lblEnd = null!, _lblStatus = null!;
-        private Button _btnPause = null!, _btnPlayRange = null!, _btnApplyTrim = null!;
+        private Button _btnPause = null!, _btnPlayRange = null!, _btnApplyTrim = null!, _btnGroundFix = null!;
         private Panel _trimPanel = null!;
         private CheckBox _chkLoop = null!;
         private NumericUpDown _numLoopFrame = null!;
@@ -234,6 +236,19 @@ namespace GlbMerger
             });
             flow.Controls.Add(_trimPanel);
 
+            // Per-frame, mesh-based floor fix for the selected clip (AnimationGroundFix): outside
+            // _trimPanel because it needs no trim range - only a selected animation - and that
+            // panel is fixed-height. Applied straight onto the model like Save Animation
+            // Adjustments, so it also lands on the next merge Save.
+            flow.Controls.Add(new Label
+            {
+                Text = "Keep above ground: raises the Hips on just the frames where the mesh dips below the floor (where the feet stand in Idle), by exactly that much.",
+                AutoSize = true, MaximumSize = new System.Drawing.Size(290, 0), Margin = new Padding(3, 10, 3, 4),
+            });
+            _btnGroundFix = new Button { Text = "Keep Above Ground", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowOnly, MinimumSize = new System.Drawing.Size(290, 0), Margin = new Padding(3, 0, 3, 0) };
+            _btnGroundFix.Click += (s, e) => ApplyGroundFix();
+            flow.Controls.Add(_btnGroundFix);
+
             _lblStatus = new Label
             {
                 AutoSize = true, MaximumSize = new System.Drawing.Size(300, 0),
@@ -294,6 +309,7 @@ namespace GlbMerger
             _paused = false;
             _btnPause.Text = "Pause";
             _btnPause.Enabled = name != null;
+            _btnGroundFix.Enabled = name != null;
 
             ConfigureTrimControls();
             Exec(name == null ? "setAnimation('');" : $"setAnimation('{EscapeJs(name)}');");
@@ -632,6 +648,40 @@ namespace GlbMerger
             {
                 MessageBox.Show(this, $"Failed to trim animation: {ex.Message}",
                     "Trim Animation", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        // Raises the selected clip's Hips wherever its mesh goes under the floor (see
+        // AnimationGroundFix), then reloads the preview. Keys land on the clip's existing frame
+        // times, so the trim sliders' numbering - and any trim not yet saved - is untouched.
+        private void ApplyGroundFix()
+        {
+            var name = CurrentAnimationName();
+            if (name == null) return;
+
+            StopRangePreview();
+
+            try
+            {
+                Cursor = Cursors.WaitCursor;
+                var r = AnimationGroundFix.Apply(_model, name);
+                string In(float units) => AnimationGroundFix.Result.Inches(units, r.Height).ToString("0.0", CultureInfo.InvariantCulture);
+                _lblStatus.Text = r.LargestRaise <= 0f
+                    ? $"'{name}' never goes under the floor - nothing to raise."
+                    : $"'{name}' went {In(r.DeepestBefore)} in under the floor (where its feet stand in {r.FloorFrom}) at its deepest " +
+                      $"({r.DeepestAt.ToString("0.00", CultureInfo.InvariantCulture)}s, inches at 6 ft). Raised the Hips on the " +
+                      $"{r.FramesRaised} of {r.Keys} frames that were under, by up to {In(r.LargestRaise)} in; the rest are untouched. " +
+                      $"Now {In(r.DeepestAfter)} in under at most. Included the next time you save the merge.";
+                ReloadPreview();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, $"Failed to keep the animation above ground: {ex.Message}",
+                    "Keep Above Ground", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            finally
+            {
+                Cursor = Cursors.Default;
             }
         }
 
