@@ -25,7 +25,8 @@ namespace GlbMerger
         private NumericUpDown _numW = null!, _numH = null!, _numD = null!, _numF = null!, _numCore = null!, _numChinDrop = null!;
         private NumericUpDown _numTilt = null!;
         private CheckBox _chkSameSize = null!, _chkShowRegion = null!, _chkShowWeights = null!, _chkShowPoints = null!;
-        private ComboBox _comboExpression = null!, _comboViseme = null!;
+        private ComboBox _comboExpression = null!, _comboViseme = null!, _comboBaked = null!;
+        private NumericUpDown _numBakedAmount = null!;
         private TrackBar _sliderStrength = null!;
         private Label _lblStatus = null!, _lblBones = null!;
 
@@ -140,9 +141,53 @@ namespace GlbMerger
                 "How far the chin region's lower half moves down with the mouth fully open, % of its " +
                 "half-height. Expressions open the mouth part way, so they drop it part way.");
 
+            BuildBakedLookRows(flow);
+
             _chkSameSize = new CheckBox { Text = "Same size for both brows", AutoSize = true, Checked = true, Margin = new Padding(3, 4, 3, 6) };
             flow.Controls.Add(_chkSameSize);
             AddButton(flow, "Clear This Feature", ClearSelected);
+        }
+
+        // The mouth's painted look: saved, and the expressions in the preview are made from neutral off it.
+        private void BuildBakedLookRows(FlowLayoutPanel flow)
+        {
+            var row = MakeRow();
+            row.Controls.Add(new Label { Text = "Baked mouth", Width = 110, Margin = new Padding(3, 6, 3, 3) });
+            _comboBaked = new ComboBox { Width = 110, DropDownStyle = ComboBoxStyle.DropDownList, Margin = new Padding(3, 3, 3, 3) };
+            _comboBaked.Items.AddRange(Presets);
+            _comboBaked.SelectedIndex = Math.Clamp(_bakedLook, 0, Presets.Length - 1);
+            _comboBaked.SelectedIndexChanged += (s, e) =>
+            {
+                _bakedLook = Math.Max(_comboBaked.SelectedIndex, 0);
+                _numBakedAmount.Enabled = _bakedLook > 0;
+                _dirty = true;
+                PushState();
+            };
+            row.Controls.Add(_comboBaked);
+            flow.Controls.Add(row);
+            _help.Add(row, "The expression the mouth is painted / sculpted in - most models come smiling (Joy). The mouth " +
+                           "bones take it back off, so Neutral moves the mouth to a neutral one and every expression's " +
+                           "mouth is made from there: Joy then adds nothing to a painted smile, Dejected frowns from " +
+                           "neutral rather than from the smile. Mouth shape only (smile, frown, wide, narrow) - the " +
+                           "painted opening and teeth are set below. Saved with the bones.");
+
+            var amountRow = MakeRow();
+            amountRow.Controls.Add(new Label { Text = "Baked amount %", Width = 110, Margin = new Padding(3, 6, 3, 3) });
+            _numBakedAmount = new NumericUpDown
+            {
+                Width = 110, Minimum = 0, Maximum = 100, Increment = 5, Margin = new Padding(3, 3, 3, 3),
+                Value = (decimal)Math.Round(_bakedAmount * 100f), Enabled = _bakedLook > 0,
+            };
+            _numBakedAmount.ValueChanged += (s, e) =>
+            {
+                _bakedAmount = (float)_numBakedAmount.Value / 100f;
+                _dirty = true;
+                PushState();
+            };
+            amountRow.Controls.Add(_numBakedAmount);
+            flow.Controls.Add(amountRow);
+            _help.Add(amountRow, "How far into the baked expression the painted mouth is: 100 = a full Joy smile, lower " +
+                                 "for a slight one. Raise it until Neutral looks neutral.");
         }
 
         private void BuildPreviewSection(FlowLayoutPanel flow)

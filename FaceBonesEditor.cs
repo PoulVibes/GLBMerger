@@ -44,6 +44,10 @@ namespace GlbMerger
         private readonly float[] _core = { DefaultCore, DefaultCore, DefaultCore, DefaultCore };
         private float _chinDrop = DefaultChinDrop;
         private readonly float[] _browTilt = new float[2];   // degrees; positive raises the region's outer end
+        // The look painted on the mouth (a Presets index; 0 = neutral) and how far into it, 0..1: expressions'
+        // mouth shapes are made from neutral, so the bones take this back off (FaceBones' "bakedLook").
+        private int _bakedLook;
+        private float _bakedAmount = 1f;
         private bool _dirty;
 
         private readonly HelpTips _help;
@@ -90,7 +94,7 @@ namespace GlbMerger
                 _regions[f] = ReadRegion(_model, node, _modelHeight);
                 if (node.Extras is not JsonObject o) continue;
                 ReadUnit(o, "core", ref _core[f]);
-                if (f == Mouth) { ReadMouthStyle(o); ReadMouthPoints(o); }
+                if (f == Mouth) { ReadMouthStyle(o); ReadMouthPoints(o); ReadBakedLook(o); }
                 if (f == Chin) ReadClamped(o, "drop", ref _chinDrop, 0f, 2f);
                 if (f < Mouth) ReadClamped(o, "tilt", ref _browTilt[f], -60f, 60f);
             }
@@ -112,7 +116,7 @@ namespace GlbMerger
                 var node = WriteRegion(_head, _meshToHead, existing, AnchorNames[f], _regions[f], _modelHeight);
                 if (node == null) continue;
                 var extras = new JsonObject { ["front"] = FrontRatio(_regions[f]), ["core"] = Math.Round(_core[f], 3) };
-                if (f == Mouth) { WriteMouthStyle(extras); WriteMouthPoints(extras); }
+                if (f == Mouth) { WriteMouthStyle(extras); WriteMouthPoints(extras); WriteBakedLook(extras); }
                 if (f == Chin) extras["drop"] = Math.Round(_chinDrop, 3);
                 if (f < Mouth) extras["tilt"] = Math.Round(_browTilt[f], 2);
                 node.Extras = extras;
@@ -133,6 +137,20 @@ namespace GlbMerger
             _dirty = false;
             _lblStatus.Text = result + " Save the GLB to keep them.";
             ReloadPreview();
+        }
+
+        private void ReadBakedLook(JsonObject o)
+        {
+            if (o["bakedLook"] is JsonNode n && n.GetValue<double>() is double v && v >= 0 && v < Presets.Length)
+                _bakedLook = (int)v;
+            ReadUnit(o, "bakedAmount", ref _bakedAmount);
+        }
+
+        private void WriteBakedLook(JsonObject extras)
+        {
+            if (_bakedLook <= 0 || _bakedAmount <= 0f) return;
+            extras["bakedLook"] = _bakedLook;
+            extras["bakedAmount"] = Math.Round(_bakedAmount, 3);
         }
 
         // ---- Editing ----------------------------------------------------------------------
@@ -198,6 +216,7 @@ namespace GlbMerger
                           $"\"showWeights\":{(_chkShowWeights.Checked ? "true" : "false")},\"selected\":{Selected}," +
                           $"\"showPoints\":{(_chkShowPoints.Checked ? "true" : "false")}," +
                           $"\"chinDrop\":{Inv(_chinDrop)},\"mouth\":{MouthJson()}," +
+                          $"\"bakedLook\":{_bakedLook},\"bakedAmount\":{Inv(_bakedAmount)}," +
                           $"\"mouthPoints\":{MouthPointsJson()},\"pickPoints\":{(_pickingMouthPoints ? "true" : "false")}}}";
             _webView.CoreWebView2.ExecuteScriptAsync($"setFace({json});");
         }
