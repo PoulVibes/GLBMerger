@@ -616,6 +616,10 @@ namespace GlbMerger
                     loopAnims1: loopAnims1, loopAnims2: loopAnims2,
                     loopFrameByName1: loopFrameAnims1, loopFrameByName2: loopFrameAnims2);
 
+                // Meshy models ship with many per-face normals, which light a smooth surface as
+                // visible triangles; every merge leaves with smooth shading instead.
+                ModelSmoother.SmoothNormals(latestMergedModel, ModelSmoother.DefaultCreaseAngle);
+
                 btnSave.Enabled = true;
                 btnSaveModel.Enabled = true;
                 btnEditModel.Enabled = true;

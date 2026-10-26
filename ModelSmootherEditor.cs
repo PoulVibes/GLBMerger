@@ -55,8 +55,8 @@ namespace GlbMerger
 
         private WebView2 _webView = null!;
         private CheckBox _chkPaintMode = null!;
-        private TrackBar _sliderBrush = null!, _sliderStrength = null!;
-        private Label _lblBrush = null!, _lblStrength = null!, _lblStatus = null!;
+        private TrackBar _sliderBrush = null!, _sliderStrength = null!, _sliderCrease = null!;
+        private Label _lblBrush = null!, _lblStrength = null!, _lblCrease = null!, _lblStatus = null!;
         private Button _btnRevert = null!;
 
         private bool _viewerReady;
@@ -143,6 +143,30 @@ namespace GlbMerger
                 "It runs continuously, not once per stroke - low strength held a moment is gentle, " +
                 "high strength (or holding longer) flattens fast and can round off nearby detail.");
 
+            _lblCrease = new Label { Text = "Crease angle: 60°", AutoSize = true, Margin = new Padding(3, 8, 3, 0) };
+            _sliderCrease = new TrackBar
+            {
+                Width = 330, Height = 45, Minimum = 10, Maximum = 120, Value = 60,
+                TickFrequency = 10, Margin = new Padding(3, 0, 3, 4),
+            };
+            _sliderCrease.ValueChanged += (s, e) => _lblCrease.Text = $"Crease angle: {_sliderCrease.Value}°";
+            flow.Controls.Add(_lblCrease);
+            flow.Controls.Add(_sliderCrease);
+
+            _help.Add(flow,
+                "Smooth Shading blends lighting across any two neighbouring faces bent less than this. " +
+                "Faces bent further keep a hard edge. Lower it if a sharp edge goes soft; raise it if " +
+                "facets still show.");
+
+            var btnSmoothShading = MakeButton("Smooth Shading (whole model)");
+            btnSmoothShading.Click += (s, e) => ApplySmoothShading();
+            flow.Controls.Add(btnSmoothShading);
+
+            _help.Add(flow,
+                "Recomputes every vertex normal from the faces around it, so a dense, smooth surface " +
+                "(a nose, a cheek) stops lighting as visible triangles. Only normals change - shape, " +
+                "UVs and skinning are untouched. Undone by Revert Smoothing.");
+
             _btnRevert = MakeButton("Revert Smoothing");
             _btnRevert.Enabled = false;
             _btnRevert.Click += (s, e) => RevertSmoothing();
@@ -176,6 +200,17 @@ namespace GlbMerger
             MinimumSize = new System.Drawing.Size(330, 0),
             Margin = new Padding(3, 3, 3, 3),
         };
+
+        private void ApplySmoothShading()
+        {
+            _originalPositions ??= ModelSmoother.SnapshotPositions(_model);
+            int changed = ModelSmoother.SmoothNormals(_model, _sliderCrease.Value);
+            _btnRevert.Enabled = true;
+
+            _lblStatus.Text = $"Smooth shading applied: {changed:N0} vertex normals changed " +
+                $"(crease {_sliderCrease.Value}°). Included the next time you save the merge.";
+            ReloadPreview();
+        }
 
         private void RevertSmoothing()
         {

@@ -20,6 +20,8 @@ static class Program
             return GroundFix(args);
         if (args.Length > 0 && args[0] == "--trim-clip")
             return TrimClip(args);
+        if (args.Length > 0 && args[0] == "--smooth-normals")
+            return SmoothNormalsFiles(args);
 
         ApplicationConfiguration.Initialize();
         Application.Run(new MainForm());
@@ -52,6 +54,37 @@ static class Program
                 foreach (var s in skipped)
                     Console.WriteLine($"  skipped (animated scale): {s}");
                 if (!dryRun && fixes.Count > 0) SaveReplacing(model, path);
+            }
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(ex.Message);
+            return 1;
+        }
+    }
+
+    // Headless: GlbMerger --smooth-normals [--dry-run] <a.glb> [b.glb ...]
+    // Rebuilds every vertex normal as smooth shading, in place, at the same crease angle the
+    // merge applies. See ModelSmoother.SmoothNormals.
+    private static int SmoothNormalsFiles(string[] args)
+    {
+        bool dryRun = args.Contains("--dry-run");
+        var paths = args.Skip(1).Where(a => a != "--dry-run").ToList();
+        if (paths.Count == 0)
+        {
+            Console.Error.WriteLine("usage: GlbMerger --smooth-normals [--dry-run] <a.glb> [b.glb ...]");
+            return 2;
+        }
+
+        try
+        {
+            foreach (var path in paths)
+            {
+                var model = ModelRoot.Load(path);
+                int changed = ModelSmoother.SmoothNormals(model, ModelSmoother.DefaultCreaseAngle);
+                Console.WriteLine($"{path}: {changed} normal(s) {(dryRun ? "would change" : "changed")}");
+                if (!dryRun && changed > 0) SaveReplacing(model, path);
             }
             return 0;
         }
