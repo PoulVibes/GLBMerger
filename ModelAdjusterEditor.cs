@@ -49,6 +49,14 @@ namespace GlbMerger
     // displacement is perpendicular to the bone in bind space, and skinning then carries it
     // through whatever the length adjustment did to the joints.
     //
+    // Direction is the length adjustment's rotational sibling: it swings one bone SEGMENT (a
+    // parent joint to one of its child joints) by rotating that child's local translation about
+    // the parent, instead of scaling it. It exists for branching bones like Hips, where rotating
+    // the joint itself turns the spine and both legs - i.e. the whole model - together, and there
+    // was no way to tilt just Hips -> Spine or Hips -> LeftUpLeg. The child's own orientation is
+    // left alone, so the subtree below is carried to its new position without being turned, and
+    // as with length the inverse binds are untouched so the mesh follows the moved joint.
+    //
     // One of the modes hosted by ModelEditorForm (see EditorMode there), which owns the window
     // chrome, so this control only contributes its own left-hand controls and 3D preview.
     public class ModelAdjusterEditor : UserControl, IUnappliedChanges
@@ -67,6 +75,9 @@ namespace GlbMerger
         private readonly TrackBar[] _sliderSize = new TrackBar[3];
         private readonly Label[] _lblSize = new Label[3];
         private CheckBox _chkUniformSize = null!;
+        private ComboBox _segmentDropdown = null!;
+        private readonly TrackBar[] _sliderAim = new TrackBar[3];
+        private readonly Label[] _lblAim = new Label[3];
         private Label _lblTargetInfo = null!, _lblMirrorInfo = null!, _lblStatus = null!;
         private CheckBox _chkMirror = null!, _chkShowBones = null!;
         private ComboBox _animDropdown = null!;
@@ -152,6 +163,45 @@ namespace GlbMerger
         // k*v + (k-1)*origin instead of k*v, and the limb overshoots by a whole joint offset.
         private readonly Dictionary<string, int> _pendingGroupSize = new(StringComparer.Ordinal);
         private readonly Dictionary<string, int> _appliedGroupSize = new(StringComparer.Ordinal);
+
+        // Segment direction, in whole degrees about the MODEL's X/Y/Z as the model stands in its
+        // bind pose (the axes the preview shows), keyed by the CHILD joint at the far end of the
+        // segment - that is the node whose translation actually rotates. Converted to the parent's
+        // local frame only when written, so the sliders mean the same thing on every bone however
+        // its parent happens to be oriented.
+        private readonly record struct AimDegrees(int X, int Y, int Z)
+        {
+            public static readonly AimDegrees Default = new(0, 0, 0);
+            public bool IsDefault => Equals(Default);
+            public int this[int axis] => axis == 0 ? X : axis == 1 ? Y : Z;
+            public AimDegrees With(int axis, int value) => axis switch
+            {
+                0 => this with { X = value },
+                1 => this with { Y = value },
+                _ => this with { Z = value },
+            };
+            // Reflected across the model's YZ plane (X is lateral on these rigs): a rotation's axis
+            // is a pseudovector, so its X component survives the reflection and Y/Z flip sign.
+            public AimDegrees Mirrored => new(X, -Y, -Z);
+            public Quaternion ModelRotation => Quaternion.CreateFromYawPitchRoll(
+                Y * MathF.PI / 180f, X * MathF.PI / 180f, Z * MathF.PI / 180f);
+        }
+
+        private const int MinAim = -180;
+        private const int MaxAim = 180;
+
+        private readonly Dictionary<string, AimDegrees> _pendingAim = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, AimDegrees> _appliedAim = new(StringComparer.Ordinal);
+
+        // What the direction sliders drive for the current selection: one segment of a bone, or
+        // every segment of a chain at once. Parallel to _segmentDropdown.Items.
+        private sealed record Segment(string Label, string[] Children);
+        private readonly List<Segment> _segments = new();
+
+        // A parent joint's world rotation in the bind pose, which is what turns a model-space aim
+        // into the parent-local rotation its child's translation lives in. Cached because nothing
+        // this editor writes changes a joint's rotation, and the first value is the right one.
+        private readonly Dictionary<Node, Quaternion> _bindWorldRotation = new();
 
         // A root joint's local scale before any branch size was applied, so repeated applies set an
         // absolute scale rather than compounding - the scale counterpart to _originalTranslation.
@@ -522,6 +572,36 @@ namespace GlbMerger
             groupSizeHost.Controls.Add(btnGroupBigger);
             lengthGroup.Controls.Add(groupSizeHost);
 
+            lengthGroup.Controls.Add(new Label
+            {
+                Text = "Direction (swings one segment about its parent joint):", AutoSize = true,
+                MaximumSize = new System.Drawing.Size(320, 0), Margin = new Padding(3, 8, 3, 2),
+            });
+            _segmentDropdown = new ComboBox { Width = 320, DropDownStyle = ComboBoxStyle.DropDownList, Margin = new Padding(3, 0, 3, 4) };
+            _segmentDropdown.SelectedIndexChanged += (s, e) => RefreshUiFromState();
+            lengthGroup.Controls.Add(_segmentDropdown);
+
+            for (int axis = 0; axis < 3; axis++)
+            {
+                int a = axis;
+                _lblAim[a] = new Label { Text = AimLabel(a, 0), AutoSize = true, Margin = new Padding(3, 0, 3, 0) };
+                lengthGroup.Controls.Add(_lblAim[a]);
+
+                _sliderAim[a] = new TrackBar
+                {
+                    Width = 300, Height = 45, Minimum = MinAim, Maximum = MaxAim, Value = 0,
+                    TickFrequency = 15, Margin = new Padding(3, 0, 3, 4),
+                };
+                _sliderAim[a].ValueChanged += (s, e) => OnAimChanged(a);
+                var (btnLess, btnMore) = SliderNudge.Attach(_sliderAim[a]);
+
+                var aimHost = new Panel { Width = 306, Height = 45, Margin = new Padding(3, 0, 3, 4) };
+                aimHost.Controls.Add(btnLess);
+                aimHost.Controls.Add(_sliderAim[a]);
+                aimHost.Controls.Add(btnMore);
+                lengthGroup.Controls.Add(aimHost);
+            }
+
             _chkMirror = new CheckBox
             {
                 Text = "Mirror left / right", AutoSize = true, Checked = true, Margin = new Padding(3, 2, 3, 0),
@@ -613,6 +693,8 @@ namespace GlbMerger
                 _sliderThickness.Enabled = false;
                 foreach (var slider in _sliderSize) slider.Enabled = false;
                 _sliderGroupSize.Enabled = false;
+                foreach (var slider in _sliderAim) slider.Enabled = false;
+                _segmentDropdown.Enabled = false;
                 _chkUniformSize.Enabled = false;
                 _chkMirror.Enabled = false;
                 _chkShowBones.Enabled = false;
@@ -641,6 +723,48 @@ namespace GlbMerger
         private static readonly string[] AxisNames = { "X (width)", "Y (height)", "Z (depth)" };
         private static string SizeLabel(int axis, int percent) => $"Size {AxisNames[axis]}: {percent}%";
         private static string GroupSizeLabel(int percent) => $"Size, whole branch: {percent}%";
+        private static readonly string[] AimAxisNames = { "Tilt about X (pitch)", "Turn about Y (yaw)", "Roll about Z" };
+        private static string AimLabel(int axis, int degrees) => $"{AimAxisNames[axis]}: {degrees}°";
+
+        private AimDegrees AimOf(string child) => _pendingAim.TryGetValue(child, out var v) ? v : AimDegrees.Default;
+
+        private Segment? SelectedSegment =>
+            _segmentDropdown.SelectedIndex >= 0 && _segmentDropdown.SelectedIndex < _segments.Count
+                ? _segments[_segmentDropdown.SelectedIndex]
+                : null;
+
+        // A lone bone lists each of its segments separately - on Hips that is the spine and the
+        // two legs, which is the whole reason this adjustment exists. A chain gets one entry that
+        // swings every segment in it together, which tilts the whole limb about its root joint.
+        private void RebuildSegmentList()
+        {
+            _segments.Clear();
+            _segmentDropdown.Items.Clear();
+
+            var target = SelectedTarget;
+            if (target != null)
+            {
+                if (target.IsGroup)
+                {
+                    var children = target.Bones
+                        .SelectMany(b => _bonesByName.TryGetValue(b, out var n) ? JointChildren(n) : Enumerable.Empty<Node>())
+                        .Where(c => !string.IsNullOrEmpty(c.Name))
+                        .Select(c => c.Name!)
+                        .Distinct(StringComparer.Ordinal)
+                        .ToArray();
+                    if (children.Length > 0)
+                        _segments.Add(new Segment($"Whole chain ({children.Length} segments)", children));
+                }
+                else if (_bonesByName.TryGetValue(target.Bones[0], out var node))
+                {
+                    foreach (var child in JointChildren(node).Where(c => !string.IsNullOrEmpty(c.Name)))
+                        _segments.Add(new Segment($"{target.Bones[0]} → {child.Name}", new[] { child.Name! }));
+                }
+            }
+
+            foreach (var segment in _segments) _segmentDropdown.Items.Add(segment.Label);
+            if (_segments.Count > 0) _segmentDropdown.SelectedIndex = 0;
+        }
 
         private int PercentOf(string bone) => _pendingPercent.TryGetValue(bone, out var v) ? v : DefaultPercent;
         private int ThicknessOf(string bone) => _pendingThickness.TryGetValue(bone, out var v) ? v : DefaultPercent;
@@ -710,6 +834,7 @@ namespace GlbMerger
 
         private void OnTargetSelected()
         {
+            RebuildSegmentList();
             RefreshUiFromState();
             PushSelectionToPreview();
         }
@@ -738,13 +863,31 @@ namespace GlbMerger
             bool canSize = _skinnedPrimitives.Count > 0;
             bool canGroupSize = canSize && HasLength(target.Bones[0]);
 
+            var segment = SelectedSegment;
+            bool canAim = segment != null;
+            // A chain whose segments were swung separately shows 0 rather than one member's value.
+            var aim = segment == null || segment.Children.Select(AimOf).Distinct().Count() > 1
+                ? AimDegrees.Default
+                : AimOf(segment.Children[0]);
+
             _suppressEvents = true;
             _sliderLength.Value = Math.Clamp(percent, MinPercent, MaxPercent);
             _sliderThickness.Value = Math.Clamp(thickness, MinPercent, MaxPercent);
             for (int axis = 0; axis < 3; axis++)
                 _sliderSize[axis].Value = Math.Clamp(size[axis], MinPercent, MaxPercent);
             _sliderGroupSize.Value = Math.Clamp(groupSize, MinPercent, MaxPercent);
+            for (int axis = 0; axis < 3; axis++)
+                _sliderAim[axis].Value = Math.Clamp(aim[axis], MinAim, MaxAim);
             _suppressEvents = false;
+
+            _segmentDropdown.Enabled = canAim;
+            for (int axis = 0; axis < 3; axis++)
+            {
+                _sliderAim[axis].Enabled = canAim;
+                _lblAim[axis].Text = canAim
+                    ? AimLabel(axis, aim[axis])
+                    : $"{AimAxisNames[axis]}: n/a (no joint below this bone)";
+            }
 
             _sliderLength.Enabled = canLength;
             _sliderThickness.Enabled = canThickness;
@@ -860,6 +1003,30 @@ namespace GlbMerger
             PushGroupSizeToPreview();
         }
 
+        // Mirroring swings the counterpart segment the opposite way about Y and Z, so a left leg
+        // pushed outward has its right leg pushed outward too rather than both drifting the same
+        // way. A segment with no counterpart (Hips -> Spine) simply has nothing to mirror onto.
+        private void OnAimChanged(int axis)
+        {
+            if (_suppressEvents) return;
+            var segment = SelectedSegment;
+            if (segment == null) return;
+
+            int degrees = _sliderAim[axis].Value;
+            foreach (var child in segment.Children)
+            {
+                var aim = AimOf(child).With(axis, degrees);
+                _pendingAim[child] = aim;
+
+                var mirror = _chkMirror.Checked ? GetMirrorBoneName(child) : null;
+                if (mirror != null && !segment.Children.Contains(mirror, StringComparer.Ordinal))
+                    _pendingAim[mirror] = aim.Mirrored;
+            }
+
+            RefreshUiFromState();
+            PushAimsToPreview();
+        }
+
         // Every bone the slider should drive for this target: its own bones, plus their opposite-
         // side counterparts when Mirror is on. A group mirrors member by member, which lands
         // exactly on the counterpart chain without needing to know the two are paired.
@@ -906,6 +1073,12 @@ namespace GlbMerger
                     _pendingThickness[mirror] = ThicknessOf(bone);
                     _pendingSize[mirror] = SizeOf(bone);
                 }
+                foreach (var child in SelectedSegment?.Children ?? Array.Empty<string>())
+                {
+                    var mirror = GetMirrorBoneName(child);
+                    if (mirror != null) _pendingAim[mirror] = AimOf(child).Mirrored;
+                }
+                PushAimsToPreview();
                 PushLengthsToPreview();
                 PushThicknessToPreview();
                 PushSizeToPreview();
@@ -942,6 +1115,7 @@ namespace GlbMerger
                 .Union(Unapplied(_pendingThickness, _appliedThickness), StringComparer.Ordinal)
                 .Union(UnappliedSizes(), StringComparer.Ordinal)
                 .Union(Unapplied(_pendingGroupSize, _appliedGroupSize), StringComparer.Ordinal)
+                .Union(UnappliedAims(), StringComparer.Ordinal)
                 .Count();
 
             _lblStatus.Text = unapplied == 0
@@ -968,10 +1142,12 @@ namespace GlbMerger
 
         public bool HasUnappliedChanges =>
             UnappliedLengths().Any() || Unapplied(_pendingThickness, _appliedThickness).Any()
-            || UnappliedSizes().Any() || Unapplied(_pendingGroupSize, _appliedGroupSize).Any();
+            || UnappliedSizes().Any() || Unapplied(_pendingGroupSize, _appliedGroupSize).Any()
+            || UnappliedAims().Any();
         public string UnappliedChangesDescription => "bone adjustments";
 
         private IEnumerable<string> UnappliedSizes() => Unapplied(_pendingSize, _appliedSize, ScalePercent.Default);
+        private IEnumerable<string> UnappliedAims() => Unapplied(_pendingAim, _appliedAim, AimDegrees.Default);
 
         // Length's own version of the above: what gets compared is the COMBINED factor, since a
         // bone can be out of date because its own length slider moved or because the group scale
@@ -1012,8 +1188,9 @@ namespace GlbMerger
 
             int thickened = ApplyThickness();
             int scaled = ApplyGroupSizes();
+            int aimed = ApplyAims();
 
-            if (changed == 0 && thickened == 0 && scaled == 0)
+            if (changed == 0 && thickened == 0 && scaled == 0 && aimed == 0)
             {
                 UpdateStatus("Nothing to apply — the model already matches the sliders.");
                 return;
@@ -1026,15 +1203,17 @@ namespace GlbMerger
                 status += (status.Length > 0 ? " " : "") + $"Rebuilt {thickened} mesh vertex buffer(s) for the thickness/size change.";
             if (scaled > 0)
                 status += (status.Length > 0 ? " " : "") + $"Scaled {scaled} whole branch(es) from their root joint.";
+            if (aimed > 0)
+                status += (status.Length > 0 ? " " : "") + $"Re-aimed {aimed} bone segment(s) in the bind pose and all animations.";
             if (_skippedPrimitives > 0)
                 status += $" {_skippedPrimitives} primitive(s) with compressed positions were skipped by the vertex pass.";
             // Both of these are properties of the file rather than of anything this editor did, but
             // they are the two cases where a clip can silently keep the old proportions, so they
             // are worth surfacing at the moment the lengths are written. Thickness is immune to
             // both - it never touches animation data - so they only apply when a length was.
-            if (changed > 0 && unnamedAnimations > 0)
+            if ((changed > 0 || aimed > 0) && unnamedAnimations > 0)
                 status += $" {unnamedAnimations} unnamed animation(s) were skipped.";
-            if (changed > 0 && duplicateNames.Count > 0)
+            if ((changed > 0 || aimed > 0) && duplicateNames.Count > 0)
                 status += $" Animations sharing a name ({string.Join(", ", duplicateNames)}) were only written once.";
             UpdateStatus(status);
         }
@@ -1056,26 +1235,89 @@ namespace GlbMerger
                 return false;
             }
 
-            foreach (var child in JointChildren(node))
-            {
-                child.WithLocalTranslation(GetOriginalTranslation(child) * factor);
-
-                foreach (var anim in _model.LogicalAnimations)
-                {
-                    if (string.IsNullOrEmpty(anim.Name)) continue;
-
-                    var keys = GetOriginalAnimKeys(child, anim);
-                    // No translation channel in this clip means the (already scaled) node
-                    // translation is what the clip uses, so there is nothing else to write.
-                    if (keys == null) continue;
-
-                    child.WithTranslationAnimation(anim.Name,
-                        keys.Select(k => (k.Time, k.Value * factor)).ToArray());
-                }
-            }
-
+            // Recorded BEFORE the children are written: WriteChildTranslation reads the applied
+            // factor, not the pending one, so each pass commits only its own adjustment.
             _appliedLengthFactor[bone] = factor;
+            foreach (var child in JointChildren(node)) WriteChildTranslation(child);
             return true;
+        }
+
+        // A child joint's translation is shaped by two adjustments - its parent's length and its
+        // own segment direction - so both passes rebuild it through this one place from the
+        // pristine value, using what is APPLIED for each. That way a length Apply never bakes in a
+        // direction that is still only pending (or vice versa), and either can be redone or reset
+        // without disturbing the other.
+        private void WriteChildTranslation(Node child)
+        {
+            var parentName = child.VisualParent?.Name;
+            float factor = parentName != null && _appliedLengthFactor.TryGetValue(parentName, out var f) ? f : 1f;
+            var rotation = child.Name != null && _appliedAim.TryGetValue(child.Name, out var aim)
+                ? LocalAimRotation(child, aim)
+                : Quaternion.Identity;
+
+            Vector3 Adjust(Vector3 original) => Vector3.Transform(original * factor, rotation);
+
+            child.WithLocalTranslation(Adjust(GetOriginalTranslation(child)));
+
+            foreach (var anim in _model.LogicalAnimations)
+            {
+                if (string.IsNullOrEmpty(anim.Name)) continue;
+
+                var keys = GetOriginalAnimKeys(child, anim);
+                // No translation channel in this clip means the (already adjusted) node
+                // translation is what the clip uses, so there is nothing else to write.
+                if (keys == null) continue;
+
+                child.WithTranslationAnimation(anim.Name,
+                    keys.Select(k => (k.Time, Adjust(k.Value))).ToArray());
+            }
+        }
+
+        // The model-space aim re-expressed in the parent's local frame, which is where the child's
+        // translation lives: P^-1 * R * P, with P the parent's bind-pose world rotation. Fixed per
+        // segment rather than recomputed per animation frame, so an animated parent carries the
+        // swung segment around with it exactly as it carried the original one.
+        private Quaternion LocalAimRotation(Node child, AimDegrees aim)
+        {
+            if (aim.IsDefault) return Quaternion.Identity;
+            var parent = child.VisualParent;
+            var p = parent == null ? Quaternion.Identity : BindWorldRotation(parent);
+            return Quaternion.Normalize(Quaternion.Inverse(p) * aim.ModelRotation * p);
+        }
+
+        private Quaternion BindWorldRotation(Node node)
+        {
+            if (_bindWorldRotation.TryGetValue(node, out var cached)) return cached;
+            var rotation = Matrix4x4.Decompose(node.WorldMatrix, out _, out var r, out _)
+                ? Quaternion.Normalize(r)
+                : Quaternion.Identity;
+            _bindWorldRotation[node] = rotation;
+            return rotation;
+        }
+
+        // Writes every segment whose dialled-in direction differs from what is baked. Returns how
+        // many child joints were rewritten.
+        private int ApplyAims()
+        {
+            int written = 0;
+            foreach (var child in UnappliedAims().ToList())
+            {
+                var aim = AimOf(child);
+                if (aim.IsDefault) _appliedAim.Remove(child);
+                else _appliedAim[child] = aim;
+
+                if (!_bonesByName.TryGetValue(child, out var node)) continue;
+                WriteChildTranslation(node);
+                written++;
+            }
+            return written;
+        }
+
+        private void ResetAim(string child)
+        {
+            _pendingAim.Remove(child);
+            if (_appliedAim.Remove(child) && _bonesByName.TryGetValue(child, out var node))
+                WriteChildTranslation(node);
         }
 
         // Rebuilds every skinned vertex buffer from its pristine copy, applying ALL bones' pending
@@ -1327,7 +1569,8 @@ namespace GlbMerger
             PushThicknessToPreview();
             PushSizeToPreview();
             PushGroupSizeToPreview();
-            UpdateStatus($"Reset {bones.Count} bone(s) to their original length, thickness and size.");
+            PushAimsToPreview();
+            UpdateStatus($"Reset {bones.Count} bone(s) to their original length, thickness, size and direction.");
         }
 
         private void ResetAllBones()
@@ -1342,6 +1585,8 @@ namespace GlbMerger
                          .Concat(_appliedGroupSize.Keys)
                          .Distinct(StringComparer.Ordinal).ToList())
                 ResetBone(name);
+            foreach (var child in _pendingAim.Keys.Concat(_appliedAim.Keys).Distinct(StringComparer.Ordinal).ToList())
+                ResetAim(child);
             ApplyThickness();
             ApplyGroupSizes();
 
@@ -1350,7 +1595,8 @@ namespace GlbMerger
             PushThicknessToPreview();
             PushSizeToPreview();
             PushGroupSizeToPreview();
-            UpdateStatus("Reset all bones to their original length, thickness and size.");
+            PushAimsToPreview();
+            UpdateStatus("Reset all bones to their original length, thickness, size and direction.");
         }
 
         // Clears the pending values, and - only if this bone's length was already written to the
@@ -1370,6 +1616,18 @@ namespace GlbMerger
 
             _pendingThickness.Remove(bone);
             _pendingSize.Remove(bone);
+
+            // Direction is keyed by the child at the far end of each segment, so resetting a bone
+            // straightens its own segments - and their mirrors, since that is where Mirror put the
+            // counterpart even when the bone itself (Hips) has no left/right twin.
+            if (!_bonesByName.TryGetValue(bone, out var node)) return;
+            foreach (var child in JointChildren(node))
+            {
+                if (string.IsNullOrEmpty(child.Name)) continue;
+                ResetAim(child.Name);
+                var mirror = _chkMirror.Checked ? GetMirrorBoneName(child.Name) : null;
+                if (mirror != null) ResetAim(mirror);
+            }
         }
 
         // ---------------------------------------------------------------------------------------
@@ -1432,6 +1690,23 @@ namespace GlbMerger
             foreach (var (bone, percent) in _pendingGroupSize) factors[bone] = percent / 100f;
 
             CallJs("setBranchScales", factors);
+        }
+
+        // Child joint -> the parent-local rotation to put on its translation, as [x, y, z, w]. Sent
+        // already converted so the preview applies exactly the quaternion the bake will.
+        private void PushAimsToPreview()
+        {
+            if (!_viewerReady) return;
+
+            var rotations = new Dictionary<string, float[]>(StringComparer.Ordinal);
+            foreach (var (child, aim) in _pendingAim)
+            {
+                if (aim.IsDefault || !_bonesByName.TryGetValue(child, out var node)) continue;
+                var q = LocalAimRotation(node, aim);
+                rotations[child] = new[] { q.X, q.Y, q.Z, q.W };
+            }
+
+            CallJs("setAimRotations", rotations);
         }
 
         private void PushSelectionToPreview()
@@ -1528,6 +1803,7 @@ namespace GlbMerger
                 PushLengthsToPreview();
                 PushThicknessToPreview();
                 PushSizeToPreview();
+                PushAimsToPreview();
                 PushSelectionToPreview();
                 PushShowBones();
             };
@@ -1632,6 +1908,9 @@ namespace GlbMerger
                         // no such bookkeeping and can't accumulate rounding error.
                         var animatedPos = {};
                         var appliedFactors = {};
+                        // Child bone name -> { q, inv }: the parent-local rotation that swings its
+                        // segment (see setAimRotations), plus its inverse for unapplyLengths.
+                        var aimRotations = {};
 
                         // The skeleton overlay: one sphere per joint, one capsule-ish cylinder per
                         // bone segment. Both are added to `scene` rather than parented to the bones
@@ -1686,6 +1965,20 @@ namespace GlbMerger
                             for (var old in lengthFactors)
                                 if (!(old in next)) next[old] = 1;
                             lengthFactors = next;
+                        };
+
+                        window.setAimRotations = function (json) {
+                            var raw = JSON.parse(json);
+                            var next = {};
+                            for (var name in raw) {
+                                var r = raw[name];
+                                var q = new THREE.Quaternion(r[0], r[1], r[2], r[3]);
+                                next[sanitize(name)] = { q: q, inv: q.clone().invert() };
+                            }
+                            // Same carry-forward rule as the length factors, at identity.
+                            for (var old in aimRotations)
+                                if (!(old in next)) next[old] = { q: new THREE.Quaternion(), inv: new THREE.Quaternion() };
+                            aimRotations = next;
                         };
 
                         window.setThicknessFactors = function (json) {
@@ -1859,23 +2152,36 @@ namespace GlbMerger
                         function unapplyLengths() {
                             for (var name in appliedFactors) {
                                 var bone = bonesByName[name];
-                                if (bone) bone.position.multiplyScalar(1 / appliedFactors[name]);
+                                var applied = appliedFactors[name];
+                                if (!bone) continue;
+                                if (applied.aim) bone.position.applyQuaternion(applied.aim.inv);
+                                bone.position.multiplyScalar(1 / applied.factor);
                             }
                             appliedFactors = {};
                         }
 
+                        // Length and direction both reshape a child's translation - scaled first,
+                        // then rotated about the parent, the same order WriteChildTranslation
+                        // bakes them in.
                         function applyLengths() {
-                            for (var name in lengthFactors) {
+                            var names = {};
+                            for (var n in lengthFactors) names[n] = true;
+                            for (var n2 in aimRotations) names[n2] = true;
+
+                            for (var name in names) {
                                 var bone = bonesByName[name];
                                 if (!bone) continue;
-                                var factor = lengthFactors[name];
+                                var factor = lengthFactors[name] !== undefined ? lengthFactors[name] : 1;
+                                var aim = aimRotations[name] || null;
                                 if (animatedPos[name]) {
-                                    if (factor !== 1) {
+                                    if (factor !== 1 || aim) {
                                         bone.position.multiplyScalar(factor);
-                                        appliedFactors[name] = factor;
+                                        if (aim) bone.position.applyQuaternion(aim.q);
+                                        appliedFactors[name] = { factor: factor, aim: aim };
                                     }
                                 } else if (bindPos[name]) {
                                     bone.position.copy(bindPos[name]).multiplyScalar(factor);
+                                    if (aim) bone.position.applyQuaternion(aim.q);
                                 }
                             }
 

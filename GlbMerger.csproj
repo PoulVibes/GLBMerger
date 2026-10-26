@@ -9,6 +9,8 @@
     <!-- MeshoptNative passes raw pointers to meshoptimizer's C API. -->
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <NoWarn>$(NoWarn);MSB3277;WFO1000</NoWarn>
+    <!-- tools/ holds separate projects (e.g. tools/LayoutCheck) that must not be compiled into the app. -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);tools/**</DefaultItemExcludes>
   </PropertyGroup>
 
   <ItemGroup>
