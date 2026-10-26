@@ -205,6 +205,9 @@ namespace GlbMerger
                 if (_suppressEvents) return;
                 _mouth.SculptedLips = _chkSculpted.Checked;
                 UpdateSculptedRows();
+                RefreshMouthPointUi();
+                if (_mouth.SculptedLips && !LowerLipRigged())
+                    _lblStatus.Text = "Sculpted lips: Save Bones && Weights to rig the jaw - the lips can't part until then.";
                 MouthEdited();
             };
             flow.Controls.Add(_chkSculpted);
@@ -212,7 +215,8 @@ namespace GlbMerger
                                     "mouth points' line, so opening the mouth parts the model's own lips, and only the " +
                                     "inside of the mouth is drawn, in the gap. Chin drop sets how far they part. No drawn " +
                                     "lips or skin mask, so their settings are greyed out; the teeth, tongue and inside " +
-                                    "colours and sizes still apply. Needs the mouth points and a chin region; Save to re-weight.");
+                                    "colours and sizes still apply. Lips modelled apart: set Painted open so the jaw can shut them. Needs the mouth points and a " +
+                                    "chin region, and Save Bones & Weights to rig the jaw before the preview can part the lips.");
             _seamBandRow = AddMouthNumber(flow, "Lip seam band", 0.01m, 2m, 0.02m, () => _mouth.SeamBand, v => _mouth.SeamBand = v,
                 "Sculpted lips: how far either side of the lip line (region units) the triangles bridging the lips " +
                 "reach - the inside is drawn on them as they stretch open. Raise it if the inside stops short of the lips.").Parent!;
@@ -239,12 +243,13 @@ namespace GlbMerger
                 "Height of the lip line at the corners: above the middle for a smile, below for a frown." + fromPoints));
             _lipLineNumbers.Add(AddMouthNumber(flow, "Lip width %", 5m, 100m, 1m, () => m.LipWidthPct, v => m.LipWidthPct = v,
                 "How far the lip line runs either side, % of the region's width." + fromPoints, 0));
-            DrawnOnly(AddMouthNumber(flow, "Painted open", 0m, 1m, 0.05m, () => m.BaseOpen,
+            AddMouthNumber(flow, "Painted open", 0m, 1m, 0.05m, () => m.BaseOpen,
                 v => { m.BaseOpen = v; _sliderOpen.Value = (int)Math.Round(v * 100f); },
                 "For a model painted with its mouth open (a grin): how open that is, as the drawn mouth would be. " +
                 "It then rests there, drawn over the paint with lips round it: expressions open it further and " +
                 "drop the chin, talking can shut it - the lips close over the painted mouth and the chin rises. " +
-                "0 = painted shut, 1 = painted fully open."));
+                "0 = painted shut, 1 = painted fully open. Sculpted lips modelled apart (teeth showing between " +
+                "them): the jaw rises Painted open x Chin drop to shut them - set both so Test open 0 just closes them.");
             DrawnOnly(AddMouthNumber(flow, "Open distance", 0m, 5m, 0.05m, () => m.OpenDepth, v => m.OpenDepth = v,
                 "How far below the lip line a fully open mouth reaches, region units. Expressions and talking " +
                 "open it part way. (Sculpted lips: the Chin drop sets how far they part.)"));

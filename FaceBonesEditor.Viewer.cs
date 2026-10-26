@@ -545,7 +545,7 @@ vec4 MouthSculpted(vec2 f, vec2 d, float restX[5], vec4 moves[5], vec3 chin, flo
         }
 
         // A move (body axes, mesh units) and a turn about body z, as FaceBones::MotionFor.
-        function motionFor(d, face, s, openFromRest) {
+        function motionFor(d, face, s, openFromRest, shut) {
             var move = [0, 0, 0], turn = 0;
             if (d.face === 'brow') {
                 var innerDrop = (0.40 * w(face, 'sad') - 0.40 * w(face, 'furrow')) * s * d.unit;
@@ -559,9 +559,10 @@ vec4 MouthSculpted(vec2 f, vec2 d, float restX[5], vec4 moves[5], vec3 chin, flo
                 move[1] = ((0.45 * w(face, 'smile') - 0.40 * w(face, 'frown')) * a2 - 0.10 * w(face, 'smile') * (1 - a2)) * s * d.unit;
                 move[0] = a * (0.12 * w(face, 'grit') + 0.15 * w(face, 'smile') - 0.30 * w(face, 'pucker')) * s * d.halfWidth;
                 move[1] += roundLift(d, w(face, 'round'), openFromRest);
+                if (d.face === 'mouthLower') move[1] += (d.close || 0) * shut;   // modelled apart: up to meet the upper lip
             } else if (d.face === 'chin') {
                 // The panel's Chin drop, not the saved one, so it can be tuned before saving.
-                move[1] = -(state ? state.chinDrop : d.drop) * openFromRest * d.unit;
+                move[1] = -(state ? state.chinDrop : d.drop) * (lipsClose ? Math.max(openFromRest, 0) : openFromRest) * d.unit;
             }
             return { move: move, turn: turn };
         }
@@ -615,6 +616,7 @@ vec4 MouthSculpted(vec2 f, vec2 d, float restX[5], vec4 moves[5], vec3 chin, flo
         }
 
         var faceBones = [];   // { bone, d (extras), restPos, restQuat, toLocal (mesh -> parent-local), axis }
+        var lipsClose = false;   // the lower lip's bones shut a mouth modelled apart (FaceBones::Build)
         function onLoaded() {
             scene.updateMatrixWorld(true);
             var idx = [];
@@ -629,6 +631,7 @@ vec4 MouthSculpted(vec2 f, vec2 d, float restX[5], vec4 moves[5], vec3 chin, flo
                     var meshToWorld = new THREE.Matrix4().multiplyMatrices(b.matrixWorld, m.skeleton.boneInverses[i]);
                     var parentInv = new THREE.Matrix4().copy(b.parent.matrixWorld).invert();
                     var toLocal = new THREE.Matrix3().setFromMatrix4(new THREE.Matrix4().multiplyMatrices(parentInv, meshToWorld));
+                    if (b.userData.face === 'mouthLower' && b.userData.close > 0) lipsClose = true;
                     faceBones.push({ bone: b, d: b.userData, restPos: b.position.clone(), restQuat: b.quaternion.clone(),
                                      toLocal: toLocal, axis: new THREE.Vector3(0, 0, 1).applyMatrix3(toLocal).normalize() });
                 });
@@ -642,6 +645,7 @@ vec4 MouthSculpted(vec2 f, vec2 d, float restX[5], vec4 moves[5], vec3 chin, flo
         // ---- Mouth points (FaceBonesEditor.MouthPoints.cs): dots on the picked points, the line
         // through them, and dragging a dot along the surface ----
         var pointDots = [], pointLine = null, dragging = -1, pointHintShown = false;
+        var lowerDots = [], lowerLine = null, draggingLower = false;
         // A bind-pose mesh point where it's drawn now: through the head bone, as three's skinning does
         // (the face rides the head), so a dot sits on the painted feature whatever the rest pose.
         function meshToWorld(p) {
@@ -652,31 +656,36 @@ vec4 MouthSculpted(vec2 f, vec2 d, float restX[5], vec4 moves[5], vec3 chin, flo
                     .applyMatrix4(headBone.matrixWorld).applyMatrix4(m.bindMatrixInverse).applyMatrix4(m.matrixWorld);
         }
 
-        function showMouthPoints(points) {
-            if (!meshes.length) return;
-            while (pointDots.length > points.length) scene.remove(pointDots.pop());
-            while (pointDots.length < points.length) {
+        // The upper (yellow) or lower lip's (cyan) dots and the line through them; returns the line.
+        function showPoints(dots, line, points, color) {
+            if (!meshes.length) return line;
+            while (dots.length > points.length) scene.remove(dots.pop());
+            while (dots.length < points.length) {
                 var dot = new THREE.Mesh(new THREE.SphereGeometry(modelHeight * 0.0035, 12, 8),
-                                         new THREE.MeshBasicMaterial({ color: 0xffd400, depthTest: false }));
+                                         new THREE.MeshBasicMaterial({ color: color, depthTest: false }));
                 dot.renderOrder = 10;
                 scene.add(dot);
-                pointDots.push(dot);
+                dots.push(dot);
             }
-            points.forEach(function (p, i) { pointDots[i].position.copy(meshToWorld(p)); });
-            if (pointLine) { scene.remove(pointLine); pointLine = null; }
+            points.forEach(function (p, i) { dots[i].position.copy(meshToWorld(p)); });
+            if (line) { scene.remove(line); line = null; }
             if (points.length > 1) {
-                pointLine = new THREE.Line(new THREE.BufferGeometry().setFromPoints(points.map(meshToWorld)),
-                                           new THREE.LineBasicMaterial({ color: 0xffd400, depthTest: false }));
-                pointLine.renderOrder = 10;
-                scene.add(pointLine);
+                line = new THREE.Line(new THREE.BufferGeometry().setFromPoints(points.map(meshToWorld)),
+                                      new THREE.LineBasicMaterial({ color: color, depthTest: false }));
+                line.renderOrder = 10;
+                scene.add(line);
             }
+            return line;
         }
+        function showMouthPoints(points) { pointLine = showPoints(pointDots, pointLine, points, 0xffd400); }
+        function showLowerPoints(points) { lowerLine = showPoints(lowerDots, lowerLine, points, 0x00d4ff); }
 
-        // The dot under the pointer (within 10 px), or -1.
-        function dotAt(event) {
+        // The dot under the pointer (within 10 px) among `dots`, or -1.
+        function dotAt(event, dots) {
+            dots = dots || pointDots;
             var rect = canvas.getBoundingClientRect();
-            for (var i = 0; i < pointDots.length; i++) {
-                var v = pointDots[i].position.clone().project(camera);
+            for (var i = 0; i < dots.length; i++) {
+                var v = dots[i].position.clone().project(camera);
                 var x = (v.x + 1) / 2 * rect.width + rect.left, y = (1 - v.y) / 2 * rect.height + rect.top;
                 if (Math.abs(x - event.clientX) < 10 && Math.abs(y - event.clientY) < 10) return i;
             }
@@ -696,18 +705,23 @@ vec4 MouthSculpted(vec2 f, vec2 d, float restX[5], vec4 moves[5], vec3 chin, flo
         // Capture phase: decided before the orbit controls see the press.
         function initMouthPointDrag() {
             canvas.addEventListener('pointerdown', function (event) {
-                if (!state || state.pickPoints) return;
-                dragging = dotAt(event);
+                if (!state || state.pickPoints || state.pickLower) return;
+                dragging = dotAt(event, pointDots);
+                draggingLower = false;
+                if (dragging < 0) { dragging = dotAt(event, lowerDots); draggingLower = dragging >= 0; }
                 if (dragging >= 0) { controls.enabled = false; event.stopPropagation(); }
             }, true);
             canvas.addEventListener('pointermove', function (event) {
                 if (dragging < 0) return;
                 var p = surfaceAt(event);
-                if (p) { state.mouthPoints[dragging] = p; showMouthPoints(state.mouthPoints); }
+                if (!p) return;
+                if (draggingLower) { state.lowerPoints[dragging] = p; showLowerPoints(state.lowerPoints); }
+                else { state.mouthPoints[dragging] = p; showMouthPoints(state.mouthPoints); }
             });
             window.addEventListener('pointerup', function () {
                 if (dragging < 0) return;
-                post({ action: 'mouthPointMoved', i: dragging, p: state.mouthPoints[dragging] });
+                if (draggingLower) post({ action: 'lowerPointMoved', i: dragging, p: state.lowerPoints[dragging] });
+                else post({ action: 'mouthPointMoved', i: dragging, p: state.mouthPoints[dragging] });
                 dragging = -1;
                 controls.enabled = true;
             });
@@ -726,9 +740,11 @@ vec4 MouthSculpted(vec2 f, vec2 d, float restX[5], vec4 moves[5], vec3 chin, flo
 
         function applyFace() {
             var s = state ? state.strength : 1, face = lessBaked(faceFor(state), s);
-            var open = state ? mouthOpen(state) - (state.mouth.baseOpen || 0) : 0;   // from the painted opening
+            var base = state ? state.mouth.baseOpen || 0 : 0;
+            var open = state ? mouthOpen(state) - base : 0;   // from the painted opening
+            var shut = base > 0 ? Math.min(Math.max(-open / base, 0), 1) : 0;
             faceBones.forEach(function (fb) {
-                var m = motionFor(fb.d, face, s, open);
+                var m = motionFor(fb.d, face, s, open, shut);
                 fb.bone.position.copy(fb.restPos).add(new THREE.Vector3(m.move[0], m.move[1], m.move[2]).applyMatrix3(fb.toLocal));
                 fb.bone.quaternion.copy(new THREE.Quaternion().setFromAxisAngle(fb.axis, m.turn).multiply(fb.restQuat));
             });
@@ -737,6 +753,7 @@ vec4 MouthSculpted(vec2 f, vec2 d, float restX[5], vec4 moves[5], vec3 chin, flo
 
         // ---- State from C# (FaceBonesEditor.PushState) ----
         var state = null;
+        var unriggedHintShown = false;
         window.setFace = function (s) {
             state = s;
             for (var f = 0; f < 4; f++) {
@@ -754,11 +771,21 @@ vec4 MouthSculpted(vec2 f, vec2 d, float restX[5], vec4 moves[5], vec3 chin, flo
             applyFace();
             // The dots and line: their own toggle (Show mouth points), and always while picking.
             showMouthPoints(s.showPoints || s.pickPoints ? (s.mouthPoints || []) : []);
+            showLowerPoints(s.showPoints || s.pickLower ? (s.lowerPoints || []) : []);
             if (s.pickPoints) {
                 setHint('Click the mouth: point ' + ((s.mouthPoints || []).length + 1) +
                         ' of 5 - both corners and three along the lip line between them.');
                 pointHintShown = true;
+            } else if (s.pickLower) {
+                setHint('Click the lower lip: point ' + ((s.lowerPoints || []).length + 1) +
+                        ' of 5 - both corners and three along its top edge between them.');
+                pointHintShown = true;
             } else if (pointHintShown) { setHint(null); pointHintShown = false; }
+            // Sculpted lips part on the jaw Save rigs: without it the preview has nothing to open them with.
+            if (!s.pickPoints && !s.pickLower && s.mouth && s.mouth.on && s.mouth.sculpted > 0.5 && !s.lipsRigged) {
+                setHint('Sculpted lips: Save Bones & Weights to rig the jaw - the lips cannot part until then.');
+                unriggedHintShown = true;
+            } else if (unriggedHintShown) { setHint(null); unriggedHintShown = false; }
         };
 
         // As MouthStencil::Pack: the preset's opening times the strength, unless Test open is up.
@@ -851,6 +878,7 @@ vec4 MouthSculpted(vec2 f, vec2 d, float restX[5], vec4 moves[5], vec3 chin, flo
                 return;
             }
             if (state && state.pickPoints) { post({ action: 'mouthPoint', p: meshPointFromHit(chosen) }); return; }
+            if (state && state.pickLower) { post({ action: 'lowerPoint', p: meshPointFromHit(chosen) }); return; }
             post({ action: 'clicked', p: meshPointFromHit(chosen) });
         }
 ";

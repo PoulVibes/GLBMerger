@@ -129,6 +129,7 @@ namespace GlbMerger
                 {
                     Name = FeatureNames[f], Region = _regions[f], Core = _core[f], Drop = f == Chin ? _chinDrop : 0f,
                     MouthPoints = f == Mouth ? MouthPointsForRig() : null,
+                    LowerLipPoints = f == Mouth ? LowerLipPointsForRig() : null,
                     TiltDeg = f < Mouth ? _browTilt[f] : 0f,
                     ChinStartY = f == Chin ? MouthOpenBottomY() : null,
                     SculptedLips = f == Mouth && _mouth.Enabled && _mouth.SculptedLips,
@@ -140,6 +141,11 @@ namespace GlbMerger
             _lblStatus.Text = result + " Save the GLB to keep them.";
             ReloadPreview();
         }
+
+        // Whether the model has the lower-lip bones Save adds for sculpted lips (FaceBoneRigger), which the
+        // jaw parts them with.
+        private bool LowerLipRigged() =>
+            _model.LogicalNodes.Any(n => n.Extras is JsonObject o && o["face"]?.GetValue<string>() == "mouthLower");
 
         private void ReadBakedLook(JsonObject o)
         {
@@ -199,7 +205,7 @@ namespace GlbMerger
         private void ClearSelected()
         {
             _regions[Selected] = default;
-            if (Selected == Mouth) { _mouthPoints.Clear(); _pickingMouthPoints = false; }
+            if (Selected == Mouth) { _mouthPoints.Clear(); _pickingMouthPoints = false; _lowerLipPoints.Clear(); _pickingLowerLip = false; }
             _dirty = true;
             RefreshUiFromState();
             PushState();
@@ -237,7 +243,9 @@ namespace GlbMerger
                           $"\"showPoints\":{(_chkShowPoints.Checked ? "true" : "false")}," +
                           $"\"chinDrop\":{Inv(_chinDrop)},\"mouth\":{MouthJson()}," +
                           $"\"bakedLook\":{_bakedLook},\"bakedAmount\":{Inv(_bakedAmount)}," +
-                          $"\"mouthPoints\":{MouthPointsJson()},\"pickPoints\":{(_pickingMouthPoints ? "true" : "false")}}}";
+                          $"\"lipsRigged\":{(LowerLipRigged() ? "true" : "false")}," +
+                          $"\"mouthPoints\":{MouthPointsJson()},\"pickPoints\":{(_pickingMouthPoints ? "true" : "false")}," +
+                          $"\"lowerPoints\":{LowerLipPointsJson()},\"pickLower\":{(_pickingLowerLip ? "true" : "false")}}}";
             _webView.CoreWebView2.ExecuteScriptAsync($"setFace({json});");
         }
 
@@ -263,14 +271,17 @@ namespace GlbMerger
             if (m.Action == "mouthPoint" && m.P is { Length: 3 } mp) OnMouthPointClicked(new Vector3(mp[0], mp[1], mp[2]));
             if (m.Action == "mouthPointMoved" && m.P is { Length: 3 } mv && m.I is int i)
                 OnMouthPointMoved(i, new Vector3(mv[0], mv[1], mv[2]));
+            if (m.Action == "lowerPoint" && m.P is { Length: 3 } lp) OnLowerLipPointClicked(new Vector3(lp[0], lp[1], lp[2]));
+            if (m.Action == "lowerPointMoved" && m.P is { Length: 3 } lv && m.I is int li)
+                OnLowerLipPointMoved(li, new Vector3(lv[0], lv[1], lv[2]));
             if (m.Action == "colorPicked" && m.Rgb is { Length: 3 } rgb) OnMouthColorPicked(m.Target, rgb, m.Mr, m.MrOnly == true);
         }
 
         private sealed class ViewerMessage
         {
             public string? Action { get; set; }
-            public float[]? P { get; set; }    // clicked, mouthPoint, mouthPointMoved: mesh point
-            public int? I { get; set; }        // mouthPointMoved: which point
+            public float[]? P { get; set; }    // clicked, mouthPoint, lowerPoint, ...Moved: mesh point
+            public int? I { get; set; }        // mouthPointMoved, lowerPointMoved: which point
             public int? Bones { get; set; }    // loaded: face bones found
             public string? Target { get; set; } // colorPicked: which mouth colour
             public float[]? Rgb { get; set; }   // colorPicked: the texture's sRGB under the click

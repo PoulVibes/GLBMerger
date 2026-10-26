@@ -54,6 +54,26 @@ namespace GlbMerger
             return across.Select(a => centre + new Vector3(a * radii.X, 0f, 0f)).ToArray();
         }
 
+        // Bone k's share at x along the curve, placed by x only (straight up and down from the points, not
+        // the nearest point on the line): the five sum to one. A smooth hat between the inner points; between
+        // a corner and its neighbour a quarter ellipse, the neighbour's share rising steeply off the corner --
+        // the way an open mouth's lower lip drops away from its corners, so what the bones carry follows it.
+        public float ShareAt(float x, int k)
+        {
+            int last = PointCount - 1;
+            int seg = last - 1;
+            float t = 1f;
+            if (x <= _p[0].X) { seg = 0; t = 0f; }
+            else
+                for (int i = 0; i < last; i++)
+                    if (x <= _p[i + 1].X) { seg = i; t = (x - _p[i].X) / Math.Max(_p[i + 1].X - _p[i].X, 1e-6f); break; }
+            // The share of the segment's far point (i + 1).
+            float far = seg == 0 ? MathF.Sqrt(Math.Max(1f - (1f - t) * (1f - t), 0f))
+                      : seg == last - 1 ? 1f - MathF.Sqrt(Math.Max(1f - t * t, 0f))
+                      : SmoothStep(0f, 1f, t);
+            return k == seg + 1 ? far : k == seg ? 1f - far : 0f;
+        }
+
         // Bone k's weight at vertex v. `back`/`front`: the region's depth behind / in front of the curve.
         public float Weight(Vector3 v, int k, float reach, float back, float front, float core)
         {

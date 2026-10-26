@@ -18,8 +18,9 @@ namespace GlbMerger
     //                           in order of x (MouthCurve); a mouth with no points gets the five its
     //                           region implies
     //   FaceChin               - at the chin region's centre; drops as the mouth opens
-    //   FaceMouthLow1..5       - sculpted lips only: on the mouth's points again, under the chin,
-    //                           holding the lower lip
+    //   FaceMouthLow1..5       - sculpted lips only: on the mouth's points again (the lower lip's, when
+    //                           picked), under the chin, holding the lower lip; with a lower lip
+    //                           picked each carries "close", how far up it goes to meet the upper
     // Each carries its motion's scale in its extras ("face", "unit" = the region's half-height,
     // and per kind "reach"/"inner" or "across"/"halfWidth"). A bone's inverse bind is just the
     // inverse of its mesh-space position, so it skins the mesh to itself at rest.
@@ -42,6 +43,7 @@ namespace GlbMerger
             public float Core = 0.4f;
             public float Drop;               // chin: x its half-height at a full open
             public Vector3[]? MouthPoints;   // mouth: the five picked along it, mesh units; null = from the region
+            public Vector3[]? LowerLipPoints;   // mouth, sculpted lips modelled apart: five along the lower lip's edge
             public float TiltDeg;            // brow: the region turned, degrees; positive raises its outer end
             public bool SculptedLips;        // mouth: lips sculpted in the mesh -- the jaw parts them (SculptedJaw)
             public float? ChinStartY;        // chin: mesh y its pull starts below -- under the drawn mouth fully
@@ -49,6 +51,9 @@ namespace GlbMerger
         }
 
         private const float CornerAt = 0.9f;   // a brow bone's distance from the centre, x the half-width
+        // A lower lip modelled apart shuts this far past meeting the upper one, so they press together and
+        // no sliver of the squashed band between them shows along the seam.
+        private const float CloseOverlap = 1.1f;
 
         private sealed class BoneSpec
         {
@@ -100,6 +105,7 @@ namespace GlbMerger
             float midline = browL != null && browR != null ? 0.5f * (browL.Region.Centre.X + browR.Region.Centre.X) : 0f;
             var jaw = SculptedJawFor(features, modelHeight);
             var lip = LipWeightFor(features, modelHeight);
+            var lowerLip = LowerLipFor(features, modelHeight, jaw);
 
             foreach (var f in features.Where(f => f.Region.Set))
             {
@@ -114,13 +120,14 @@ namespace GlbMerger
                         Name = "FaceChin", Position = c,
                         Extras = new JsonObject { ["face"] = "chin", ["unit"] = r.Y, ["drop"] = f.Drop },
                         // Sculpted: the jaw, less the lower lip its own bones hold.
-                        Weight = jaw != null && lip != null ? v => jaw.Weight(v) * (1f - LipShare(lip, v))
+                        Weight = jaw != null && lowerLip != null ? v => jaw.Weight(v) * (1f - lowerLip.Hold(v))
+                               : jaw != null && lip != null ? v => jaw.Weight(v) * (1f - LipShare(lip, v))
                                : v => ChinFalloff(v - c, r, front, f.Core, ChinTop(c, r, f.ChinStartY)),
                     });
                 }
                 else if (f.Name == "Mouth")
                 {
-                    specs.AddRange(MouthBones(f, c, r, lip!, jaw));
+                    specs.AddRange(MouthBones(f, c, r, lip!, jaw, lowerLip));
                 }
                 else
                 {
@@ -153,8 +160,42 @@ namespace GlbMerger
             if (mouth == null || chin == null) return null;
             var mr = mouth.Region.RadiiPct * (modelHeight / 100f);
             var curve = new MouthCurve(mouth.MouthPoints ?? MouthCurve.FromRegion(mouth.Region.Centre, mr));
-            return new SculptedJaw(curve, chin.Region.Centre, chin.Region.RadiiPct * (modelHeight / 100f),
+            var lower = mouth.MouthPoints != null && mouth.LowerLipPoints != null ? new MouthCurve(mouth.LowerLipPoints) : null;
+            return new SculptedJaw(curve, lower, chin.Region.Centre, chin.Region.RadiiPct * (modelHeight / 100f),
                                    chin.Region.FrontPct * (modelHeight / 100f), chin.Core);
+        }
+
+        // The lower lip of sculpted lips modelled apart: its curve, and how much of vertex v its bones hold
+        // (Hold, of the jaw's share) and how bone k's part of that is split (Share). Null without one.
+        private sealed class LowerLip
+        {
+            public required MouthCurve Curve;
+            public required Func<Vector3, float> Hold;
+            public required Func<Vector3, int, float> Share;
+            public required Func<int, float> Close;   // how far bone k goes up to meet the upper lip, mesh units
+        }
+
+        // Its bones hold all of the band and the lip's edge, handing the skin further under it to the chin
+        // the way the upper curve's falloff would: so the band closes whole, and the chin below stretches.
+        private static LowerLip? LowerLipFor(IReadOnlyList<Feature> features, float modelHeight, SculptedJaw? jaw)
+        {
+            var f = features.FirstOrDefault(x => x.Name == "Mouth" && x.Region.Set);
+            if (f?.LowerLipPoints == null || f.MouthPoints == null || jaw == null) return null;
+            var r = f.Region.RadiiPct * (modelHeight / 100f);
+            float front = f.Region.FrontPct * (modelHeight / 100f);
+            var curve = new MouthCurve(f.LowerLipPoints);
+            float Falloff(Vector3 v)
+            {
+                float sum = 0f;
+                for (int k = 0; k < MouthCurve.PointCount; k++) sum += curve.Weight(v, k, r.Y, r.Z, front, f.Core);
+                return Math.Min(sum, 1f);
+            }
+            float Hold(Vector3 v)
+            {
+                float edge = jaw.LowerLipHold(v, 0.3f * r.Y);
+                return edge + (1f - edge) * Falloff(v);
+            }
+            return new LowerLip { Curve = curve, Hold = Hold, Share = jaw.LowerShare, Close = jaw.Close };
         }
 
         // The mouth bones' weights: bone k's share of vertex v along the curve, fading off it. Null with
@@ -182,7 +223,8 @@ namespace GlbMerger
         // splits the mouth: the upper lip stays with these, and the lower goes to five more on the same
         // points under the chin (FaceMouthLow1..5), so it drops with the jaw and still moves as the mouth
         // does -- pucker, smile, the corners closing for an "oo".
-        private static IEnumerable<BoneSpec> MouthBones(Feature f, Vector3 c, Vector3 r, Func<Vector3, int, float> lip, SculptedJaw? jaw)
+        private static IEnumerable<BoneSpec> MouthBones(Feature f, Vector3 c, Vector3 r, Func<Vector3, int, float> lip,
+                                                        SculptedJaw? jaw, LowerLip? lowerLip)
         {
             var curve = new MouthCurve(f.MouthPoints ?? MouthCurve.FromRegion(c, r));
             JsonObject Extras(string kind, int k) => new JsonObject
@@ -202,10 +244,21 @@ namespace GlbMerger
             for (int k = 0; k < MouthCurve.PointCount; k++)
             {
                 int bone = k;
+                if (lowerLip == null)
+                {
+                    yield return new BoneSpec
+                    {
+                        Name = MouthLowBoneNames[k], Position = curve[k], Parent = "FaceChin", Extras = Extras("mouthLower", k),
+                        Weight = v => lip(v, bone) * jaw.Weight(v),
+                    };
+                    continue;
+                }
+                var extras = Extras("mouthLower", k);
+                extras["close"] = Math.Round(lowerLip.Close(k) * CloseOverlap, 6);
                 yield return new BoneSpec
                 {
-                    Name = MouthLowBoneNames[k], Position = curve[k], Parent = "FaceChin", Extras = Extras("mouthLower", k),
-                    Weight = v => lip(v, bone) * jaw.Weight(v),
+                    Name = MouthLowBoneNames[k], Position = lowerLip.Curve[k], Parent = "FaceChin", Extras = extras,
+                    Weight = v => jaw.Weight(v) * lowerLip.Hold(v) * lowerLip.Share(v, bone),
                 };
             }
         }

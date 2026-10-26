@@ -14,6 +14,10 @@ namespace GlbMerger
     // stays the panel's - it's how far the mouth's weights reach off the curve.
     //
     // Saved on the MouthAnchor's extras as "points", in the head's frame like the anchor itself.
+    //
+    // Sculpted lips modelled apart (teeth showing between them, Barrett) also take five on the lower lip's
+    // edge, corner to corner ("lowerPoints"): the band between the two lines is rigged to squash shut as
+    // the lower lip rises to meet the upper one (FaceBoneRigger, SculptedJaw).
     public partial class FaceBonesEditor
     {
         private const float MouthWidthPad = 1.15f;   // the region's half-width over the corners' half-span
@@ -25,38 +29,64 @@ namespace GlbMerger
 
         private bool HasMouthPoints => _mouthPoints.Count == MouthCurve.PointCount && !_pickingMouthPoints;
 
+        private readonly List<Vector3> _lowerLipPoints = new();   // as _mouthPoints, along the lower lip
+        private bool _pickingLowerLip;
+        private Label _lblLowerLip = null!;
+        private Button _btnPickLowerLip = null!, _btnClearLowerLip = null!;
+
+        private bool HasLowerLipPoints => _lowerLipPoints.Count == MouthCurve.PointCount && !_pickingLowerLip;
+
         // ---- Extras ---------------------------------------------------------------------------
 
         private void ReadMouthPoints(JsonObject o)
         {
-            _mouthPoints.Clear();
-            if (o["points"] is not JsonArray arr || arr.Count != MouthCurve.PointCount) return;
+            ReadPoints(o, "points", _mouthPoints);
+            ReadPoints(o, "lowerPoints", _lowerLipPoints);
+        }
+
+        private void ReadPoints(JsonObject o, string key, List<Vector3> points)
+        {
+            points.Clear();
+            if (o[key] is not JsonArray arr || arr.Count != MouthCurve.PointCount) return;
             if (!Matrix4x4.Invert(_meshToHead, out var headToMesh)) return;
             foreach (var node in arr)
             {
-                if (node is not JsonArray xyz || xyz.Count != 3) { _mouthPoints.Clear(); return; }
+                if (node is not JsonArray xyz || xyz.Count != 3) { points.Clear(); return; }
                 var head = new Vector3((float)xyz[0]!.GetValue<double>(), (float)xyz[1]!.GetValue<double>(), (float)xyz[2]!.GetValue<double>());
-                _mouthPoints.Add(Vector3.Transform(head, headToMesh));
+                points.Add(Vector3.Transform(head, headToMesh));
             }
-            SortMouthPoints();
+            SortPoints(points);
         }
 
         private void WriteMouthPoints(JsonObject extras)
         {
             if (!HasMouthPoints) return;
+            extras["points"] = PointsJsonArray(_mouthPoints);
+            if (HasLowerLipPoints) extras["lowerPoints"] = PointsJsonArray(_lowerLipPoints);
+        }
+
+        private JsonArray PointsJsonArray(List<Vector3> points)
+        {
             var arr = new JsonArray();
-            foreach (var p in _mouthPoints)
+            foreach (var p in points)
             {
                 var head = Vector3.Transform(p, _meshToHead);
                 arr.Add(new JsonArray(Math.Round(head.X, 6), Math.Round(head.Y, 6), Math.Round(head.Z, 6)));
             }
-            extras["points"] = arr;
+            return arr;
         }
 
         private Vector3[]? MouthPointsForRig() => HasMouthPoints ? _mouthPoints.ToArray() : null;
 
-        private string MouthPointsJson() =>
-            "[" + string.Join(",", _mouthPoints.Select(p => $"[{FaceAnchors.Inv(p.X)},{FaceAnchors.Inv(p.Y)},{FaceAnchors.Inv(p.Z)}]")) + "]";
+        // Only with the upper ones and sculpted lips: the band between the lips is a sculpted mouth's.
+        private Vector3[]? LowerLipPointsForRig() =>
+            HasMouthPoints && HasLowerLipPoints && _mouth.Enabled && _mouth.SculptedLips ? _lowerLipPoints.ToArray() : null;
+
+        private string MouthPointsJson() => PointsJson(_mouthPoints);
+        private string LowerLipPointsJson() => PointsJson(_lowerLipPoints);
+
+        private static string PointsJson(List<Vector3> points) =>
+            "[" + string.Join(",", points.Select(p => $"[{FaceAnchors.Inv(p.X)},{FaceAnchors.Inv(p.Y)},{FaceAnchors.Inv(p.Z)}]")) + "]";
 
         // ---- Panel ----------------------------------------------------------------------------
 
@@ -72,6 +102,18 @@ namespace GlbMerger
                 "them. Drag a dot in the preview to adjust it.");
             _lblMouthPoints = Caption("", 10);
             flow.Controls.Add(_lblMouthPoints);
+
+            var lowerRow = MakeRow();
+            _btnPickLowerLip = AddButton(lowerRow, "Pick Lower Lip", StartPickingLowerLip);
+            _btnClearLowerLip = AddButton(lowerRow, "Clear Lower Lip", ClearLowerLip);
+            flow.Controls.Add(lowerRow);
+            _help.Add(_btnPickLowerLip,
+                "Sculpted lips modelled apart, with teeth showing between them: click five points along the lower " +
+                "lip's top edge - both corners and three between. Save then rigs the band between the lips to " +
+                "squash shut as the lower lip rises to meet the upper one (Test open below Painted open), " +
+                "hiding the teeth. Needs the mouth points and Sculpted lips; set Painted open above 0.");
+            _lblLowerLip = Caption("", 10);
+            flow.Controls.Add(_lblLowerLip);
         }
 
         private void RefreshMouthPointUi()
@@ -87,11 +129,20 @@ namespace GlbMerger
             bool placed = mouth && HasMouthPoints;
             foreach (var n in new[] { _numX, _numY, _numZ, _numW }) n.Enabled &= !placed;
             SetLipLineEditable(!HasMouthPoints);
+
+            _btnPickLowerLip.Enabled = mouth && HasMouthPoints;
+            _btnClearLowerLip.Enabled = mouth && _lowerLipPoints.Count > 0;
+            _lblLowerLip.Text = _pickingLowerLip
+                ? $"Click the lower lip's edge: point {_lowerLipPoints.Count + 1} of {MouthCurve.PointCount}."
+                : !HasLowerLipPoints ? "Lower lip: none (the lips meet at the mouth points)."
+                : _mouth.SculptedLips ? "Lower lip: set - Save, and the lips close to meet."
+                                      : "Lower lip: set, but only used with Sculpted lips.";
         }
 
         private void StartPickingMouthPoints()
         {
             _mouthPoints.Clear();
+            _pickingLowerLip = false;
             _pickingMouthPoints = true;
             RefreshUiFromState();
             PushState();
@@ -101,6 +152,24 @@ namespace GlbMerger
         {
             _mouthPoints.Clear();
             _pickingMouthPoints = false;
+            _dirty = true;
+            RefreshUiFromState();
+            PushState();
+        }
+
+        private void StartPickingLowerLip()
+        {
+            _lowerLipPoints.Clear();
+            _pickingMouthPoints = false;
+            _pickingLowerLip = true;
+            RefreshUiFromState();
+            PushState();
+        }
+
+        private void ClearLowerLip()
+        {
+            _lowerLipPoints.Clear();
+            _pickingLowerLip = false;
             _dirty = true;
             RefreshUiFromState();
             PushState();
@@ -131,11 +200,37 @@ namespace GlbMerger
             PushState();
         }
 
-        private void SortMouthPoints()
+        private void OnLowerLipPointClicked(Vector3 p)
         {
-            var sorted = _mouthPoints.OrderBy(p => p.X).ToList();
-            _mouthPoints.Clear();
-            _mouthPoints.AddRange(sorted);
+            if (!_pickingLowerLip) return;
+            _lowerLipPoints.Add(p);
+            if (_lowerLipPoints.Count == MouthCurve.PointCount)
+            {
+                _pickingLowerLip = false;
+                SortPoints(_lowerLipPoints);
+                _dirty = true;
+            }
+            RefreshUiFromState();
+            PushState();
+        }
+
+        private void OnLowerLipPointMoved(int i, Vector3 p)
+        {
+            if (i < 0 || i >= _lowerLipPoints.Count) return;
+            _lowerLipPoints[i] = p;
+            if (HasLowerLipPoints) SortPoints(_lowerLipPoints);
+            _dirty = true;
+            RefreshUiFromState();
+            PushState();
+        }
+
+        private void SortMouthPoints() => SortPoints(_mouthPoints);
+
+        private static void SortPoints(List<Vector3> points)
+        {
+            var sorted = points.OrderBy(p => p.X).ToList();
+            points.Clear();
+            points.AddRange(sorted);
         }
 
         // ---- What the points decide ----------------------------------------------------------
