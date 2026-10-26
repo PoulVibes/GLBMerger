@@ -679,8 +679,19 @@ vec4 MouthSculpted(vec2 f, vec2 d, float restX[5], vec4 moves[5], vec3 chin, flo
             });
         }
 
+        // The mouth's painted look taken back off the bones' shape, as FaceBones::Apply: the expression's
+        // mouth made from neutral. In expression units, so it's undone at full strength whatever the slider.
+        var BAKED_KEYS = ['smile', 'frown', 'grit', 'pucker'];
+        function lessBaked(face, s) {
+            var b = state && PRESETS[state.bakedLook], amount = state ? state.bakedAmount : 0;
+            if (!b || !amount || !s) return face;
+            var f = Object.assign({}, face);
+            BAKED_KEYS.forEach(function (k) { f[k] = w(face, k) - w(b, k) * amount / s; });
+            return f;
+        }
+
         function applyFace() {
-            var face = faceFor(state), s = state ? state.strength : 1;
+            var s = state ? state.strength : 1, face = lessBaked(faceFor(state), s);
             var open = state ? mouthOpen(state) - (state.mouth.baseOpen || 0) : 0;   // from the painted opening
             faceBones.forEach(function (fb) {
                 var m = motionFor(fb.d, face, s, open);
