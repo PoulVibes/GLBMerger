@@ -275,19 +275,52 @@ float MouthLineAt(float x, MouthParams p)
     return mix(p.lip.x, p.lip.y, t * t);
 }
 
-// A lip's move at x (lower: the lower lip's): its points' moves under a smooth hat in the position
-// along them, 0 at the first point .. 4 at the last, found by x through the points as moved.
+// The least-squares parabola through five values v at xk, as coefficients of 1, x/h, (x/h)^2
+// (h: the points' reach, for conditioning). Zero if the points don't spread.
+vec3 MouthQuadFit(float xk[5], float v[5], float h)
+{
+    float S0 = 5.0, S1 = 0.0, S2 = 0.0, S3 = 0.0, S4 = 0.0;
+    vec3  T  = vec3(0.0);
+    for (int k = 0; k < 5; ++k)
+    {
+        float u = xk[k] / h, u2 = u * u;
+        S1 += u; S2 += u2; S3 += u2 * u; S4 += u2 * u2;
+        T  += v[k] * vec3(1.0, u, u2);
+    }
+    vec3  a = vec3(S0, S1, S2), b = vec3(S1, S2, S3), c = vec3(S2, S3, S4);   // the normal equations' columns
+    float det = dot(a, cross(b, c));
+    if (abs(det) < 1e-6) return vec3(0.0);
+    return vec3(dot(T, cross(b, c)), dot(a, cross(T, c)), dot(a, cross(b, T))) / det;
+}
+
+float MouthQuadAt(vec3 q, float x, float h) { float u = x / h; return q.x + u * (q.y + u * q.z); }
+
+// A lip's move at x (lower: the lower lip's), from its points' moves: the parabola through them
+// along the mouth -- which any smile, frown, grit or pucker is, so they bend the painted line
+// (itself a parabola) exactly and a smile taken back off a painted one leaves it straight -- plus
+// what's left at each point under a smooth hat in the position along them, 0 at the first point
+// .. 4 at the last, found by x through the points as moved. Across is fitted against where the points
+// are now, up against where they were, at where x was before it moved.
 vec2 MouthLipMove(float x, float restX[5], vec4 moves[5], bool lower)
 {
-    float xs[5];
-    for (int k = 0; k < 5; ++k) xs[k] = restX[k] + (lower ? moves[k].z : moves[k].x);
+    float xs[5], mx[5], my[5];
+    for (int k = 0; k < 5; ++k)
+    {
+        mx[k] = lower ? moves[k].z : moves[k].x;
+        my[k] = lower ? moves[k].w : moves[k].y;
+        xs[k] = restX[k] + mx[k];
+    }
+    float h  = max(max(abs(restX[0]), abs(restX[4])), 1e-4);
+    vec3  qx = MouthQuadFit(xs, mx, h), qy = MouthQuadFit(restX, my, h);
     float s = x <= xs[0] ? 0.0 : 4.0;
     for (int k = 0; k < 4; ++k)
         if (x > xs[k] && x <= xs[k + 1]) s = float(k) + (x - xs[k]) / max(xs[k + 1] - xs[k], 1e-5);
-    vec2 o = vec2(0.0);
+    vec2 rest = vec2(0.0);   // the moves the parabolas miss
     for (int k = 0; k < 5; ++k)
-        o += (1.0 - smoothstep(0.0, 1.0, abs(s - float(k)))) * (lower ? moves[k].zw : moves[k].xy);
-    return o;
+        rest += (1.0 - smoothstep(0.0, 1.0, abs(s - float(k))))
+              * vec2(mx[k] - MouthQuadAt(qx, xs[k], h), my[k] - MouthQuadAt(qy, restX[k], h));
+    float ox = MouthQuadAt(qx, x, h) + rest.x;
+    return vec2(ox, MouthQuadAt(qy, x - ox, h) + rest.y);
 }
 
 // The gap's edges at x: (top, bottom).
@@ -520,10 +553,11 @@ vec4 MouthSculpted(vec2 f, vec2 d, float restX[5], vec4 moves[5], vec3 chin, flo
                 move[1] = 0.35 * w(face, 'raise') * s * d.unit;
                 move[0] = d.inner * 0.05 * w(face, 'furrow') * s * d.unit;
             } else if (d.face === 'mouth' || d.face === 'mouthLower') {
-                // Shaped by where along the mouth the bone sits: a smile lifts the corners, the middle dips.
+                // Shaped by where along the mouth the bone sits: a smile lifts the corners and stretches them
+                // out, the middle dips.
                 var a = d.across, a2 = a * a;
                 move[1] = ((0.45 * w(face, 'smile') - 0.40 * w(face, 'frown')) * a2 - 0.10 * w(face, 'smile') * (1 - a2)) * s * d.unit;
-                move[0] = a * (0.12 * w(face, 'grit') - 0.30 * w(face, 'pucker')) * s * d.halfWidth;
+                move[0] = a * (0.12 * w(face, 'grit') + 0.15 * w(face, 'smile') - 0.30 * w(face, 'pucker')) * s * d.halfWidth;
                 move[1] += roundLift(d, w(face, 'round'), openFromRest);
             } else if (d.face === 'chin') {
                 // The panel's Chin drop, not the saved one, so it can be tuned before saving.

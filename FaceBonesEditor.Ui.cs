@@ -161,6 +161,7 @@ namespace GlbMerger
                 _bakedLook = Math.Max(_comboBaked.SelectedIndex, 0);
                 _numBakedAmount.Enabled = _bakedLook > 0;
                 _dirty = true;
+                if (FittedBakedAmount() is float fit) _numBakedAmount.Value = (decimal)Math.Round(fit * 100f);
                 PushState();
             };
             row.Controls.Add(_comboBaked);
@@ -175,7 +176,7 @@ namespace GlbMerger
             amountRow.Controls.Add(new Label { Text = "Baked amount %", Width = 110, Margin = new Padding(3, 6, 3, 3) });
             _numBakedAmount = new NumericUpDown
             {
-                Width = 110, Minimum = 0, Maximum = 100, Increment = 5, Margin = new Padding(3, 3, 3, 3),
+                Width = 110, Minimum = 0, Maximum = (decimal)(MaxBakedAmount * 100f), Increment = 5, Margin = new Padding(3, 3, 3, 3),
                 Value = (decimal)Math.Round(_bakedAmount * 100f), Enabled = _bakedLook > 0,
             };
             _numBakedAmount.ValueChanged += (s, e) =>
@@ -187,7 +188,15 @@ namespace GlbMerger
             amountRow.Controls.Add(_numBakedAmount);
             flow.Controls.Add(amountRow);
             _help.Add(amountRow, "How far into the baked expression the painted mouth is: 100 = a full Joy smile, lower " +
-                                 "for a slight one. Raise it until Neutral looks neutral.");
+                                 "for a slight one, higher for a painted grin past it. Picking the baked mouth fits it " +
+                                 "to the lip line (Fit Neutral) - adjust from there until Neutral looks neutral.");
+            var fit = AddButton(flow, "Fit Neutral to Lip Line", () =>
+            {
+                if (FittedBakedAmount() is float f) _numBakedAmount.Value = (decimal)Math.Round(f * 100f);
+                else _lblStatus.Text = "Nothing to fit: set the open mouth's lip line, and a baked mouth that smiles or frowns.";
+            });
+            _help.Add(fit, "Sets Baked amount so Neutral's lip line comes out straight - the teeth then hang level " +
+                           "from it. Uses the open mouth's lip line (Lip Y and corner Y).");
         }
 
         private void BuildPreviewSection(FlowLayoutPanel flow)

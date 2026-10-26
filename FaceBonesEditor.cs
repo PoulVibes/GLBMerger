@@ -44,10 +44,12 @@ namespace GlbMerger
         private readonly float[] _core = { DefaultCore, DefaultCore, DefaultCore, DefaultCore };
         private float _chinDrop = DefaultChinDrop;
         private readonly float[] _browTilt = new float[2];   // degrees; positive raises the region's outer end
-        // The look painted on the mouth (a Presets index; 0 = neutral) and how far into it, 0..1: expressions'
-        // mouth shapes are made from neutral, so the bones take this back off (FaceBones' "bakedLook").
+        // The look painted on the mouth (a Presets index; 0 = neutral) and how far into it (1 = the preset's
+        // own, more for a painted smile past it): expressions' mouth shapes are made from neutral, so the
+        // bones take this back off (FaceBones' "bakedLook").
         private int _bakedLook;
         private float _bakedAmount = 1f;
+        private const float MaxBakedAmount = 3f;
         private bool _dirty;
 
         private readonly HelpTips _help;
@@ -143,8 +145,26 @@ namespace GlbMerger
         {
             if (o["bakedLook"] is JsonNode n && n.GetValue<double>() is double v && v >= 0 && v < Presets.Length)
                 _bakedLook = (int)v;
-            ReadUnit(o, "bakedAmount", ref _bakedAmount);
+            ReadClamped(o, "bakedAmount", ref _bakedAmount, 0f, MaxBakedAmount);
         }
+
+        // The baked amount that leaves Neutral's lip line straight: the painted line's rise from the middle
+        // to the corners over what the look's mouth does there (FaceBones: smile lifts the corners 0.45 and
+        // dips the middle 0.10, frown drops the corners 0.40 - region units). Null without a lip line, or for
+        // a look that doesn't bend the mouth the way it's painted.
+        private float? FittedBakedAmount()
+        {
+            if (!_mouth.Enabled || _bakedLook <= 0) return null;
+            var (smile, frown) = PresetMouthBend[_bakedLook];
+            float bend = 0.55f * smile - 0.40f * frown;
+            float painted = _mouth.LipCornerY - _mouth.LipY;
+            if (Math.Abs(bend) < 1e-4f || painted / bend <= 0f) return null;
+            return Math.Min(painted / bend, MaxBakedAmount);
+        }
+
+        // Each preset's smile and frown (FaceExpression.cpp's PresetWeights), in Presets order.
+        private static readonly (float Smile, float Frown)[] PresetMouthBend =
+            { (0f, 0f), (0f, 0f), (0f, 0f), (0f, 0f), (0f, 0.4f), (1f, 0f), (0f, 0.8f) };
 
         private void WriteBakedLook(JsonObject extras)
         {
