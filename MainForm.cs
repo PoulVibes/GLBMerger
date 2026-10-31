@@ -802,7 +802,7 @@ namespace GlbMerger
                 if (!OfferCleanup(beforeSave: true)) return;
 
                 Cursor = Cursors.WaitCursor;
-                try { GlbPrune.Save(latestMergedModel, dlg.FileName); }
+                try { GlbPrune.Save(latestMergedModel, dlg.FileName, ConfirmRemoveLeftoverBones); }
                 finally { Cursor = Cursors.Default; }
 
                 long written = new FileInfo(dlg.FileName).Length;
@@ -839,7 +839,7 @@ namespace GlbMerger
             try
             {
                 Cursor = Cursors.WaitCursor;
-                try { GlbPrune.Save(latestMergedModel, targetPath); }
+                try { GlbPrune.Save(latestMergedModel, targetPath, ConfirmRemoveLeftoverBones); }
                 finally { Cursor = Cursors.Default; }
             }
             catch (Exception ex)
@@ -971,6 +971,25 @@ namespace GlbMerger
                 DialogResult.No => cleaned,
                 _ => null,
             };
+        }
+
+        // Asked by GlbPrune.Save when the file has bones no skin uses any more (see
+        // GlbPrune.RemoveLeftoverBones). Removing them is a real change to the file, so it's
+        // offered; it only reaches the saved GLB, and Save Model's reload picks it up.
+        private bool ConfirmRemoveLeftoverBones(GlbPrune.LeftoverBones bones)
+        {
+            var shown = bones.Nodes.Take(12).ToList();
+            string list = string.Join(", ", shown) + (bones.Nodes.Count > shown.Count ? $", and {bones.Nodes.Count - shown.Count} more" : "");
+            string clips = bones.EmptiedClips.Count == 0 ? ""
+                : $"{Environment.NewLine}{Environment.NewLine}These clips only animate those bones and would be dropped: {string.Join(", ", bones.EmptiedClips)}.";
+            var choice = MessageBox.Show(this,
+                $"{bones.Nodes.Count} bone(s) are no longer part of the skin (no triangle is weighted to them), "
+                + $"but are still in the file and keyed by {bones.Channels} animation channel(s):{Environment.NewLine}{Environment.NewLine}"
+                + list + clips + Environment.NewLine + Environment.NewLine
+                + "Remove them from the saved file? The mesh and the markers editors save are not affected.",
+                "Remove leftover bones?",
+                MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+            return choice == DialogResult.Yes;
         }
 
         private static string FormatBytes(long bytes) => FileDetailsPanel.FormatBytes(bytes);

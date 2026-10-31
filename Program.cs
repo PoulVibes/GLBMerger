@@ -16,6 +16,8 @@ static class Program
             return SyncScaleKeys(args);
         if (args.Length > 0 && args[0] == "--prune")
             return PruneFiles(args);
+        if (args.Length > 0 && args[0] == "--remove-leftover-bones")
+            return RemoveLeftoverBonesFiles(args);
         if (args.Length > 0 && args[0] == "--ground-fix")
             return GroundFix(args);
         if (args.Length > 0 && args[0] == "--trim-clip")
@@ -115,6 +117,45 @@ static class Program
                 Console.WriteLine($"{path}: {s.Samplers} sampler(s), {s.Accessors} accessor(s), "
                     + $"{s.BufferViews} buffer view(s), {s.Bytes / 1024.0:F1} KB {(dryRun ? "unused" : "removed")}");
                 if (!dryRun && s.Any) WriteReplacing(bytes, path);
+            }
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(ex.Message);
+            return 1;
+        }
+    }
+
+    // Headless: GlbMerger --remove-leftover-bones [--dry-run] <a.glb> [b.glb ...]
+    // Removes animated nodes no skin uses any more (e.g. finger bones Normalize Rig folded out of
+    // the skin), then prunes what they leave behind, in place. See GlbPrune.RemoveLeftoverBones.
+    private static int RemoveLeftoverBonesFiles(string[] args)
+    {
+        bool dryRun = args.Contains("--dry-run");
+        var paths = args.Skip(1).Where(a => a != "--dry-run").ToList();
+        if (paths.Count == 0)
+        {
+            Console.Error.WriteLine("usage: GlbMerger --remove-leftover-bones [--dry-run] <a.glb> [b.glb ...]");
+            return 2;
+        }
+
+        try
+        {
+            foreach (var path in paths)
+            {
+                GlbPrune.LeftoverBones? found = null;
+                var (bytes, _) = GlbPrune.RemoveLeftoverBones(System.IO.File.ReadAllBytes(path), r => { found = r; return !dryRun; });
+                if (found == null)
+                {
+                    Console.WriteLine($"{path}: no leftover bones");
+                    continue;
+                }
+                Console.WriteLine($"{path}: {found.Nodes.Count} node(s), {found.Channels} channel(s) {(dryRun ? "would be removed" : "removed")}");
+                Console.WriteLine($"  {string.Join(", ", found.Nodes)}");
+                if (found.EmptiedClips.Count > 0)
+                    Console.WriteLine($"  clips left empty and dropped: {string.Join(", ", found.EmptiedClips)}");
+                if (!dryRun) WriteReplacing(GlbPrune.Prune(bytes).Glb, path);
             }
             return 0;
         }

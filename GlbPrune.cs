@@ -40,12 +40,106 @@ namespace GlbMerger
 
         private const uint JsonChunk = 0x4E4F534A, BinChunk = 0x004E4942;
 
-        // The one way this app writes a GLB the user keeps.
-        public static Stats Save(ModelRoot model, string path)
+        // Nodes RemoveLeftoverBones takes out, the animation channels that keyed them, and any
+        // clip left with no channels at all (dropped too - glTF requires at least one).
+        public sealed record LeftoverBones(IReadOnlyList<string> Nodes, int Channels, IReadOnlyList<string> EmptiedClips);
+
+        // The one way this app writes a GLB the user keeps. `removeLeftoverBones`, when given, is
+        // asked whether to remove the leftover bones found (only called when there are some).
+        public static Stats Save(ModelRoot model, string path, Func<LeftoverBones, bool>? removeLeftoverBones = null)
         {
-            var (bytes, stats) = Prune(model.WriteGLB().ToArray());
+            var glb = model.WriteGLB().ToArray();
+            if (removeLeftoverBones != null) glb = RemoveLeftoverBones(glb, removeLeftoverBones).Glb;
+            var (bytes, stats) = Prune(glb);
             File.WriteAllBytes(path, bytes);
             return stats;
+        }
+
+        // Removes bones a rig no longer skins with: nodes in no skin, with no mesh, camera, skin
+        // or extension, that some animation still keys, and whose children all qualify too.
+        // That's what Normalize Rig's "fold extra joints" leaves behind - it moves an extra
+        // joint's weights onto a shared joint and drops it from the skin, but SharpGLTF can't
+        // delete the node, so e.g. Eli kept every finger bone as a plain animated node (which
+        // the game's and this app's hand lookup then matched by name). No vertex can be weighted
+        // to a node outside every skin, so the mesh is untouched. Editor markers (BallAnchor,
+        // StiffArm, EyeAnchor, ...) are never animated, which is what keeps them out.
+        //
+        // Edits the index tables like Prune, so everything else is written back as it was; run
+        // Prune after it to drop the samplers and keyframe bytes the removed channels leave.
+        public static (byte[] Glb, LeftoverBones? Removed) RemoveLeftoverBones(byte[] glb, Func<LeftoverBones, bool>? confirm = null)
+        {
+            if (!TryReadChunks(glb, out var json, out var bin)) return (glb, null);
+            if (!CanPrune(json)) return (glb, null);
+
+            var nodes = Array(json, "nodes");
+            var skins = Array(json, "skins").Select(s => s!.AsObject()).ToList();
+            var anims = Array(json, "animations").Select(a => a!.AsObject()).ToList();
+            var inSkin = skins.SelectMany(s => Array(s, "joints").Select(j => j!.GetValue<int>())
+                .Concat(s["skeleton"] != null ? new[] { Index(s, "skeleton") } : System.Array.Empty<int>())).ToHashSet();
+            var animated = anims.SelectMany(a => Array(a, "channels"))
+                .Select(c => c!["target"]?["node"]?.GetValue<int>() ?? -1).ToHashSet();
+
+            var removable = new bool?[nodes.Count];
+            bool Removable(int i)
+            {
+                if (removable[i] is bool known) return known;
+                removable[i] = false;   // guards a malformed cycle
+                var n = nodes[i]!.AsObject();
+                bool result = !inSkin.Contains(i) && animated.Contains(i)
+                    && n["mesh"] == null && n["camera"] == null && n["skin"] == null && n["extensions"] == null
+                    && Array(n, "children").All(c => Removable(c!.GetValue<int>()));
+                removable[i] = result;
+                return result;
+            }
+            var gone = Enumerable.Range(0, nodes.Count).Where(Removable).ToHashSet();
+            if (gone.Count == 0) return (glb, null);
+
+            int channels = 0;
+            var emptied = new List<string>();
+            foreach (var anim in anims)
+            {
+                var list = Array(anim, "channels");
+                var drop = list.Where(c => c!["target"]?["node"] is JsonNode t && gone.Contains(t.GetValue<int>())).ToList();
+                channels += drop.Count;
+                if (drop.Count == list.Count && drop.Count > 0) emptied.Add(anim["name"]?.GetValue<string>() ?? "(unnamed)");
+            }
+            var report = new LeftoverBones(
+                gone.Order().Select(i => nodes[i]!["name"]?.GetValue<string>() ?? $"node {i}").ToList(), channels, emptied);
+            if (confirm != null && !confirm(report)) return (glb, null);
+
+            var remap = Compact(nodes, Enumerable.Range(0, nodes.Count).Where(i => !gone.Contains(i)).ToHashSet());
+            foreach (var n in nodes.Select(n => n!.AsObject()))
+                if (n["children"] is JsonArray children) RemapList(n, "children", children, remap);
+            foreach (var scene in Array(json, "scenes").Select(s => s!.AsObject()))
+                if (scene["nodes"] is JsonArray roots) RemapList(scene, "nodes", roots, remap);
+            foreach (var skin in skins)
+            {
+                RemapList(skin, "joints", Array(skin, "joints"), remap);
+                if (skin["skeleton"] != null) Remap(skin, "skeleton", remap);
+            }
+            var animations = Array(json, "animations");
+            foreach (var anim in anims)
+            {
+                var list = Array(anim, "channels");
+                var keep = list.Where(c => c!["target"]?["node"] is not JsonNode t || remap[t.GetValue<int>()] >= 0).ToList();
+                list.Clear();
+                foreach (var c in keep)
+                {
+                    if (c!["target"]!["node"] != null) Remap(c["target"]!.AsObject(), "node", remap);
+                    list.Add(c);
+                }
+                if (list.Count == 0) animations.Remove(anim);
+            }
+            return (WriteChunks(json, bin), report);
+        }
+
+        // Rewrites an index list through `remap`, dropping entries that map to -1 (and the key
+        // itself when nothing is left, since glTF forbids empty index arrays).
+        private static void RemapList(JsonObject owner, string key, JsonArray list, int[] remap)
+        {
+            var kept = list.Select(x => remap[x!.GetValue<int>()]).Where(x => x >= 0).ToList();
+            if (kept.Count == 0) { owner.Remove(key); return; }
+            owner[key] = new JsonArray(kept.Select(x => (JsonNode)x).ToArray());
         }
 
         public static (byte[] Glb, Stats Stats) Prune(byte[] glb)
