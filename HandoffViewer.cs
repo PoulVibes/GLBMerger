@@ -71,12 +71,6 @@ namespace GlbMerger
         private readonly Node? _rightElbow, _leftElbow;
         private readonly Node? _rightShoulder, _leftShoulder;
 
-        private static readonly string[] RightNames = { "righthand", "hand_r", "r_hand", "hand.r",
-            "wrist_r", "mixamorig:righthand", "handr", "rwrist" };
-        private static readonly string[] LeftNames = { "lefthand", "hand_l", "l_hand", "hand.l",
-            "wrist_l", "mixamorig:lefthand", "handl", "lwrist" };
-        private static readonly string[] WeakNames = { "hand", "wrist", "palm" };
-
         private static readonly string[] JointNames = { "Shoulder", "Elbow", "Wrist" };
 
         // Degrees, matching ModelRenderer::ArmPoseConfig's three joints. Float
@@ -173,20 +167,7 @@ namespace GlbMerger
         // so this resolves the exact bones the game will pose and hang the
         // ball off of.
         private static Node? FindHandNode(ModelRoot model, bool right)
-        {
-            Node? Search(string[] names)
-            {
-                foreach (var n in model.LogicalNodes)
-                {
-                    if (string.IsNullOrEmpty(n.Name)) continue;
-                    var lower = n.Name.ToLowerInvariant();
-                    foreach (var key in names)
-                        if (lower.Contains(key)) return n;
-                }
-                return null;
-            }
-            return right ? (Search(RightNames) ?? Search(WeakNames)) : Search(LeftNames);
-        }
+            => HandBones.Find(model, right);
 
         private static Node? FindChildByName(Node? parent, string name)
         {
