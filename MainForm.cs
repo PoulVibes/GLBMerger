@@ -802,7 +802,7 @@ namespace GlbMerger
                 if (!OfferCleanup(beforeSave: true)) return;
 
                 Cursor = Cursors.WaitCursor;
-                try { GlbPrune.Save(latestMergedModel, dlg.FileName, ConfirmRemoveLeftoverBones); }
+                try { GlbPrune.Save(latestMergedModel, dlg.FileName, ConfirmRemoveUnusedNodes); }
                 finally { Cursor = Cursors.Default; }
 
                 long written = new FileInfo(dlg.FileName).Length;
@@ -839,7 +839,7 @@ namespace GlbMerger
             try
             {
                 Cursor = Cursors.WaitCursor;
-                try { GlbPrune.Save(latestMergedModel, targetPath, ConfirmRemoveLeftoverBones); }
+                try { GlbPrune.Save(latestMergedModel, targetPath, ConfirmRemoveUnusedNodes); }
                 finally { Cursor = Cursors.Default; }
             }
             catch (Exception ex)
@@ -973,21 +973,29 @@ namespace GlbMerger
             };
         }
 
-        // Asked by GlbPrune.Save when the file has bones no skin uses any more (see
-        // GlbPrune.RemoveLeftoverBones). Removing them is a real change to the file, so it's
+        // Asked by GlbPrune.Save when the file has nodes nothing uses (see
+        // GlbPrune.RemoveUnusedNodes). Removing them is a real change to the file, so it's
         // offered; it only reaches the saved GLB, and Save Model's reload picks it up.
-        private bool ConfirmRemoveLeftoverBones(GlbPrune.LeftoverBones bones)
+        private bool ConfirmRemoveUnusedNodes(GlbPrune.UnusedNodes unused)
         {
-            var shown = bones.Nodes.Take(12).ToList();
-            string list = string.Join(", ", shown) + (bones.Nodes.Count > shown.Count ? $", and {bones.Nodes.Count - shown.Count} more" : "");
-            string clips = bones.EmptiedClips.Count == 0 ? ""
-                : $"{Environment.NewLine}{Environment.NewLine}These clips only animate those bones and would be dropped: {string.Join(", ", bones.EmptiedClips)}.";
+            static string List(IReadOnlyList<string> names)
+            {
+                var shown = names.Take(12).ToList();
+                return string.Join(", ", shown) + (names.Count > shown.Count ? $", and {names.Count - shown.Count} more" : "");
+            }
+            var nl2 = Environment.NewLine + Environment.NewLine;
+            var parts = new List<string>();
+            if (unused.Bones.Count > 0)
+                parts.Add($"{unused.Bones.Count} bone(s) are no longer part of the skin (no triangle is weighted to them), "
+                    + $"but are still keyed by {unused.Channels} animation channel(s):{nl2}{List(unused.Bones)}");
+            if (unused.Empty.Count > 0)
+                parts.Add($"{unused.Empty.Count} empty node(s) left by earlier merges, with nothing under them:{nl2}{List(unused.Empty)}");
+            if (unused.EmptiedClips.Count > 0)
+                parts.Add($"These clips only animate those bones and would be dropped: {string.Join(", ", unused.EmptiedClips)}.");
             var choice = MessageBox.Show(this,
-                $"{bones.Nodes.Count} bone(s) are no longer part of the skin (no triangle is weighted to them), "
-                + $"but are still in the file and keyed by {bones.Channels} animation channel(s):{Environment.NewLine}{Environment.NewLine}"
-                + list + clips + Environment.NewLine + Environment.NewLine
+                string.Join(nl2, parts) + nl2
                 + "Remove them from the saved file? The mesh and the markers editors save are not affected.",
-                "Remove leftover bones?",
+                "Remove unused nodes?",
                 MessageBoxButtons.YesNo, MessageBoxIcon.Question);
             return choice == DialogResult.Yes;
         }

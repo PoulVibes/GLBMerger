@@ -40,33 +40,39 @@ namespace GlbMerger
 
         private const uint JsonChunk = 0x4E4F534A, BinChunk = 0x004E4942;
 
-        // Nodes RemoveLeftoverBones takes out, the animation channels that keyed them, and any
-        // clip left with no channels at all (dropped too - glTF requires at least one).
-        public sealed record LeftoverBones(IReadOnlyList<string> Nodes, int Channels, IReadOnlyList<string> EmptiedClips);
+        // What RemoveUnusedNodes takes out: leftover bones (animated) and empty nodes (not), by
+        // name, the animation channels that keyed the bones, and any clip left with no channels
+        // at all (dropped too - glTF requires at least one).
+        public sealed record UnusedNodes(IReadOnlyList<string> Bones, IReadOnlyList<string> Empty,
+            int Channels, IReadOnlyList<string> EmptiedClips);
 
-        // The one way this app writes a GLB the user keeps. `removeLeftoverBones`, when given, is
-        // asked whether to remove the leftover bones found (only called when there are some).
-        public static Stats Save(ModelRoot model, string path, Func<LeftoverBones, bool>? removeLeftoverBones = null)
+        // The one way this app writes a GLB the user keeps. `removeUnusedNodes`, when given, is
+        // asked whether to remove the unused nodes found (only called when there are some).
+        public static Stats Save(ModelRoot model, string path, Func<UnusedNodes, bool>? removeUnusedNodes = null)
         {
             var glb = model.WriteGLB().ToArray();
-            if (removeLeftoverBones != null) glb = RemoveLeftoverBones(glb, removeLeftoverBones).Glb;
+            if (removeUnusedNodes != null) glb = RemoveUnusedNodes(glb, removeUnusedNodes).Glb;
             var (bytes, stats) = Prune(glb);
             File.WriteAllBytes(path, bytes);
             return stats;
         }
 
-        // Removes bones a rig no longer skins with: nodes in no skin, with no mesh, camera, skin
-        // or extension, that some animation still keys, and whose children all qualify too.
-        // That's what Normalize Rig's "fold extra joints" leaves behind - it moves an extra
-        // joint's weights onto a shared joint and drops it from the skin, but SharpGLTF can't
-        // delete the node, so e.g. Eli kept every finger bone as a plain animated node (which
-        // the game's and this app's hand lookup then matched by name). No vertex can be weighted
-        // to a node outside every skin, so the mesh is untouched. Editor markers (BallAnchor,
-        // StiffArm, EyeAnchor, ...) are never animated, which is what keeps them out.
+        // Removes nodes nothing draws with or reads, of two kinds. Both are in no skin, have no
+        // mesh, camera, skin, extension or extras, and have only such nodes as children:
+        //   - Leftover bones: ones some animation still keys. That's what Normalize Rig's "fold
+        //     extra joints" leaves - it moves an extra joint's weights onto a shared joint and
+        //     drops it from the skin, but SharpGLTF can't delete the node, so e.g. Eli kept every
+        //     finger bone as a plain animated node (which the game's and this app's hand lookup
+        //     then matched by name). No vertex can be weighted to a node outside every skin, so
+        //     the mesh is untouched.
+        //   - Empty nodes: unanimated ones NOT parented to a skin joint - the placeholders older
+        //     merges left ("char1", "char1_GLB1_GLB1...", one "node_N" per merge for the skinned
+        //     mesh's node; see GlbMergeService.BuildNodeTree). Every editor marker (BallAnchor,
+        //     StiffArm, EyeAnchor, MouthAnchor, ...) hangs under a bone, which keeps them out.
         //
         // Edits the index tables like Prune, so everything else is written back as it was; run
         // Prune after it to drop the samplers and keyframe bytes the removed channels leave.
-        public static (byte[] Glb, LeftoverBones? Removed) RemoveLeftoverBones(byte[] glb, Func<LeftoverBones, bool>? confirm = null)
+        public static (byte[] Glb, UnusedNodes? Removed) RemoveUnusedNodes(byte[] glb, Func<UnusedNodes, bool>? confirm = null)
         {
             if (!TryReadChunks(glb, out var json, out var bin)) return (glb, null);
             if (!CanPrune(json)) return (glb, null);
@@ -78,6 +84,9 @@ namespace GlbMerger
                 .Concat(s["skeleton"] != null ? new[] { Index(s, "skeleton") } : System.Array.Empty<int>())).ToHashSet();
             var animated = anims.SelectMany(a => Array(a, "channels"))
                 .Select(c => c!["target"]?["node"]?.GetValue<int>() ?? -1).ToHashSet();
+            var parent = Enumerable.Repeat(-1, nodes.Count).ToArray();
+            for (int i = 0; i < nodes.Count; ++i)
+                foreach (var c in Array(nodes[i]!.AsObject(), "children")) parent[c!.GetValue<int>()] = i;
 
             var removable = new bool?[nodes.Count];
             bool Removable(int i)
@@ -85,8 +94,9 @@ namespace GlbMerger
                 if (removable[i] is bool known) return known;
                 removable[i] = false;   // guards a malformed cycle
                 var n = nodes[i]!.AsObject();
-                bool result = !inSkin.Contains(i) && animated.Contains(i)
-                    && n["mesh"] == null && n["camera"] == null && n["skin"] == null && n["extensions"] == null
+                bool result = !inSkin.Contains(i) && (animated.Contains(i) || !inSkin.Contains(parent[i]))
+                    && n["mesh"] == null && n["camera"] == null && n["skin"] == null
+                    && n["extensions"] == null && n["extras"] == null
                     && Array(n, "children").All(c => Removable(c!.GetValue<int>()));
                 removable[i] = result;
                 return result;
@@ -103,8 +113,10 @@ namespace GlbMerger
                 channels += drop.Count;
                 if (drop.Count == list.Count && drop.Count > 0) emptied.Add(anim["name"]?.GetValue<string>() ?? "(unnamed)");
             }
-            var report = new LeftoverBones(
-                gone.Order().Select(i => nodes[i]!["name"]?.GetValue<string>() ?? $"node {i}").ToList(), channels, emptied);
+            string Name(int i) => nodes[i]!["name"]?.GetValue<string>() ?? $"node {i}";
+            var report = new UnusedNodes(
+                gone.Order().Where(animated.Contains).Select(Name).ToList(),
+                gone.Order().Where(i => !animated.Contains(i)).Select(Name).ToList(), channels, emptied);
             if (confirm != null && !confirm(report)) return (glb, null);
 
             var remap = Compact(nodes, Enumerable.Range(0, nodes.Count).Where(i => !gone.Contains(i)).ToHashSet());

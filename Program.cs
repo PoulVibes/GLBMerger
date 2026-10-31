@@ -16,8 +16,8 @@ static class Program
             return SyncScaleKeys(args);
         if (args.Length > 0 && args[0] == "--prune")
             return PruneFiles(args);
-        if (args.Length > 0 && args[0] == "--remove-leftover-bones")
-            return RemoveLeftoverBonesFiles(args);
+        if (args.Length > 0 && args[0] == "--remove-unused-nodes")
+            return RemoveUnusedNodesFiles(args);
         if (args.Length > 0 && args[0] == "--ground-fix")
             return GroundFix(args);
         if (args.Length > 0 && args[0] == "--trim-clip")
@@ -127,16 +127,17 @@ static class Program
         }
     }
 
-    // Headless: GlbMerger --remove-leftover-bones [--dry-run] <a.glb> [b.glb ...]
-    // Removes animated nodes no skin uses any more (e.g. finger bones Normalize Rig folded out of
-    // the skin), then prunes what they leave behind, in place. See GlbPrune.RemoveLeftoverBones.
-    private static int RemoveLeftoverBonesFiles(string[] args)
+    // Headless: GlbMerger --remove-unused-nodes [--dry-run] <a.glb> [b.glb ...]
+    // Removes bones no skin uses any more (e.g. finger bones Normalize Rig folded out of the skin)
+    // and empty placeholder nodes older merges left, then prunes what they leave behind, in
+    // place. See GlbPrune.RemoveUnusedNodes.
+    private static int RemoveUnusedNodesFiles(string[] args)
     {
         bool dryRun = args.Contains("--dry-run");
         var paths = args.Skip(1).Where(a => a != "--dry-run").ToList();
         if (paths.Count == 0)
         {
-            Console.Error.WriteLine("usage: GlbMerger --remove-leftover-bones [--dry-run] <a.glb> [b.glb ...]");
+            Console.Error.WriteLine("usage: GlbMerger --remove-unused-nodes [--dry-run] <a.glb> [b.glb ...]");
             return 2;
         }
 
@@ -144,15 +145,17 @@ static class Program
         {
             foreach (var path in paths)
             {
-                GlbPrune.LeftoverBones? found = null;
-                var (bytes, _) = GlbPrune.RemoveLeftoverBones(System.IO.File.ReadAllBytes(path), r => { found = r; return !dryRun; });
+                GlbPrune.UnusedNodes? found = null;
+                var (bytes, _) = GlbPrune.RemoveUnusedNodes(System.IO.File.ReadAllBytes(path), r => { found = r; return !dryRun; });
                 if (found == null)
                 {
-                    Console.WriteLine($"{path}: no leftover bones");
+                    Console.WriteLine($"{path}: no unused nodes");
                     continue;
                 }
-                Console.WriteLine($"{path}: {found.Nodes.Count} node(s), {found.Channels} channel(s) {(dryRun ? "would be removed" : "removed")}");
-                Console.WriteLine($"  {string.Join(", ", found.Nodes)}");
+                Console.WriteLine($"{path}: {found.Bones.Count} leftover bone(s) with {found.Channels} channel(s), "
+                    + $"{found.Empty.Count} empty node(s) {(dryRun ? "would be removed" : "removed")}");
+                if (found.Bones.Count > 0) Console.WriteLine($"  bones: {string.Join(", ", found.Bones)}");
+                if (found.Empty.Count > 0) Console.WriteLine($"  empty: {string.Join(", ", found.Empty)}");
                 if (found.EmptiedClips.Count > 0)
                     Console.WriteLine($"  clips left empty and dropped: {string.Join(", ", found.EmptiedClips)}");
                 if (!dryRun) WriteReplacing(GlbPrune.Prune(bytes).Glb, path);

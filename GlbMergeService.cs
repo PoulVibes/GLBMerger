@@ -208,7 +208,10 @@ namespace GlbMerger
             // channels are authored against) survive the merge unchanged.
             var nodeMap = new Dictionary<Node, NodeBuilder>();
             foreach (var node in structuralModel.DefaultScene.VisualChildren)
-                outScene.AddNode(BuildNodeTree(node, nodeMap));
+            {
+                var nb = BuildNodeTree(node, nodeMap);
+                if (!IsReemittedSkinnedMeshNode(node)) outScene.AddNode(nb);
+            }
 
             // The material the user marked "First" (in either panel) should end up at index 0 of
             // the output's material array, since some engines/tools default to that. SharpGLTF
@@ -646,10 +649,24 @@ namespace GlbMerger
             map[srcNode] = nb;
 
             foreach (var child in srcNode.VisualChildren)
-                nb.AddNode(BuildNodeTree(child, map));
+            {
+                var childNb = BuildNodeTree(child, map);
+                if (!IsReemittedSkinnedMeshNode(child)) nb.AddNode(childNb);
+            }
 
             return nb;
         }
+
+        // A skinned mesh's own node: EmitNodeGeometry re-emits its mesh through AddSkinnedMesh,
+        // which takes no target node and makes a fresh one, so copying this node into the
+        // hierarchy as well only left an empty duplicate behind - named "node_N" when the source
+        // node had no name, which is how every Save Model round grew the file by one empty node.
+        // It stays in the node map (EmitNodeGeometry walks that), just out of the scene. A node
+        // with children, or with a primitive that falls back to the rigid path (no JOINTS_0 /
+        // WEIGHTS_0), still needs its place in the tree.
+        private static bool IsReemittedSkinnedMeshNode(Node node) =>
+            node.Mesh != null && node.Skin != null && !node.VisualChildren.Any()
+            && node.Mesh.Primitives.All(p => p.GetVertexAccessor("JOINTS_0") != null && p.GetVertexAccessor("WEIGHTS_0") != null);
 
         // Whether this node (or its name-matched counterpart in the "other" source model) has any
         // primitive whose original source material name matches - used to decide emission order
