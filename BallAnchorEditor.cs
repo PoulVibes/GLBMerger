@@ -309,6 +309,31 @@ namespace GlbMerger
             return ((int)MathF.Round(roll * r2d), (int)MathF.Round(pitch * r2d), (int)MathF.Round(yaw * r2d));
         }
 
+        private static Quaternion WorldRotation(Node n)
+        {
+            Matrix4x4.Decompose(n.WorldMatrix, out _, out var r, out _);
+            return Quaternion.Normalize(r);
+        }
+
+        // The bone's direction in 'joint's own frame: towards 'child' when there is one, else
+        // (the hand, at the end of the chain) continuing the bone that leads into it.
+        private static Vector3 BoneAxis(Node joint, Node? child)
+        {
+            var axis = child != null
+                ? child.LocalTransform.GetDecomposed().Translation
+                : Vector3.Transform(joint.LocalTransform.GetDecomposed().Translation,
+                                    Quaternion.Inverse(joint.LocalTransform.GetDecomposed().Rotation));
+            return axis.LengthSquared() > 1e-12f ? Vector3.Normalize(axis) : Vector3.UnitY;
+        }
+
+        // The twist part of a swing-twist split of 'q' around 'axis'.
+        private static Quaternion RollAround(Quaternion q, Vector3 axis)
+        {
+            var along = Vector3.Dot(new Vector3(q.X, q.Y, q.Z), axis) * axis;
+            var twist = new Quaternion(along, q.W);
+            return twist.LengthSquared() > 1e-12f ? Quaternion.Normalize(twist) : Quaternion.Identity;
+        }
+
         private static Quaternion ComputeOffsetQuaternion(int xDeg, int yDeg, int zDeg)
         {
             const float d2r = MathF.PI / 180f;
@@ -1058,7 +1083,8 @@ namespace GlbMerger
         // those same values in here. Nothing is written to the current model until the user hits
         // Save (per hand/arm-pose, same as always) - this only seeds the sliders/fields. A source
         // model missing a particular marker (e.g. it only ever had a right-hand anchor saved)
-        // just leaves that piece of state untouched rather than zeroing it out.
+        // just leaves that piece of state untouched rather than zeroing it out. Values are
+        // converted into this rig's units and joint axes on the way in (see FrameChange below).
         private void CopyFromLibraryModel(string glbPath)
         {
             ModelRoot source;
@@ -1082,6 +1108,25 @@ namespace GlbMerger
 
             bool any = false;
 
+            // The two rigs can disagree on each joint's local axes, so a hand-local offset or a
+            // joint-local rotation copied raw would point somewhere else on this rig. Converted
+            // the way RigNormalizer carries a clip's keys across - local' = inverse(C_parent) *
+            // local * C_self, C = inverse(sourceRestWorld) * targetRestWorld - except that only
+            // C's ROLL around the bone is kept. The rest of C is the two rigs' different rest
+            // poses (Barrett's arms rest ~55 degrees lower than Billy's), which RigNormalizer
+            // wants carried along but a marker must not: it is an absolute local rotation, and
+            // the anchor sits on the palm wherever the arm happens to rest. Keeping the full C
+            // swung a copied carry pose's arm ~55 degrees off; roll alone is the axis-convention
+            // difference (up to 93 degrees between these rigs), and identity once this rig has
+            // been normalized against the source. srcChild is the next joint down the chain,
+            // whose offset gives the bone's axis.
+            Quaternion FrameChange(Node? src, Node? tgt, Node? srcChild)
+            {
+                if (src == null || tgt == null) return Quaternion.Identity;
+                var change = Quaternion.Normalize(Quaternion.Inverse(WorldRotation(src)) * WorldRotation(tgt));
+                return Quaternion.Normalize(RollAround(change, BoneAxis(src, srcChild)));
+            }
+
             void CopyAnchor(bool right)
             {
                 var hand = right ? srcRightHand : srcLeftHand;
@@ -1090,11 +1135,16 @@ namespace GlbMerger
 
                 // Converted via cm (see ModelUnits) so a cm-rig library model's
                 // anchor lands at the same real distance on a metre-rig model
-                // (and vice versa) instead of 100x too far/near.
+                // (and vice versa) instead of 100x too far/near. Deliberately not
+                // scaled by the rigs' proportions (the merge's leg-chain ratio): the
+                // ball is the same size on everyone, and on the tuned models that
+                // ratio predicted their anchors' distance worse than copying it 1:1.
                 var t = anchor.LocalTransform.GetDecomposed();
+                var inverseChange = Quaternion.Inverse(FrameChange(hand, right ? _rightHand : _leftHand, null));
                 float k = ModelUnits.DisplayPerLocal(hand) / (right ? _rightUnits : _leftUnits);
-                var pos = (t.Translation.X * k, t.Translation.Y * k, t.Translation.Z * k);
-                var deg = QuaternionToDegrees(t.Rotation);
+                var turned = Vector3.Transform(t.Translation, inverseChange) * k;
+                var pos = (turned.X, turned.Y, turned.Z);
+                var deg = QuaternionToDegrees(Quaternion.Normalize(inverseChange * t.Rotation));
                 if (right) { _rightPos = pos; _rightRotDeg = deg; } else { _leftPos = pos; _leftRotDeg = deg; }
                 any = true;
             }
@@ -1107,6 +1157,13 @@ namespace GlbMerger
                 var shoulder = right ? srcRightShoulder : srcLeftShoulder;
                 var elbow = right ? srcRightElbow : srcLeftElbow;
                 Node? ParentFor(int joint) => joint switch { 0 => shoulder?.VisualParent, 1 => shoulder, 2 => elbow, _ => null };
+                var hand = right ? srcRightHand : srcLeftHand;
+                // The real joint each marker stands in for (see ArmMarkerParentFor).
+                Node? JointFor(int joint) => joint switch { 0 => shoulder, 1 => elbow, 2 => hand, _ => null };
+                var tgtShoulder = right ? _rightShoulder : _leftShoulder;
+                var tgtElbow = right ? _rightElbow : _leftElbow;
+                var tgtHand = right ? _rightHand : _leftHand;
+                Node? TargetJointFor(int joint) => joint switch { 0 => tgtShoulder, 1 => tgtElbow, 2 => tgtHand, _ => null };
 
                 for (int joint = 0; joint < 3; joint++)
                 {
@@ -1114,7 +1171,10 @@ namespace GlbMerger
                     var marker = FindExistingChildByName(parent, ArmMarkerName(category, joint));
                     if (marker == null) continue;
 
-                    var deg = QuaternionToDegrees(marker.LocalTransform.GetDecomposed().Rotation);
+                    var parentChange = FrameChange(parent, ArmMarkerParentFor(right, joint), JointFor(joint));
+                    var selfChange = FrameChange(JointFor(joint), TargetJointFor(joint), JointFor(joint + 1));
+                    var local = marker.LocalTransform.GetDecomposed().Rotation;
+                    var deg = QuaternionToDegrees(Quaternion.Normalize(Quaternion.Inverse(parentChange) * local * selfChange));
                     _armDeg[category, joint] = new JointDeg { X = deg.X, Y = deg.Y, Z = deg.Z };
                     any = true;
                 }

@@ -46,7 +46,7 @@ namespace GlbMerger
         private TrackBar _sliderBrush = null!;
         private Label _lblBrush = null!, _lblSelection = null!, _lblStatus = null!;
         private Button _btnClearSelection = null!, _btnApply = null!, _btnRevert = null!;
-        private Button _btnRemoveRigidity = null!, _btnColorize = null!;
+        private Button _btnRemoveRigidity = null!, _btnRebuildWeights = null!, _btnColorize = null!;
         private CheckBox _chkWireframe = null!;
         private NumericUpDown _numFeatherRings = null!;
         private ComboBox _animDropdown = null!;
@@ -208,6 +208,16 @@ namespace GlbMerger
                 "painted core goes fully back to original and the rings ease into whatever pinning " +
                 "survives around them, so the cut doesn't leave a crease.");
 
+            _btnRebuildWeights = MakeButton("Remove Saved Rigid Region (Painted)");
+            _btnRebuildWeights.Click += async (s, e) => await RebuildPaintedWeightsAsync();
+            flow.Controls.Add(_btnRebuildWeights);
+            _help.Add(flow,
+                "For rigid regions already saved into the file (from an earlier session), whose " +
+                "original weights are gone. Paint over the old region - Colorize by Rigidity shows " +
+                "it in solid green - and this rebuilds the painted faces' skin weights by blending " +
+                "in the weights of the unpainted skin around them. Paint slightly past the region's " +
+                "edge so the blend starts from skin that was never pinned.");
+
             _btnRevert = MakeButton("Revert All Rigid Regions");
             _btnRevert.Enabled = false;
             _btnRevert.Click += (s, e) => RevertAll();
@@ -318,6 +328,7 @@ namespace GlbMerger
             _btnClearSelection.Enabled = enabled;
             _numFeatherRings.Enabled = enabled;
             _btnApply.Enabled = enabled;
+            _btnRebuildWeights.Enabled = enabled;
         }
 
         private void PopulateAnimations()
@@ -490,7 +501,8 @@ namespace GlbMerger
             if (!_hasSkins) return;
             if (_originalSkin.Count == 0)
             {
-                _lblStatus.Text = "Nothing to remove - no region has been pinned in this session.";
+                _lblStatus.Text = "Nothing to remove - no region has been pinned in this session. " +
+                    "For a region saved in the file, use Remove Saved Rigid Region.";
                 return;
             }
 
@@ -519,6 +531,40 @@ namespace GlbMerger
                   (skippedPrims > 0 ? $" ({skippedPrims} painted primitive(s) skipped - no skin data)." : ".") +
                   " Included the next time you save."
                 : "Nothing removed - the painted faces were never pinned in this session.";
+        }
+
+        // Remove's counterpart for regions that came in with the file - see RebuildWeightsInMesh.
+        // Works whether or not anything has been pinned this session, and goes through the same
+        // snapshot as Apply, so Revert All takes it back too.
+        private async Task RebuildPaintedWeightsAsync()
+        {
+            if (!_hasSkins) return;
+
+            var selection = await ReadSelectionAsync();
+            if (IsDisposed) return;
+            if (selection == null || selection.Count == 0)
+            {
+                _lblStatus.Text = "Nothing painted - paint over the old rigid region first (Colorize by Rigidity shows it in green).";
+                return;
+            }
+
+            int maxRings = (int)_numFeatherRings.Value;
+            int rebuiltVerts = 0, skippedPrims = 0;
+
+            foreach (int meshIdx in selection.Keys.Select(k => k.MeshIndex).Distinct())
+            {
+                if (meshIdx < 0 || meshIdx >= _model.LogicalMeshes.Count) { skippedPrims++; continue; }
+                rebuiltVerts += RebuildWeightsInMesh(
+                    _model.LogicalMeshes[meshIdx], meshIdx, selection, maxRings, ref skippedPrims);
+            }
+
+            RefreshAfterSkinEdit();
+
+            _lblStatus.Text = rebuiltVerts > 0
+                ? $"Removed: {rebuiltVerts:N0} vertex weight(s) rebuilt from the surrounding skin" +
+                  (skippedPrims > 0 ? $" ({skippedPrims} painted primitive(s) skipped - no skin data)." : ".") +
+                  " Included the next time you save."
+                : "Nothing removed - the painted faces have no unpainted skin around them to rebuild from.";
         }
 
         // A jersey-number-style paint almost always sits on its own UV island, which means the
@@ -641,7 +687,7 @@ namespace GlbMerger
                 frontier = next;
             }
 
-            return new PaintedRegion(prims, offsets, dsu, level);
+            return new PaintedRegion(prims, offsets, dsu, level, rootAdjacency);
         }
 
         // The painted patch resolved against one mesh: the primitives that carry skin data, the
@@ -654,7 +700,8 @@ namespace GlbMerger
                 IList<Vector3> Positions, List<(int A, int B, int C)> Triangles)> Prims,
             int[] Offsets,
             DisjointSet Dsu,
-            Dictionary<int, int> Level)
+            Dictionary<int, int> Level,
+            Dictionary<int, HashSet<int>> RootAdjacency)
         {
             // 1 at the painted core, tapering across the feather rings, 0 for anything the paint
             // never reached (which callers skip entirely).
@@ -734,6 +781,139 @@ namespace GlbMerger
                         joints[v], weights[v], snapshot.OrigJoints[v], snapshot.OrigWeights[v], f);
                     joints[v] = nj;
                     weights[v] = nw;
+                    touched++;
+                }
+            }
+            return touched;
+        }
+
+        // For regions pinned in an EARLIER session. Their original weights were saved over and no
+        // snapshot exists, so there is nothing exact to put back - instead the painted vertices'
+        // weights are rebuilt from the unpinned skin around them. The vertices just outside the
+        // paint (and its feather rings) keep their weights and act as the boundary; everything
+        // inside is solved as the smooth (harmonic) blend of that boundary, which is the shape a
+        // hand-smoothed weight map takes anyway: a shoulder patch pinned 100% to Spine comes back
+        // shading from the arm's weights on one side to the neck's on the other. Feather rings
+        // then ease from the rebuilt weights into what's already there, as Apply's own rings do.
+        // An island the paint covers entirely has no boundary to rebuild from and is left alone.
+        private int RebuildWeightsInMesh(
+            SharpGLTF.Schema2.Mesh mesh, int meshIdx,
+            Dictionary<(int MeshIndex, int PrimitiveIndex), HashSet<int>> selection,
+            int maxRings, ref int skippedPrims)
+        {
+            var region = BuildPaintedRegion(mesh, meshIdx, selection, maxRings);
+            if (region == null) { skippedPrims++; return 0; }
+
+            var joints = new IList<Vector4>[region.Prims.Count];
+            var weights = new IList<Vector4>[region.Prims.Count];
+            for (int i = 0; i < region.Prims.Count; i++)
+            {
+                joints[i] = region.Prims[i].Joints.AsVector4Array();
+                weights[i] = region.Prims[i].Weights.AsVector4Array();
+            }
+
+            // One weight map per logical vertex; seam duplicates share skin data, so the first
+            // copy speaks for all of them.
+            var current = new Dictionary<int, Dictionary<int, float>>();
+            for (int i = 0; i < region.Prims.Count; i++)
+                for (int v = 0; v < region.Prims[i].Positions.Count; v++)
+                {
+                    int root = region.Dsu.Find(region.Offsets[i] + v);
+                    if (current.ContainsKey(root)) continue;
+                    var map = new Dictionary<int, float>();
+                    void One(float j, float w) { if (w > 0f) map[(int)j] = map.TryGetValue((int)j, out var e) ? e + w : w; }
+                    One(joints[i][v].X, weights[i][v].X); One(joints[i][v].Y, weights[i][v].Y);
+                    One(joints[i][v].Z, weights[i][v].Z); One(joints[i][v].W, weights[i][v].W);
+                    current[root] = map;
+                }
+
+            // Seed from the boundary inward, breadth first, so every unknown starts from the
+            // average of whatever is already settled next to it. That alone is a reasonable fill;
+            // the relaxation below then smooths away the ring-by-ring banding it leaves.
+            var solved = new Dictionary<int, Dictionary<int, float>>();
+            var order = new List<int>();
+            var frontier = region.Level.Keys
+                .Where(r => region.RootAdjacency.TryGetValue(r, out var n) && n.Any(x => !region.Level.ContainsKey(x)))
+                .ToList();
+            var queued = new HashSet<int>(frontier);
+            while (frontier.Count > 0)
+            {
+                var next = new List<int>();
+                foreach (int root in frontier)
+                {
+                    solved[root] = AverageOfNeighbors(root);
+                    order.Add(root);
+                    foreach (int n in region.RootAdjacency[root])
+                        if (region.Level.ContainsKey(n) && queued.Add(n)) next.Add(n);
+                }
+                frontier = next;
+            }
+
+            Dictionary<int, float> AverageOfNeighbors(int root)
+            {
+                var sum = new Dictionary<int, float>();
+                int count = 0;
+                foreach (int n in region.RootAdjacency[root])
+                {
+                    var map = region.Level.ContainsKey(n)
+                        ? (solved.TryGetValue(n, out var s) ? s : null)
+                        : current.GetValueOrDefault(n);
+                    if (map == null) continue;
+                    foreach (var (j, w) in map) sum[j] = sum.GetValueOrDefault(j) + w;
+                    count++;
+                }
+                if (count > 0)
+                    foreach (int j in sum.Keys.ToList()) sum[j] /= count;
+                return sum;
+            }
+
+            // Gauss-Seidel relaxation toward the harmonic solution. Tiny weights are pruned each
+            // pass so the maps don't fill up with every joint the diffusion ever brushed past.
+            for (int iter = 0; iter < 300; iter++)
+            {
+                float maxDelta = 0f;
+                foreach (int root in order)
+                {
+                    var avg = AverageOfNeighbors(root);
+                    foreach (var j in avg.Where(kv => kv.Value < 1e-4f).Select(kv => kv.Key).ToList()) avg.Remove(j);
+                    var old = solved[root];
+                    foreach (var j in avg.Keys.Union(old.Keys))
+                        maxDelta = MathF.Max(maxDelta, MathF.Abs(avg.GetValueOrDefault(j) - old.GetValueOrDefault(j)));
+                    solved[root] = avg;
+                }
+                if (maxDelta < 1e-4f) break;
+            }
+
+            int touched = 0;
+            for (int i = 0; i < region.Prims.Count; i++)
+            {
+                var (_, jointsAcc, weightsAcc, positions, _) = region.Prims[i];
+                bool written = false;
+
+                for (int v = 0; v < positions.Count; v++)
+                {
+                    float f = region.FeatherAt(i, v, maxRings);
+                    if (f <= 0f) continue;
+                    int root = region.Dsu.Find(region.Offsets[i] + v);
+                    if (!solved.TryGetValue(root, out var map) || map.Count == 0) continue;
+
+                    if (!written)
+                    {
+                        if (!_originalSkin.ContainsKey(jointsAcc))
+                            _originalSkin[jointsAcc] = (weightsAcc, joints[i].ToArray(), weights[i].ToArray());
+                        written = true;
+                    }
+
+                    var top = map.OrderByDescending(kv => kv.Value).Take(4).ToList();
+                    float total = top.Sum(kv => kv.Value);
+                    var tj = new float[4];
+                    var tw = new float[4];
+                    for (int k = 0; k < top.Count; k++) { tj[k] = top[k].Key; tw[k] = top[k].Value / total; }
+
+                    var (nj, nw) = BlendTowardOriginal(joints[i][v], weights[i][v],
+                        new Vector4(tj[0], tj[1], tj[2], tj[3]), new Vector4(tw[0], tw[1], tw[2], tw[3]), f);
+                    joints[i][v] = nj;
+                    weights[i][v] = nw;
                     touched++;
                 }
             }

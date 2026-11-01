@@ -489,6 +489,39 @@ namespace GlbMerger
             };
             lengthGroup.Controls.Add(_lblTargetInfo);
 
+            // Direction sits right under the bone picker rather than after the five size sliders,
+            // where it was below the visible area at the editor's default size and easy to miss -
+            // and on Hips (the bone it exists for) it is the adjustment most likely wanted.
+            lengthGroup.Controls.Add(new Label
+            {
+                Text = "Direction (swings one segment about its parent joint):", AutoSize = true,
+                MaximumSize = new System.Drawing.Size(320, 0), Margin = new Padding(3, 0, 3, 2),
+            });
+            _segmentDropdown = new ComboBox { Width = 320, DropDownStyle = ComboBoxStyle.DropDownList, Margin = new Padding(3, 0, 3, 4) };
+            _segmentDropdown.SelectedIndexChanged += (s, e) => RefreshUiFromState();
+            lengthGroup.Controls.Add(_segmentDropdown);
+
+            for (int axis = 0; axis < 3; axis++)
+            {
+                int a = axis;
+                _lblAim[a] = new Label { Text = AimLabel(a, 0), AutoSize = true, Margin = new Padding(3, 0, 3, 0) };
+                lengthGroup.Controls.Add(_lblAim[a]);
+
+                _sliderAim[a] = new TrackBar
+                {
+                    Width = 300, Height = 45, Minimum = MinAim, Maximum = MaxAim, Value = 0,
+                    TickFrequency = 15, Margin = new Padding(3, 0, 3, 4),
+                };
+                _sliderAim[a].ValueChanged += (s, e) => OnAimChanged(a);
+                var (btnLess, btnMore) = SliderNudge.Attach(_sliderAim[a]);
+
+                var aimHost = new Panel { Width = 306, Height = 45, Margin = new Padding(3, 0, 3, 4) };
+                aimHost.Controls.Add(btnLess);
+                aimHost.Controls.Add(_sliderAim[a]);
+                aimHost.Controls.Add(btnMore);
+                lengthGroup.Controls.Add(aimHost);
+            }
+
             _lblLength = new Label { Text = LengthLabel(DefaultPercent), AutoSize = true, Margin = new Padding(3, 0, 3, 0) };
             lengthGroup.Controls.Add(_lblLength);
 
@@ -571,36 +604,6 @@ namespace GlbMerger
             groupSizeHost.Controls.Add(_sliderGroupSize);
             groupSizeHost.Controls.Add(btnGroupBigger);
             lengthGroup.Controls.Add(groupSizeHost);
-
-            lengthGroup.Controls.Add(new Label
-            {
-                Text = "Direction (swings one segment about its parent joint):", AutoSize = true,
-                MaximumSize = new System.Drawing.Size(320, 0), Margin = new Padding(3, 8, 3, 2),
-            });
-            _segmentDropdown = new ComboBox { Width = 320, DropDownStyle = ComboBoxStyle.DropDownList, Margin = new Padding(3, 0, 3, 4) };
-            _segmentDropdown.SelectedIndexChanged += (s, e) => RefreshUiFromState();
-            lengthGroup.Controls.Add(_segmentDropdown);
-
-            for (int axis = 0; axis < 3; axis++)
-            {
-                int a = axis;
-                _lblAim[a] = new Label { Text = AimLabel(a, 0), AutoSize = true, Margin = new Padding(3, 0, 3, 0) };
-                lengthGroup.Controls.Add(_lblAim[a]);
-
-                _sliderAim[a] = new TrackBar
-                {
-                    Width = 300, Height = 45, Minimum = MinAim, Maximum = MaxAim, Value = 0,
-                    TickFrequency = 15, Margin = new Padding(3, 0, 3, 4),
-                };
-                _sliderAim[a].ValueChanged += (s, e) => OnAimChanged(a);
-                var (btnLess, btnMore) = SliderNudge.Attach(_sliderAim[a]);
-
-                var aimHost = new Panel { Width = 306, Height = 45, Margin = new Padding(3, 0, 3, 4) };
-                aimHost.Controls.Add(btnLess);
-                aimHost.Controls.Add(_sliderAim[a]);
-                aimHost.Controls.Add(btnMore);
-                lengthGroup.Controls.Add(aimHost);
-            }
 
             _chkMirror = new CheckBox
             {

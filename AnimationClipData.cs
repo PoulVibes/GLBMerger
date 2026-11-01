@@ -9,6 +9,10 @@ namespace GlbMerger
     {
         public required string Name { get; init; }
         public List<NodeChannelData> NodeChannels { get; } = new();
+
+        // When each foot stands planted, by foot bone name, in this clip's own time - read off
+        // the donor rig's motion before retargeting (see FootPlanting). Null = not detected yet.
+        public Dictionary<string, List<(float Start, float End)>>? FootContacts { get; set; }
     }
 
     public sealed class NodeChannelData
@@ -47,6 +51,8 @@ namespace GlbMerger
         // stands in.
         public Dictionary<string, Vector3>? BindScalesByName { get; init; }
         public Quaternion? HipsBindRotation { get; init; }
+        // This GLB's own rest pose and hierarchy, for finding when its clips' feet are planted.
+        public FootPlanting.Rig? FootRig { get; init; }
 
         // Whatever loop/pause setting (and seconds-offset to resume at) this library GLB's own
         // clips already carry in their glTF extras, keyed by each clip's *original* name (matching

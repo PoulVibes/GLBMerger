@@ -29,6 +29,12 @@ namespace GlbMerger
         private readonly ModelRoot _model;
 
         private ComboBox _boneDropdown = null!;
+        // What the rotation sliders turn: the selected joint itself, or - on a joint that
+        // branches, like Hips - one of the branches below it, swung about the selected joint
+        // (Hips -> Spine02 alone, or just the legs). Rotating Hips itself turns the whole body,
+        // so without this there was no way to tilt the spine or legs relative to the hips.
+        private ComboBox _branchDropdown = null!;
+        private readonly List<Branch> _branches = new();
         private ComboBox _animDropdown = null!;
         private TrackBar _sliderX = null!, _sliderY = null!, _sliderZ = null!;
         private Label _lblX = null!, _lblY = null!, _lblZ = null!;
@@ -115,6 +121,24 @@ namespace GlbMerger
         // selected.
         private readonly Dictionary<string, bool> _distributeSpineFlags = new();
 
+        // Child bone name -> not-yet-saved branch swing in degrees (see _branchDropdown), and the
+        // per-animation record of what was saved - the branch counterparts to _pendingOffsets
+        // and _committedOffsets. Keyed by the CHILD, since that is the node whose rotation and
+        // translation the swing rewrites. Kept apart from _pendingOffsets so a child can carry
+        // both its own joint correction and a swing about its parent.
+        private readonly Dictionary<string, (int X, int Y, int Z)> _pendingBranchOffsets = new();
+        private readonly Dictionary<(string Bone, string? Anim), (int X, int Y, int Z)> _committedBranchOffsets = new();
+
+        // One entry in _branchDropdown. No children = the selected joint itself. A mirrored pair
+        // (both legs) takes the slider values on the first child and their mirror image on the
+        // second.
+        private sealed record Branch(string Label, string[] Children, bool Mirrored);
+
+        private Branch? SelectedBranch =>
+            _branchDropdown.SelectedIndex > 0 && _branchDropdown.SelectedIndex < _branches.Count
+                ? _branches[_branchDropdown.SelectedIndex]
+                : null;
+
         private bool _suppressSliderEvents;
 
         public JointOrientationEditor(ModelRoot model, bool darkMode = false)
@@ -152,7 +176,13 @@ namespace GlbMerger
             y += lblBone.Height + 2;
             _boneDropdown = new ComboBox { Left = 12, Top = y, Width = 280, DropDownStyle = ComboBoxStyle.DropDownList };
             _boneDropdown.SelectedIndexChanged += (s, e) => OnBoneSelected();
-            y += _boneDropdown.Height + gap * 2;
+            y += _boneDropdown.Height + gap;
+
+            var lblBranch = new Label { Text = "Rotate (branching joints like Hips):", Left = 12, Top = y, AutoSize = true };
+            y += lblBranch.Height + 2;
+            _branchDropdown = new ComboBox { Left = 12, Top = y, Width = 280, DropDownStyle = ComboBoxStyle.DropDownList };
+            _branchDropdown.SelectedIndexChanged += (s, e) => OnBranchSelected();
+            y += _branchDropdown.Height + gap * 2;
 
             var lblAnim = new Label { Text = "Preview Animation:", Left = 12, Top = y, AutoSize = true };
             y += lblAnim.Height + 2;
@@ -224,7 +254,7 @@ namespace GlbMerger
 
             controlPanel.Controls.AddRange(new Control[]
             {
-                lblBone, _boneDropdown, lblAnim, _animDropdown, _btnPause, _chkShowJoints,
+                lblBone, _boneDropdown, lblBranch, _branchDropdown, lblAnim, _animDropdown, _btnPause, _chkShowJoints,
                 _lblX, _sliderX, btnMinusX, btnPlusX, _chkMirrorX, _chkInverseX,
                 _lblY, _sliderY, btnMinusY, btnPlusY, _chkMirrorY, _chkInverseY,
                 _lblZ, _sliderZ, btnMinusZ, btnPlusZ, _chkMirrorZ, _chkInverseZ,
@@ -362,6 +392,12 @@ namespace GlbMerger
                         var liveTranslationCorrections = {};
                         var basePositions = {};
 
+                        // boneName -> THREE.Quaternion that swings the bone's whole branch about
+                        // its PARENT joint (Hips -> Spine02, Hips -> LeftUpLeg): it turns the
+                        // bone's rotation like liveCorrections does, and also its offset from the
+                        // parent, so the branch pivots at the parent rather than at itself.
+                        var branchCorrections = {};
+
                         // Every bone's transform exactly as the file loaded it, captured once
                         // before any correction has ever been applied. Used as the fallback base
                         // for a bone with no track in the current clip: reading bone.quaternion
@@ -409,6 +445,11 @@ namespace GlbMerger
                         window.setLiveTranslationCorrection = function (boneName, x, y, z) {
                             if (!liveTranslationCorrections[boneName]) liveTranslationCorrections[boneName] = new THREE.Vector3();
                             liveTranslationCorrections[boneName].set(x, y, z);
+                        };
+
+                        window.setBranchCorrection = function (boneName, x, y, z, w) {
+                            if (!branchCorrections[boneName]) branchCorrections[boneName] = new THREE.Quaternion();
+                            branchCorrections[boneName].set(x, y, z, w);
                         };
 
                         window.setAnimationByName = function (name) {
@@ -619,11 +660,19 @@ namespace GlbMerger
                             if (mixer && !paused) mixer.update(delta);
                             var clipTime = currentAction ? currentAction.time : 0;
 
-                            for (var name in liveCorrections) {
+                            var rotationNames = Object.keys(liveCorrections).concat(
+                                Object.keys(branchCorrections).filter(function (n) { return !liveCorrections[n]; }));
+                            for (var ri = 0; ri < rotationNames.length; ri++) {
+                                var name = rotationNames[ri];
                                 var bone = bonesByName[name];
                                 if (!bone) continue;
 
-                                if (!paused) {
+                                // While paused the base is only taken once, but it is still taken
+                                // from the paused FRAME: a joint picking up its first correction
+                                // mid-pause (editing a position registers a rotation correction too)
+                                // used to fall straight to the rest pose here, snapping it to its
+                                // bind-pose angle until the animation was resumed.
+                                if (!paused || !baseQuaternions[name]) {
                                     var sampledRot = sampleTrackValue(currentClip, name, 'quaternion', clipTime);
                                     if (sampledRot) {
                                         if (!baseQuaternions[name]) baseQuaternions[name] = new THREE.Quaternion();
@@ -635,18 +684,22 @@ namespace GlbMerger
                                         // may already carry last frame's correction.
                                         baseQuaternions[name] = (restQuaternions[name] || bone.quaternion).clone();
                                     }
-                                } else if (!baseQuaternions[name]) {
-                                    baseQuaternions[name] = (restQuaternions[name] || bone.quaternion).clone();
                                 }
 
-                                bone.quaternion.copy(baseQuaternions[name]).premultiply(liveCorrections[name]);
+                                bone.quaternion.copy(baseQuaternions[name]);
+                                if (liveCorrections[name]) bone.quaternion.premultiply(liveCorrections[name]);
+                                if (branchCorrections[name]) bone.quaternion.premultiply(branchCorrections[name]);
                             }
 
-                            for (var posName in liveTranslationCorrections) {
+                            var positionNames = Object.keys(liveTranslationCorrections).concat(
+                                Object.keys(branchCorrections).filter(function (n) { return !liveTranslationCorrections[n]; }));
+                            for (var pi = 0; pi < positionNames.length; pi++) {
+                                var posName = positionNames[pi];
                                 var posBone = bonesByName[posName];
                                 if (!posBone) continue;
 
-                                if (!paused) {
+                                // Paused-frame sampling for the same reason as the rotation base.
+                                if (!paused || !basePositions[posName]) {
                                     var sampledPos = sampleTrackValue(currentClip, posName, 'position', clipTime);
                                     if (sampledPos) {
                                         if (!basePositions[posName]) basePositions[posName] = new THREE.Vector3();
@@ -657,8 +710,6 @@ namespace GlbMerger
                                         // already carry last frame's correction.
                                         basePositions[posName] = (restPositions[posName] || posBone.position).clone();
                                     }
-                                } else if (!basePositions[posName]) {
-                                    basePositions[posName] = (restPositions[posName] || posBone.position).clone();
                                 }
 
                                 // The correction is a WORLD-space delta (e.g. 'always 10cm
@@ -668,7 +719,8 @@ namespace GlbMerger
                                 // the offset visibly wobble instead of holding a steady position.
                                 // Counter-rotating by the parent's current world orientation is
                                 // what keeps it anchored in world space for the whole clip.
-                                var localDelta = liveTranslationCorrections[posName].clone();
+                                var localDelta = liveTranslationCorrections[posName]
+                                    ? liveTranslationCorrections[posName].clone() : new THREE.Vector3();
                                 if (posBone.parent) {
                                     posBone.parent.updateWorldMatrix(true, false);
                                     var parentWorldQuat = new THREE.Quaternion();
@@ -676,7 +728,9 @@ namespace GlbMerger
                                     localDelta.applyQuaternion(parentWorldQuat.invert());
                                 }
 
-                                posBone.position.copy(basePositions[posName]).add(localDelta);
+                                posBone.position.copy(basePositions[posName]);
+                                if (branchCorrections[posName]) posBone.position.applyQuaternion(branchCorrections[posName]);
+                                posBone.position.add(localDelta);
                             }
 
                             if (jointMarkersVisible) {
@@ -1007,6 +1061,101 @@ namespace GlbMerger
 
             if (_viewerReady)
                 _webView.CoreWebView2.ExecuteScriptAsync($"setSelectedJoint('{EscapeJs(boneName)}');");
+
+            PopulateBranches(boneName);
+        }
+
+        // Lists the branches below the selected joint: each child joint on its own, plus any
+        // Left/Right pair among them (the legs, under Hips) as one mirrored entry. A joint with a
+        // single child has nothing to choose between - rotating the joint already turns that one
+        // branch - so the dropdown only offers the joint itself and stays disabled.
+        private void PopulateBranches(string boneName)
+        {
+            var node = _model.LogicalNodes.First(n => n.Name == boneName);
+            var children = node.VisualChildren
+                .Select(c => c.Name)
+                .Where(n => !string.IsNullOrEmpty(n) && _boneDropdown.Items.Contains(n))
+                .Select(n => n!)
+                .ToList();
+
+            _branches.Clear();
+            _branches.Add(new Branch($"{boneName} (the joint itself)", Array.Empty<string>(), false));
+            if (children.Count > 1)
+            {
+                foreach (var left in children.Where(c => c.Contains("Left", StringComparison.Ordinal)))
+                {
+                    var right = GetMirrorBoneName(left);
+                    if (right != null && children.Contains(right))
+                        _branches.Add(new Branch($"{left} + {right} (mirrored)", new[] { left, right }, true));
+                }
+                foreach (var child in children)
+                    _branches.Add(new Branch($"{child} only (about {boneName})", new[] { child }, false));
+            }
+
+            _branchDropdown.Items.Clear();
+            foreach (var branch in _branches) _branchDropdown.Items.Add(branch.Label);
+            _branchDropdown.Enabled = _branches.Count > 1;
+            _branchDropdown.SelectedIndex = 0;
+        }
+
+        // Swaps the rotation sliders between the joint's own correction and a branch's swing.
+        // The position fields, Mirror/Inv and spine distribution all describe the joint itself,
+        // so they're disabled while a branch is selected rather than left looking live.
+        private void OnBranchSelected()
+        {
+            if (_boneDropdown.SelectedItem is not string boneName) return;
+            var branch = SelectedBranch;
+
+            var (x, y, z) = branch == null
+                ? (_pendingOffsets.TryGetValue(boneName, out var own) ? own : (0, 0, 0))
+                : (_pendingBranchOffsets.TryGetValue(branch.Children[0], out var swing) ? swing : (0, 0, 0));
+
+            _suppressSliderEvents = true;
+            _sliderX.Value = x;
+            _sliderY.Value = y;
+            _sliderZ.Value = z;
+            _lblX.Text = $"X Rotation: {x}°";
+            _lblY.Text = $"Y Rotation: {y}°";
+            _lblZ.Text = $"Z Rotation: {z}°";
+            _suppressSliderEvents = false;
+
+            bool joint = branch == null;
+            foreach (var c in new Control[]
+                     {
+                         _chkMirrorX, _chkMirrorY, _chkMirrorZ, _chkInverseX, _chkInverseY, _chkInverseZ,
+                         _numPosX, _numPosY, _numPosZ,
+                         _chkMirrorPosX, _chkMirrorPosY, _chkMirrorPosZ, _chkInversePosX, _chkInversePosY, _chkInversePosZ,
+                     })
+                c.Enabled = joint;
+            _chkDistributeSpine.Enabled = joint && IsSpineBone(boneName) && GetSpineBoneNames().Count > 1;
+        }
+
+        // Records the slider values as the selected branch's swing and shows it live. A mirrored
+        // pair reflects the swing across the body's left/right (YZ) plane for the second child -
+        // the same X-kept, Y/Z-flipped convention ApplyMirrorIfNeeded uses for joint corrections.
+        private void ApplyBranchRotation(Branch branch, bool isStaticPose, Animation? anim)
+        {
+            for (int i = 0; i < branch.Children.Length; i++)
+            {
+                var child = branch.Children[i];
+                var node = _model.LogicalNodes.First(n => n.Name == child);
+                GetOrCacheOriginalKeys(child, isStaticPose, anim, node);
+                GetOrCacheOriginalTranslationKeys(child, isStaticPose, anim, node);
+
+                var degrees = branch.Mirrored && i > 0
+                    ? (_sliderX.Value, -_sliderY.Value, -_sliderZ.Value)
+                    : (_sliderX.Value, _sliderY.Value, _sliderZ.Value);
+                _pendingBranchOffsets[child] = degrees;
+                PushBranchCorrection(child, degrees);
+            }
+        }
+
+        private void PushBranchCorrection(string child, (int X, int Y, int Z) degrees)
+        {
+            if (!_viewerReady) return;
+            var q = ComputeOffsetQuaternion(degrees.X, degrees.Y, degrees.Z);
+            _webView.CoreWebView2.ExecuteScriptAsync(
+                $"setBranchCorrection('{EscapeJs(child)}', {Inv(q.X)}, {Inv(q.Y)}, {Inv(q.Z)}, {Inv(q.W)});");
         }
 
         // Captures a bone's rotation data (its keys in the currently selected animation, or its
@@ -1067,6 +1216,12 @@ namespace GlbMerger
         {
             if (_boneDropdown.SelectedItem is not string boneName) return;
 
+            if (SelectedBranch is { } selectedBranch)
+            {
+                ResetBranch(selectedBranch);
+                return;
+            }
+
             var node = _model.LogicalNodes.First(n => n.Name == boneName);
             // Only undoes the live/not-yet-saved state for the currently selected animation (or
             // bind pose) - any other animation's baseline cached by a previous "Apply to All
@@ -1094,6 +1249,14 @@ namespace GlbMerger
             }
             _committedTranslationOffsets.Remove(cacheKey);
 
+            // Resetting a leg's own correction shouldn't also undo a swing it got from Hips above
+            // it (see _branchDropdown) - that one is reset from the parent - so put it back on.
+            if (_committedBranchOffsets.TryGetValue(cacheKey, out var swing))
+            {
+                Animation? anim = isStaticPose ? null : _model.LogicalAnimations.First(a => a.Name == (string)_animDropdown.SelectedItem!);
+                WriteBone(boneName, isStaticPose, anim, null, null, swing);
+            }
+
             _pendingOffsets.Remove(boneName);
             _pendingTranslationOffsets.Remove(boneName);
             _mirrorRotFlags.Remove(boneName);
@@ -1108,6 +1271,32 @@ namespace GlbMerger
                 _webView.CoreWebView2.ExecuteScriptAsync($"setLiveCorrection('{EscapeJs(boneName)}', 0, 0, 0, 1);");
                 _webView.CoreWebView2.ExecuteScriptAsync($"setLiveTranslationCorrection('{EscapeJs(boneName)}', 0, 0, 0);");
             }
+            _lblStatus.Text = "";
+        }
+
+        // Takes back a branch swing in the selected animation (or bind pose) only, rewriting each
+        // child from its baseline with whatever joint correction and position offset it still
+        // carries there - so the child's own adjustments survive the reset.
+        private void ResetBranch(Branch branch)
+        {
+            bool isStaticPose = _animDropdown.SelectedIndex <= 0;
+            Animation? anim = isStaticPose ? null : _model.LogicalAnimations.First(a => a.Name == (string)_animDropdown.SelectedItem!);
+            string? animKey = SelectedAnimationKey();
+
+            foreach (var child in branch.Children)
+            {
+                _pendingBranchOffsets.Remove(child);
+                if (_committedBranchOffsets.Remove((child, animKey)))
+                {
+                    (int X, int Y, int Z)? degrees = _committedOffsets.TryGetValue((child, animKey), out var d) ? d : null;
+                    (float X, float Y, float Z)? pos = _committedTranslationOffsets.TryGetValue((child, animKey), out var p) ? p : null;
+                    WriteBone(child, isStaticPose, anim, degrees, pos, null, restoreUntouched: true);
+                }
+                if (_viewerReady)
+                    _webView.CoreWebView2.ExecuteScriptAsync($"setBranchCorrection('{EscapeJs(child)}', 0, 0, 0, 1);");
+            }
+
+            OnBranchSelected();
             _lblStatus.Text = "";
         }
 
@@ -1126,9 +1315,11 @@ namespace GlbMerger
             // offsets get loaded into them too, so this covers saved and unsaved alike.
             var previouslyShown = new HashSet<string>(_pendingOffsets.Keys);
             previouslyShown.UnionWith(_pendingTranslationOffsets.Keys);
+            var previouslySwung = new List<string>(_pendingBranchOffsets.Keys);
 
             _pendingOffsets.Clear();
             _pendingTranslationOffsets.Clear();
+            _pendingBranchOffsets.Clear();
             _mirrorRotFlags.Clear();
             _mirrorPosFlags.Clear();
             _mirrorRotInverseFlags.Clear();
@@ -1140,6 +1331,8 @@ namespace GlbMerger
                 if (entry.Key.Anim == animKey) _pendingOffsets[entry.Key.Bone] = entry.Value;
             foreach (var entry in _committedTranslationOffsets)
                 if (entry.Key.Anim == animKey) _pendingTranslationOffsets[entry.Key.Bone] = entry.Value;
+            foreach (var entry in _committedBranchOffsets)
+                if (entry.Key.Anim == animKey) _pendingBranchOffsets[entry.Key.Bone] = entry.Value;
 
             if (_viewerReady)
             {
@@ -1160,10 +1353,13 @@ namespace GlbMerger
                 foreach (var entry in _pendingTranslationOffsets)
                     _webView.CoreWebView2.ExecuteScriptAsync(
                         $"setLiveTranslationCorrection('{EscapeJs(entry.Key)}', {Inv(entry.Value.X)}, {Inv(entry.Value.Y)}, {Inv(entry.Value.Z)});");
+                foreach (var child in previouslySwung)
+                    _webView.CoreWebView2.ExecuteScriptAsync($"setBranchCorrection('{EscapeJs(child)}', 0, 0, 0, 1);");
             }
+            foreach (var entry in _pendingBranchOffsets) PushBranchCorrection(entry.Key, entry.Value);
 
             if (_boneDropdown.SelectedItem is string) OnBoneSelected();
-            _lblStatus.Text = _pendingOffsets.Count > 0 || _pendingTranslationOffsets.Count > 0
+            _lblStatus.Text = _pendingOffsets.Count > 0 || _pendingTranslationOffsets.Count > 0 || _pendingBranchOffsets.Count > 0
                 ? "Showing adjustments already saved to this animation."
                 : "";
         }
@@ -1186,6 +1382,14 @@ namespace GlbMerger
 
             bool isStaticPose = _animDropdown.SelectedIndex <= 0;
             Animation? anim = isStaticPose ? null : _model.LogicalAnimations.First(a => a.Name == (string)_animDropdown.SelectedItem!);
+
+            if (SelectedBranch is { } branch)
+            {
+                _lblStatus.Text = "";
+                ApplyBranchRotation(branch, isStaticPose, anim);
+                return;
+            }
+
             var node = _model.LogicalNodes.First(n => n.Name == boneName);
             // Capture the baseline now, before Save could ever overwrite the model, so it reflects
             // this bone's truly-original data for the current animation.
@@ -1316,13 +1520,65 @@ namespace GlbMerger
             ApplyCorrection();
         }
 
+        // Rewrites one bone's keys in one target (an animation, or the bind pose) from its cached
+        // baseline: rotation = branch swing * joint correction * original, translation = the
+        // original turned by the branch swing (that's what pivots the branch about the parent
+        // joint) plus the world-space position offset. A part with nothing to apply is left as it
+        // is, except where a branch swing is being taken back - then the baseline goes back in.
+        private void WriteBone(string boneName, bool isStaticPose, Animation? targetAnim,
+            (int X, int Y, int Z)? degrees, (float X, float Y, float Z)? posOffset, (int X, int Y, int Z)? branch,
+            bool restoreUntouched = false)
+        {
+            var node = _model.LogicalNodes.First(n => n.Name == boneName);
+            string? targetAnimName = targetAnim?.Name;
+            var swing = branch is { } bd ? ComputeOffsetQuaternion(bd.X, bd.Y, bd.Z) : Quaternion.Identity;
+
+            if (degrees != null || branch != null || restoreUntouched)
+            {
+                var offset = degrees is { } dd ? ComputeOffsetQuaternion(dd.X, dd.Y, dd.Z) : Quaternion.Identity;
+                var total = Quaternion.Normalize(Quaternion.Multiply(swing, offset));
+                var originalKeys = GetOrCacheOriginalKeys(boneName, isStaticPose, targetAnim, node);
+
+                if (isStaticPose)
+                    node.WithLocalRotation(Quaternion.Normalize(Quaternion.Multiply(total, originalKeys[0].Value)));
+                else
+                {
+                    var corrected = originalKeys.Select(k => (k.Time, Quaternion.Normalize(Quaternion.Multiply(total, k.Value)))).ToArray();
+                    node.WithRotationAnimation(targetAnimName!, corrected);
+                }
+            }
+
+            if (posOffset != null || branch != null || restoreUntouched)
+            {
+                // Treated as a WORLD-space delta (e.g. "always 10cm lower"), not a raw local
+                // one - see ToParentLocalOffset for why a plain local add wobbles when the
+                // bone's parent chain is itself animated (a spine swaying with a breathing
+                // idle, say).
+                var worldOffset = posOffset is { } po ? new Vector3(po.X, po.Y, po.Z) : Vector3.Zero;
+                var originalTranslationKeys = GetOrCacheOriginalTranslationKeys(boneName, isStaticPose, targetAnim, node);
+
+                if (isStaticPose)
+                {
+                    var localDelta = ToParentLocalOffset(node, null, 0f, worldOffset);
+                    node.WithLocalTranslation(Vector3.Transform(originalTranslationKeys[0].Value, swing) + localDelta);
+                }
+                else
+                {
+                    var corrected = originalTranslationKeys
+                        .Select(k => (k.Time, Vector3.Transform(k.Value, swing) + ToParentLocalOffset(node, targetAnim, k.Time, worldOffset)))
+                        .ToArray();
+                    node.WithTranslationAnimation(targetAnimName!, corrected);
+                }
+            }
+        }
+
         // `applyToAll`: normally just the one currently-selected animation (or the static/bind
         // pose) is written. When true, every animation in the model becomes a target instead -
         // there's no "every animation" analogue for the bind pose, so this is simply ignored while
         // "None (Static Pose)" is selected.
         private void SaveAdjustments(bool applyToAll)
         {
-            if (_pendingOffsets.Count == 0 && _pendingTranslationOffsets.Count == 0)
+            if (_pendingOffsets.Count == 0 && _pendingTranslationOffsets.Count == 0 && _pendingBranchOffsets.Count == 0)
             {
                 MessageBox.Show(this, "No joint adjustments to save.", "Fix Joint Orientation",
                     MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -1343,58 +1599,25 @@ namespace GlbMerger
             // means neither kind of adjustment is silently skipped if that ever changes.
             var affectedBones = new HashSet<string>(_pendingOffsets.Keys);
             affectedBones.UnionWith(_pendingTranslationOffsets.Keys);
+            affectedBones.UnionWith(_pendingBranchOffsets.Keys);
 
             foreach (var boneName in affectedBones)
             {
-                var node = _model.LogicalNodes.First(n => n.Name == boneName);
-
                 foreach (var targetAnim in targetAnims)
                 {
                     string? targetAnimName = targetAnim?.Name;
+                    (int X, int Y, int Z)? degrees = _pendingOffsets.TryGetValue(boneName, out var d) ? d : null;
+                    (float X, float Y, float Z)? posOffset = _pendingTranslationOffsets.TryGetValue(boneName, out var p) ? p : null;
+                    (int X, int Y, int Z)? branch = _pendingBranchOffsets.TryGetValue(boneName, out var b) ? b : null;
 
-                    if (_pendingOffsets.TryGetValue(boneName, out var degrees))
-                    {
-                        var offset = ComputeOffsetQuaternion(degrees.X, degrees.Y, degrees.Z);
-                        var originalKeys = GetOrCacheOriginalKeys(boneName, isStaticPose, targetAnim, node);
+                    WriteBone(boneName, isStaticPose, targetAnim, degrees, posOffset, branch);
 
-                        if (isStaticPose)
-                            node.WithLocalRotation(Quaternion.Normalize(Quaternion.Multiply(offset, originalKeys[0].Value)));
-                        else
-                        {
-                            var corrected = originalKeys.Select(k => (k.Time, Quaternion.Normalize(Quaternion.Multiply(offset, k.Value)))).ToArray();
-                            node.WithRotationAnimation(targetAnimName!, corrected);
-                        }
-
-                        // Assignment, not accumulation: `degrees` is always measured against the
-                        // baseline this same target was corrected from, so re-saving while still
-                        // dragging the slider replaces the record instead of stacking onto it.
-                        _committedOffsets[(boneName, targetAnimName)] = degrees;
-                    }
-
-                    if (_pendingTranslationOffsets.TryGetValue(boneName, out var posOffset))
-                    {
-                        // Treated as a WORLD-space delta (e.g. "always 10cm lower"), not a raw local
-                        // one - see ToParentLocalOffset for why a plain local add wobbles when the
-                        // bone's parent chain is itself animated (a spine swaying with a breathing
-                        // idle, say).
-                        var worldOffset = new Vector3(posOffset.X, posOffset.Y, posOffset.Z);
-                        var originalTranslationKeys = GetOrCacheOriginalTranslationKeys(boneName, isStaticPose, targetAnim, node);
-
-                        if (isStaticPose)
-                        {
-                            var localDelta = ToParentLocalOffset(node, null, 0f, worldOffset);
-                            node.WithLocalTranslation(originalTranslationKeys[0].Value + localDelta);
-                        }
-                        else
-                        {
-                            var corrected = originalTranslationKeys
-                                .Select(k => (k.Time, k.Value + ToParentLocalOffset(node, targetAnim, k.Time, worldOffset)))
-                                .ToArray();
-                            node.WithTranslationAnimation(targetAnimName!, corrected);
-                        }
-
-                        _committedTranslationOffsets[(boneName, targetAnimName)] = posOffset;
-                    }
+                    // Assignment, not accumulation: each offset is always measured against the
+                    // baseline this same target was corrected from, so re-saving while still
+                    // dragging the slider replaces the record instead of stacking onto it.
+                    if (degrees is { } dv) _committedOffsets[(boneName, targetAnimName)] = dv;
+                    if (posOffset is { } pv) _committedTranslationOffsets[(boneName, targetAnimName)] = pv;
+                    if (branch is { } bv) _committedBranchOffsets[(boneName, targetAnimName)] = bv;
                 }
             }
 

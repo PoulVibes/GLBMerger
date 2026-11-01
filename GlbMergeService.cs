@@ -100,7 +100,11 @@ namespace GlbMerger
             // library file's own bind pose, captured up front in GlbAnimationSource), rather than
             // an FBX-style axis retarget, since these are ordinary glTF rigs sharing the same
             // Y-up convention as the target - not FBX exports needing a coordinate-system fix.
-            List<GlbAnimationSource>? libraryAnims2 = null)
+            List<GlbAnimationSource>? libraryAnims2 = null,
+            // Pins each foot in place while it's planted, re-solving the legs with two-bone IK -
+            // see FootPlanting. Contacts come from the donor rig's own motion where it's known.
+            List<string>? plantFeetAnims1 = null,
+            List<string>? plantFeetAnims2 = null)
         {
             if (path1 == null)
                 throw new ArgumentException("A model must be loaded - its geometry is always used as the merged output's structure.");
@@ -327,6 +331,7 @@ namespace GlbMerger
             if (model2 != null)
             {
                 var nativeClips2 = ExtractGlbAnimationClips(model2);
+                DetectFootContacts(nativeClips2, FootPlanting.Rig.From(otherNodesByName.Values), plantFeetAnims2);
                 ApplyBoneLengthCorrection(
                     nativeClips2,
                     sourceBindTranslationsByName, targetReferenceTranslationsByName,
@@ -355,6 +360,7 @@ namespace GlbMerger
             foreach (var librarySource in libraryAnims2 ?? Enumerable.Empty<GlbAnimationSource>())
             {
                 var clips = CloneClips(librarySource.Clips);
+                DetectFootContacts(clips, librarySource.FootRig, plantFeetAnims2);
                 ApplyBoneLengthCorrection(
                     clips,
                     librarySource.BindTranslationsByName, targetReferenceTranslationsByName,
@@ -393,8 +399,8 @@ namespace GlbMerger
             if (firstAnimName1 != null) MoveClipToFront(clips1, firstAnimName1);
             if (firstAnimName2 != null) MoveClipToFront(clips2, firstAnimName2);
 
-            void ApplySlot1() { if (allowedAnims1.Count > 0) ApplyClipsToNodes(clips1, nodeBuildersByName, allowedAnims1, new HashSet<string>(inPlaceAnims1), animRenameMap1, new HashSet<string>(groundFixAnims1 ?? new List<string>()), yRotationAnims1, yOffsetAnims1); }
-            void ApplySlot2() { if (allowedAnims2.Count > 0) ApplyClipsToNodes(clips2, nodeBuildersByName, allowedAnims2, new HashSet<string>(inPlaceAnims2), animRenameMap2, new HashSet<string>(groundFixAnims2 ?? new List<string>()), yRotationAnims2, yOffsetAnims2); }
+            void ApplySlot1() { if (allowedAnims1.Count > 0) ApplyClipsToNodes(clips1, nodeBuildersByName, allowedAnims1, new HashSet<string>(inPlaceAnims1), animRenameMap1, new HashSet<string>(groundFixAnims1 ?? new List<string>()), yRotationAnims1, yOffsetAnims1, new HashSet<string>(plantFeetAnims1 ?? new List<string>())); }
+            void ApplySlot2() { if (allowedAnims2.Count > 0) ApplyClipsToNodes(clips2, nodeBuildersByName, allowedAnims2, new HashSet<string>(inPlaceAnims2), animRenameMap2, new HashSet<string>(groundFixAnims2 ?? new List<string>()), yRotationAnims2, yOffsetAnims2, new HashSet<string>(plantFeetAnims2 ?? new List<string>())); }
 
             // Only swap the default (slot 1 then slot 2) order when slot 2 has a "First" pick and
             // slot 1 doesn't - otherwise slot 1's own animations would still register ahead of it.
@@ -427,6 +433,17 @@ namespace GlbMerger
         // instead of one that's been cropped away or left pointing at the old, pre-trim time.
         // Absent from loopFrameByName means "loop to frame 0" (the trimmed clip's own start),
         // unchanged from before this option existed.
+        // Reads each Plant Feet clip's foot contacts off its donor rig, before any correction
+        // reshapes its motion for the target. A clip left undetected (no rig known) gets its
+        // contacts from the target's own playback of it instead, in ApplyClipsToNodes.
+        private static void DetectFootContacts(List<AnimationClipData> clips, FootPlanting.Rig? sourceRig, List<string>? plantFeetNames)
+        {
+            if (sourceRig == null || plantFeetNames == null || plantFeetNames.Count == 0) return;
+            foreach (var clip in clips)
+                if (plantFeetNames.Contains(clip.Name))
+                    FootPlanting.DetectContacts(clip, sourceRig);
+        }
+
         private static Dictionary<string, float> ComputeLoopTimes(
             List<AnimationClipData> clips, Dictionary<string, int>? loopFrameByName,
             Dictionary<string, (int Start, int End)>? frameTrimByName)
@@ -614,6 +631,14 @@ namespace GlbMerger
                 if (ch.Rotation != null) ch.Rotation = TrimKeyDict(ch.Rotation, startTime, endTime);
                 if (ch.Scale != null) ch.Scale = TrimKeyDict(ch.Scale, startTime, endTime);
             }
+
+            if (clip.FootContacts != null)
+                clip.FootContacts = clip.FootContacts.ToDictionary(
+                    kv => kv.Key,
+                    kv => kv.Value
+                        .Where(w => w.End >= startTime && w.Start <= endTime)
+                        .Select(w => (Math.Max(w.Start, startTime) - startTime, Math.Min(w.End, endTime) - startTime))
+                        .ToList());
         }
 
         private static List<float> CollectFrameTimes(AnimationClipData clip)
@@ -1251,6 +1276,7 @@ namespace GlbMerger
                 BindTranslationsByName = bindTranslationsByName,
                 BindScalesByName = ScaleKeySync.RestScales(nodesByName.Values),
                 HipsBindRotation = hipsBindRotation,
+                FootRig = FootPlanting.Rig.From(nodesByName.Values),
                 LoopByClipName = loopByClipName
             };
         }
@@ -1264,7 +1290,11 @@ namespace GlbMerger
             var result = new List<AnimationClipData>();
             foreach (var clip in clips)
             {
-                var cloned = new AnimationClipData { Name = clip.Name };
+                var cloned = new AnimationClipData
+                {
+                    Name = clip.Name,
+                    FootContacts = clip.FootContacts?.ToDictionary(kv => kv.Key, kv => kv.Value.ToList()),
+                };
                 foreach (var ch in clip.NodeChannels)
                 {
                     cloned.NodeChannels.Add(new NodeChannelData
@@ -1505,8 +1535,11 @@ namespace GlbMerger
             List<AnimationClipData> clips, IReadOnlyDictionary<string, NodeBuilder> targetsByName,
             List<string> names, HashSet<string> inPlaceNames, IReadOnlyDictionary<string, string>? renameMap,
             HashSet<string>? groundFixNames = null,
-            IReadOnlyDictionary<string, float>? yRotationByName = null, IReadOnlyDictionary<string, float>? yOffsetByName = null)
+            IReadOnlyDictionary<string, float>? yRotationByName = null, IReadOnlyDictionary<string, float>? yOffsetByName = null,
+            HashSet<string>? plantFeetNames = null)
         {
+            var targetRig = plantFeetNames is { Count: > 0 } ? FootPlanting.Rig.From(targetsByName) : null;
+
             foreach (var clip in clips)
             {
                 if (!names.Contains(clip.Name)) continue;
@@ -1544,30 +1577,31 @@ namespace GlbMerger
                 if (yOffsetByName != null && yOffsetByName.TryGetValue(clip.Name, out var yOffset) && yOffset != 0f)
                     ApplyYOffset(clip, yOffset, targetsByName);
 
+                // Lock to the target node's actual rest/bind pose position (the un-animated
+                // geometry), not the clip's own first frame - the clip's first frame can itself be
+                // an arbitrary animated position (e.g. when retargeted, it's anchored onto an
+                // *existing* target animation's first frame, which is not necessarily the model's
+                // resting pose). Written into the clip itself, so Plant Feet below pins the feet
+                // where the locked clip actually puts them.
+                var hipsChannel = clip.NodeChannels.FirstOrDefault(c => c.NodeName == "Hips");
+                if (lockInPlace && hipsChannel?.Translation != null && targetsByName.TryGetValue("Hips", out var hipsNode))
+                {
+                    Matrix4x4.Decompose(hipsNode.LocalMatrix, out _, out _, out var bindTranslation);
+                    hipsChannel.Translation = hipsChannel.Translation.ToDictionary(
+                        k => k.Key,
+                        k => new Vector3(bindTranslation.X, k.Value.Y, bindTranslation.Z));
+                }
+
+                // Last of the corrections: it pins the feet wherever everything above left them.
+                if (targetRig != null && plantFeetNames!.Contains(clip.Name))
+                    FootPlanting.Apply(clip, targetRig);
+
                 foreach (var nodeChannel in clip.NodeChannels)
                 {
                     if (!targetsByName.TryGetValue(nodeChannel.NodeName, out var dstNode)) continue;
 
                     if (nodeChannel.Translation != null)
-                    {
-                        if (lockInPlace && nodeChannel.NodeName == "Hips")
-                        {
-                            // Lock to the target node's actual rest/bind pose position (the
-                            // un-animated geometry), not the clip's own first frame - the clip's
-                            // first frame can itself be an arbitrary animated position (e.g. when
-                            // retargeted, it's anchored onto an *existing* target animation's
-                            // first frame, which is not necessarily the model's resting pose).
-                            Matrix4x4.Decompose(dstNode.LocalMatrix, out _, out _, out var bindTranslation);
-                            var lockedXZ = nodeChannel.Translation.ToDictionary(
-                                k => k.Key,
-                                k => new Vector3(bindTranslation.X, k.Value.Y, bindTranslation.Z));
-                            dstNode.WithLocalTranslation(outputName, lockedXZ);
-                        }
-                        else
-                        {
-                            dstNode.WithLocalTranslation(outputName, nodeChannel.Translation);
-                        }
-                    }
+                        dstNode.WithLocalTranslation(outputName, nodeChannel.Translation);
 
                     if (nodeChannel.Rotation != null)
                         dstNode.WithLocalRotation(outputName, nodeChannel.Rotation);

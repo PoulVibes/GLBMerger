@@ -165,7 +165,7 @@ namespace GlbMerger
             panel1.UpdateTitle("Model (geometry, materials, animations)");
             panel1.SettingsChanged += OnPanelSettingsChanged;
 
-            panel2 = new GlbInfoPanel(showGeometryBox: false, defaultFixBoneLength: true, defaultFixHipRotation: true) { Dock = DockStyle.Fill, ShowAnimationCheckboxes = true };
+            panel2 = new GlbInfoPanel(showGeometryBox: false, defaultFixBoneLength: true, defaultFixHipRotation: true, defaultPlantFeet: true) { Dock = DockStyle.Fill, ShowAnimationCheckboxes = true };
             panel2.SettingsChanged += OnPanelSettingsChanged;
             panel2.UpdateTitle("Additional Models - drop a GLB onto Materials, FBX file(s) onto Animations");
             panel2.EnableDropTargets();
@@ -572,6 +572,7 @@ namespace GlbMerger
                 var groundFixAnims1 = panel1.GetGroundFixAnimationNames();
                 var fixBoneLengthAnims1 = panel1.GetFixBoneLengthAnimationNames();
                 var fixHipRotationAnims1 = panel1.GetFixHipRotationAnimationNames();
+                var plantFeetAnims1 = panel1.GetPlantFeetAnimationNames();
                 var yRotationAnims1 = panel1.GetYRotationByAnimation();
                 var yOffsetAnims1 = panel1.GetYOffsetByAnimation();
                 var renameMap1 = panel1.GetAnimationRenameMap();
@@ -590,6 +591,7 @@ namespace GlbMerger
                 var groundFixAnims2 = loaded2 ? panel2.GetGroundFixAnimationNames() : new List<string>();
                 var fixBoneLengthAnims2 = loaded2 ? panel2.GetFixBoneLengthAnimationNames() : new List<string>();
                 var fixHipRotationAnims2 = loaded2 ? panel2.GetFixHipRotationAnimationNames() : new List<string>();
+                var plantFeetAnims2 = loaded2 ? panel2.GetPlantFeetAnimationNames() : new List<string>();
                 var yRotationAnims2 = loaded2 ? panel2.GetYRotationByAnimation() : new Dictionary<string, float>();
                 var yOffsetAnims2 = loaded2 ? panel2.GetYOffsetByAnimation() : new Dictionary<string, float>();
                 var renameMap2 = loaded2 ? panel2.GetAnimationRenameMap() : new Dictionary<string, string>();
@@ -614,7 +616,8 @@ namespace GlbMerger
                     geomRenameMap1: geomRenameMap1,
                     libraryAnims2: libraryAnimsList2,
                     loopAnims1: loopAnims1, loopAnims2: loopAnims2,
-                    loopFrameByName1: loopFrameAnims1, loopFrameByName2: loopFrameAnims2);
+                    loopFrameByName1: loopFrameAnims1, loopFrameByName2: loopFrameAnims2,
+                    plantFeetAnims1: plantFeetAnims1, plantFeetAnims2: plantFeetAnims2);
 
                 // Meshy models ship with many per-face normals, which light a smooth surface as
                 // visible triangles; every merge leaves with smooth shading instead.

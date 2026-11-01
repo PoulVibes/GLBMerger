@@ -77,14 +77,16 @@ namespace GlbMerger
         // both default on.
         private readonly bool _defaultFixBoneLength;
         private readonly bool _defaultFixHipRotation;
+        private readonly bool _defaultPlantFeet;
 
         // Model 2 never uses its own geometry (model 1's is always used), so the "Available
         // Geometry" reference list is meaningless there - showGeometryBox omits it entirely and
         // lets the materials/animations lists expand to fill the space instead.
-        public GlbInfoPanel(bool showGeometryBox = true, bool defaultFixBoneLength = false, bool defaultFixHipRotation = false)
+        public GlbInfoPanel(bool showGeometryBox = true, bool defaultFixBoneLength = false, bool defaultFixHipRotation = false, bool defaultPlantFeet = false)
         {
             _defaultFixBoneLength = defaultFixBoneLength;
             _defaultFixHipRotation = defaultFixHipRotation;
+            _defaultPlantFeet = defaultPlantFeet;
 
             Padding = new Padding(4);
 
@@ -205,6 +207,10 @@ namespace GlbMerger
             // absorb it the way a leg can absorb its own bind mismatch. Off by default - only
             // needed when the torso visibly leans/shifts relative to the hips.
             grdAnimations.Columns.Add(new DataGridViewCheckBoxColumn { Name = "FixHipRotation", HeaderText = "Fix Hip Rotation", FillWeight = 30 });
+            // Stops planted feet sliding: finds when each foot stands still in the donor's own
+            // motion and re-solves the legs (two-bone IK) so the foot stays on that spot - see
+            // FootPlanting. Needed when the two rigs' legs differ in shape, not just size.
+            grdAnimations.Columns.Add(new DataGridViewCheckBoxColumn { Name = "PlantFeet", HeaderText = "Plant Feet", FillWeight = 30 });
             // Manual turn of the whole clip around the world Y axis (facing direction and root
             // motion path both rotate together, pivoting on the clip's own starting position) -
             // for cases where the retargeted clip simply faces/walks the wrong way. Out-of-range
@@ -268,7 +274,7 @@ namespace GlbMerger
             // would just immediately undo a bulk-check anyway).
             grdAnimations.ColumnHeaderMouseClick += (s, e) => ToggleAllInColumn(
                 grdAnimations, e.ColumnIndex,
-                new HashSet<string> { "Include", "InPlace", "GroundFix", "FixBoneLength", "FixHipRotation", "Loop" });
+                new HashSet<string> { "Include", "InPlace", "GroundFix", "FixBoneLength", "FixHipRotation", "PlantFeet", "Loop" });
 
             // Each box (label + list/grid) sits in its own SplitContainer panel with a draggable
             // divider between it and its neighbor, instead of the old TableLayoutPanel's fixed
@@ -774,7 +780,7 @@ namespace GlbMerger
         // earlier drop.
         private void RebuildAnimationGrid()
         {
-            var previousSettings = new Dictionary<string, (bool Include, string MergedAs, bool InPlace, bool GroundFix, bool FixBoneLength, bool FixHipRotation, decimal YRotation, decimal YOffset, decimal StartFrame, decimal EndFrame, bool EndAtLastFrame, bool First, bool Loop, decimal LoopFrame)>();
+            var previousSettings = new Dictionary<string, (bool Include, string MergedAs, bool InPlace, bool GroundFix, bool FixBoneLength, bool FixHipRotation, bool PlantFeet, decimal YRotation, decimal YOffset, decimal StartFrame, decimal EndFrame, bool EndAtLastFrame, bool First, bool Loop, decimal LoopFrame)>();
             foreach (DataGridViewRow row in grdAnimations.Rows)
             {
                 var name = (string)row.Cells["Name"].Value!;
@@ -786,6 +792,7 @@ namespace GlbMerger
                     row.Cells["GroundFix"].Value is bool gf && gf,
                     row.Cells["FixBoneLength"].Value is bool fbl && fbl,
                     row.Cells["FixHipRotation"].Value is bool fhr && fhr,
+                    row.Cells["PlantFeet"].Value is bool pf && pf,
                     row.Cells["YRotation"].Value is decimal yr ? yr : 0m,
                     row.Cells["YOffset"].Value is decimal yo ? yo : 0m,
                     row.Cells["StartFrame"].Value is decimal sf ? sf : 0m,
@@ -818,7 +825,7 @@ namespace GlbMerger
                     // 10.6s Idle to 1.9s mid-motion, so it snapped back to frame 0 on every loop.
                     decimal end = s.EndAtLastFrame ? lastFrame : Math.Clamp(s.EndFrame, start, lastFrame);
                     decimal loopFrame = Math.Clamp(s.LoopFrame, 0m, lastFrame);
-                    rowIndex = grdAnimations.Rows.Add(s.Include, name, s.MergedAs, s.InPlace, s.Loop, s.GroundFix, s.FixBoneLength, s.FixHipRotation, s.YRotation, s.YOffset, start, end, loopFrame, s.First);
+                    rowIndex = grdAnimations.Rows.Add(s.Include, name, s.MergedAs, s.InPlace, s.Loop, s.GroundFix, s.FixBoneLength, s.FixHipRotation, s.PlantFeet, s.YRotation, s.YOffset, start, end, loopFrame, s.First);
                 }
                 else
                 {
@@ -833,7 +840,7 @@ namespace GlbMerger
                     // etc.) is the exception and easy to uncheck per-row.
                     var (defaultLoop, defaultLoopFrame) = _animLoopByName.GetValueOrDefault(name, (true, 0));
                     decimal loopFrame = Math.Clamp((decimal)defaultLoopFrame, 0m, lastFrame);
-                    rowIndex = grdAnimations.Rows.Add(true, name, defaultMergedAs, false, defaultLoop, false, _defaultFixBoneLength, _defaultFixHipRotation, 0m, 0m, 0m, (decimal)lastFrame, loopFrame, false);
+                    rowIndex = grdAnimations.Rows.Add(true, name, defaultMergedAs, false, defaultLoop, false, _defaultFixBoneLength, _defaultFixHipRotation, _defaultPlantFeet, 0m, 0m, 0m, (decimal)lastFrame, loopFrame, false);
                 }
 
                 var row = grdAnimations.Rows[rowIndex];
@@ -994,6 +1001,19 @@ namespace GlbMerger
                 bool included = row.Cells["Include"].Value is bool inc && inc;
                 bool fixHipRotation = row.Cells["FixHipRotation"].Value is bool fhr && fhr;
                 if (included && fixHipRotation)
+                    result.Add((string)row.Cells["Name"].Value!);
+            }
+            return result;
+        }
+
+        public List<string> GetPlantFeetAnimationNames()
+        {
+            var result = new List<string>();
+            foreach (DataGridViewRow row in grdAnimations.Rows)
+            {
+                bool included = row.Cells["Include"].Value is bool inc && inc;
+                bool plantFeet = row.Cells["PlantFeet"].Value is bool pf && pf;
+                if (included && plantFeet)
                     result.Add((string)row.Cells["Name"].Value!);
             }
             return result;
