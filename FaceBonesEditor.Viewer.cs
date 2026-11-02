@@ -63,7 +63,8 @@ struct MouthParams
     float lipOpacity;                   // 0..1: how much the lips cover the paint under them
     float lipArc;                       // the bottom lip's curve: 1 round, below flatter, above deeper in the middle
     float alwaysDrawn;                  // 1: the drawn mouth never hands back to the paint, even at rest
-    float sculpted;                     // 1: lips sculpted in the mesh, parted by the jaw (MouthSculpted)
+    float sculpted;                     // 1: lips sculpted in the mesh, parted by the jaw (MouthSculpted);
+                                        // 2: and lips and skin mask painted over them (MouthSculptedLips)
     float seamBand;                     // sculpted: the lip line's band, region units either side, the
                                         // triangles bridging the lips lie in
 };
@@ -379,6 +380,40 @@ vec4 MouthSculpted(vec2 f, vec2 d, float restX[5], vec4 moves[5], vec3 chin, flo
     else               { c = mix(c, upperC, upper.y); c = mix(c, lowerC, lower.y); }
     return vec4(c, gap);
 }
+
+// Sculpted lips painted over (sculpted 2), at rest too. Worked as MouthSculpted is, in the head
+// frame (d) against the gap's edges (e: top, bottom, MouthGapAt), so they follow the lips as the jaw
+// parts them on clean curves -- not the bind pose, whose triangles round the mouth are big and
+// stretch, so its curves come out choppy. The painted mouth under them -- its dark line, painted
+// lips -- covered in skin within maskMargin of the gap (its whole width), then lips either side of
+// it, the upper one thinner, both thinning to the corners, shaded as MouthPaint's, with the outline.
+float MouthSculptedMask(vec2 d, vec2 e, float aa, MouthParams p)
+{
+    if (p.sculpted < 1.5 || p.maskMargin <= 0.0) return 0.0;
+    float dy = max(max(d.y - max(e.x, e.y), min(e.x, e.y) - d.y), 0.0);
+    return MouthIn(length(vec2(max(abs(d.x) - max(p.lip.z, 1e-4), 0.0), dy)) - p.maskMargin, aa);
+}
+
+vec4 MouthSculptedLips(vec2 d, vec2 e, float aa, MouthParams p)
+{
+    if (p.sculpted < 1.5 || p.lipThickness <= 0.0) return vec4(0.0);
+    float hl     = max(p.lip.z, 1e-4);
+    float t      = clamp(d.x / hl, -1.0, 1.0);
+    float top    = max(e.x, e.y), bottom = min(e.x, e.y);   // lips modelled apart can overlap shutting
+    float lipT   = p.lipThickness * sqrt(sqrt(max(1.0 - t * t, 0.0)));
+    float upperT = lipT * 0.8, lowerT = lipT * 1.2;
+    float dOuter = max(max(d.y - (top + upperT), (bottom - lowerT) - d.y), abs(d.x) - hl);
+    float lips   = MouthIn(dOuter, aa);
+    float ring   = MouthIn(dOuter - p.edge, aa) * step(1e-4, p.edge);
+    if (max(lips, ring) <= 0.0) return vec4(0.0);
+    float lv   = clamp((d.y - (bottom - lowerT)) / max(lowerT, 1e-4), 0.0, 1.0);   // 0 outer edge .. 1 the gap
+    float uv   = clamp((top + upperT - d.y) / max(upperT, 1e-4), 0.0, 1.0);
+    float isUp = step(0.5 * (top + bottom), d.y);
+    float l    = mix(lv, uv, isUp);
+    vec3  lipC = p.lips * mix(1.0, 0.7, l * l) * mix(1.0, 0.85, isUp)
+               + p.lips * 0.35 * exp(-pow((lv - 0.45) / 0.22, 2.0)) * (1.0 - isUp);
+    return vec4(mix(p.outline, lipC, lips), max(p.lipOpacity * lips, ring * 0.85));
+}
 // ---- end MouthPaint ----
 `;
         var FRAG_HEAD = [
@@ -433,8 +468,19 @@ vec4 MouthSculpted(vec2 f, vec2 d, float restX[5], vec4 moves[5], vec3 chin, flo
             '        if (p.sculpted > 0.5) {',
             '            vec3 d = (featMat[2] * vec4(vMouthDef, 1.0)).xyz;',
             '            vec4 sc = MouthSculpted(f.xy, d.xy, mouthRestX, mouthLipMove, mouthChin, aa, p);',
+            '            float cover = sc.a;',
+            '            if (p.sculpted > 1.5) {',
+            '                MouthShape g = MouthShapeAt(f.xy, p);',
+            '                vec2 e = MouthGapAt(d.x, mouthRestX, mouthLipMove, mouthChin, p);',
+            '                float aaD = length(fwidth(d.xy)) * 0.75;',
+            '                float mask = MouthSculptedMask(d.xy, e, aaD, p);',
+            '                vec3 painted = MouthCreases(mix(albedo, p.skin, mask), f.xy, aa, p, g);',
+            '                vec4 l = MouthSculptedLips(d.xy, e, aaD, p);',
+            '                albedo = mix(albedo, mix(painted, l.rgb, l.a), slab);',
+            '                cover = max(cover, max(mask, l.a));',
+            '            }',
             '            albedo = mix(albedo, sc.rgb, sc.a * slab);',
-            '            gMouthSurface = sc.a * slab;',
+            '            gMouthSurface = cover * slab;',
             '        } else {',
             '        MouthShape g = MouthShapeAt(f.xy, p);',
             '        albedo = mix(albedo, MouthCreases(MouthMask(albedo, f.xy, aa, p, g), f.xy, aa, p, g), slab);',
@@ -805,7 +851,7 @@ vec4 MouthSculpted(vec2 f, vec2 d, float restX[5], vec4 moves[5], vec3 chin, flo
         function applyMouth(s) {
             var M = s.mouth, face = faceFor(s), forced = testing(M);
             var open = mouthOpen(s);
-            var drawn = M.sculpted > 0.5 ? open > 1e-3 : (M.alwaysDrawn > 0.5 || Math.abs(open - (M.baseOpen || 0)) > 1e-3);
+            var drawn = M.sculpted > 0.5 ? (open > 1e-3 || M.sculptedPaint > 0.5) : (M.alwaysDrawn > 0.5 || Math.abs(open - (M.baseOpen || 0)) > 1e-3);
             U.mouthA.value.set(M.on && drawn ? 1 : 0, open, M.edge,
                                s.showRegion && M.on ? 1 : 0);
             U.mouthLip.value.set(M.lipY, M.lipCornerY, M.lipHalfWidth, M.openDepth);
@@ -825,7 +871,8 @@ vec4 MouthSculpted(vec2 f, vec2 d, float restX[5], vec4 moves[5], vec3 chin, flo
             U.mouthCrease.value.set(M.creaseCurve, M.creaseAngle * Math.PI / 180, M.creaseOffset, M.baseOpen || 0);
             var cc = linear(M.crease, 0);
             U.mouthCreaseColor.value.set(cc.x, cc.y, cc.z);
-            U.mouthLipLook.value.set(M.lipOpacity != null ? M.lipOpacity : 1, M.lipArc != null ? M.lipArc : 1, M.alwaysDrawn || 0, M.sculpted || 0);
+            U.mouthLipLook.value.set(M.lipOpacity != null ? M.lipOpacity : 1, M.lipArc != null ? M.lipArc : 1, M.alwaysDrawn || 0,
+                                   M.sculpted > 0.5 ? (M.sculptedPaint > 0.5 ? 2 : 1) : 0);
             U.mouthSeamBand.value = M.seamBand || 0.2;
             // The chin region across the mouth, as SculptedLips::Build.
             var C = s.regions[3], Mr = s.regions[2];

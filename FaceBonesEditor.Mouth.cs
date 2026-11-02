@@ -22,6 +22,7 @@ namespace GlbMerger
             public float OpenDepth = 1.2f, Edge = 0.03f, LipThickness = 0.3f, LipOpacity = 1f, LipArc = 1f;
             public bool AlwaysDrawn;   // the drawn mouth at rest too, never swapping back to the paint
             public bool SculptedLips;  // lips sculpted in the mesh: the jaw parts them (SculptedJaw)
+            public bool SculptedPaint;      // sculpted: lips and skin mask painted over the model's, at rest too
             public float SeamBand = 0.2f;   // sculpted: the lip line's band either side, region units
             public float UpperTooth = 0.4f, LowerTooth = 0.28f;               // region units past the lip
             public float TeethWidthPct = 70f, ToothWidth = 1f, ToothGapPct = 0f, Bite = 0f;
@@ -46,9 +47,11 @@ namespace GlbMerger
         private readonly List<(Button Swatch, Func<Color?> Get)> _mouthColors = new();
         private readonly Dictionary<string, Action<Color>> _mouthPickTargets = new();
 
-        private CheckBox _chkMouth = null!, _chkAlwaysDrawn = null!, _chkSculpted = null!, _chkTeethUpper = null!, _chkTeethLower = null!;
+        private CheckBox _chkMouth = null!, _chkAlwaysDrawn = null!, _chkSculpted = null!, _chkSculptedPaint = null!;
+        private CheckBox _chkTeethUpper = null!, _chkTeethLower = null!;
         private readonly List<NumericUpDown> _lipLineNumbers = new();   // set by the mouth points when there are some
         private readonly List<Control> _drawnLipRows = new();   // only for drawn lips: greyed out for sculpted ones
+        private readonly List<Control> _paintRows = new();      // lips, mask, creases: sculpted lips only when painted over
         private Control _seamBandRow = null!;                     // only for sculpted lips
         private TrackBar _sliderOpen = null!;
 
@@ -81,6 +84,7 @@ namespace GlbMerger
             ReadClamped(o, "lipArc", ref m.LipArc, 0.05f, 4f);
             m.AlwaysDrawn = o["alwaysDrawn"] is JsonNode ad && ad.GetValue<double>() > 0.5;
             m.SculptedLips = o["sculpted"] is JsonNode sc && sc.GetValue<double>() > 0.5;
+            m.SculptedPaint = o["sculptedPaint"] is JsonNode sp && sp.GetValue<double>() > 0.5;
             ReadClamped(o, "seamBand", ref m.SeamBand, 0.01f, 2f);
             ReadClamped(o, "maskMargin", ref m.MaskMargin, 0f, 3f);
             ReadClamped(o, "baseOpen", ref m.BaseOpen, 0f, 1f);
@@ -148,6 +152,7 @@ namespace GlbMerger
             yield return ("lipArc", m.LipArc);
             yield return ("alwaysDrawn", m.AlwaysDrawn ? 1f : 0f);
             yield return ("sculpted", m.SculptedLips ? 1f : 0f);
+            yield return ("sculptedPaint", m.SculptedPaint ? 1f : 0f);
             yield return ("seamBand", m.SeamBand);
             yield return ("maskMargin", m.MaskMargin);
             yield return ("baseOpen", m.BaseOpen);
@@ -213,10 +218,25 @@ namespace GlbMerger
             flow.Controls.Add(_chkSculpted);
             _help.Add(_chkSculpted, "For lips modelled into the mesh (Tre): the chin bone takes everything below the " +
                                     "mouth points' line, so opening the mouth parts the model's own lips, and only the " +
-                                    "inside of the mouth is drawn, in the gap. Chin drop sets how far they part. No drawn " +
-                                    "lips or skin mask, so their settings are greyed out; the teeth, tongue and inside " +
-                                    "colours and sizes still apply. Lips modelled apart: set Painted open so the jaw can shut them. Needs the mouth points and a " +
+                                    "inside of the mouth is drawn, in the gap. Chin drop sets how far they part. The " +
+                                    "teeth, tongue and inside colours and sizes still apply; drawn lips, skin mask and " +
+                                    "creases only with Paint lips and mask on them. Lips modelled apart: set Painted open so the jaw can shut them. Needs the mouth points and a " +
                                     "chin region, and Save Bones & Weights to rig the jaw before the preview can part the lips.");
+            _chkSculptedPaint = new CheckBox { Text = "Paint lips and mask on them", AutoSize = true, Margin = new Padding(20, 0, 3, 6) };
+            _chkSculptedPaint.CheckedChanged += (s, e) =>
+            {
+                if (_suppressEvents) return;
+                _mouth.SculptedPaint = _chkSculptedPaint.Checked;
+                UpdateSculptedRows();
+                MouthEdited();
+                FillSkinIfMissing();
+            };
+            flow.Controls.Add(_chkSculptedPaint);
+            _help.Add(_chkSculptedPaint, "Sculpted lips: paint over the model's own lips, at rest too - the Skin colour " +
+                                         "within Mask margin of the lip line (hiding a painted mouth line), then drawn lips " +
+                                         "Lip thickness either side of it in the Lips colour, with Lip opacity and the Outline. " +
+                                         "They ride the mesh as the jaw parts the lips. Creases show while it's open. Set " +
+                                         "Lip thickness to 0 for just the mask.");
             _seamBandRow = AddMouthNumber(flow, "Lip seam band", 0.01m, 2m, 0.02m, () => _mouth.SeamBand, v => _mouth.SeamBand = v,
                 "Sculpted lips: how far either side of the lip line (region units) the triangles bridging the lips " +
                 "reach - the inside is drawn on them as they stretch open. Raise it if the inside stops short of the lips.").Parent!;
@@ -253,14 +273,15 @@ namespace GlbMerger
             DrawnOnly(AddMouthNumber(flow, "Open distance", 0m, 5m, 0.05m, () => m.OpenDepth, v => m.OpenDepth = v,
                 "How far below the lip line a fully open mouth reaches, region units. Expressions and talking " +
                 "open it part way. (Sculpted lips: the Chin drop sets how far they part.)"));
-            DrawnOnly(AddMouthNumber(flow, "Lip thickness", 0m, 2m, 0.02m, () => m.LipThickness, v => m.LipThickness = v,
-                "How thick the lips round the opening are, region units (the lower one a little fuller). 0 = no lips."));
-            DrawnOnly(AddMouthNumber(flow, "Lip opacity", 0m, 1m, 0.05m, () => m.LipOpacity, v => m.LipOpacity = v,
+            PaintRow(AddMouthNumber(flow, "Lip thickness", 0m, 2m, 0.02m, () => m.LipThickness, v => m.LipThickness = v,
+                "How thick the lips round the opening are, region units (the lower one a little fuller). 0 = no lips. " +
+                "Sculpted lips painted over: how far the drawn lips reach either side of the lip line."));
+            PaintRow(AddMouthNumber(flow, "Lip opacity", 0m, 1m, 0.05m, () => m.LipOpacity, v => m.LipOpacity = v,
                 "How much the drawn lips cover the paint under them: 1 = solid, lower lets the painted mouth show through."));
             DrawnOnly(AddMouthNumber(flow, "Lip arc", 0.05m, 4m, 0.05m, () => m.LipArc, v => m.LipArc = v,
                 "The bottom lip's curve as the mouth opens: 1 = round; lower is flatter, deep right out to the corners " +
                 "(an even grin); higher drops the middle more than the sides."));
-            DrawnOnly(AddMouthNumber(flow, "Outline width", 0m, 1m, 0.01m, () => m.Edge, v => m.Edge = v,
+            PaintRow(AddMouthNumber(flow, "Outline width", 0m, 1m, 0.01m, () => m.Edge, v => m.Edge = v,
                 "Width of the soft line round the outside of the lips, in the Outline colour."));
         }
 
@@ -290,38 +311,39 @@ namespace GlbMerger
         private void BuildMaskRows(FlowLayoutPanel flow)
         {
             var m = _mouth;
-            DrawnOnly(AddMouthNumber(flow, "Mask margin", 0.02m, 3m, 0.02m, () => m.MaskMargin, v => m.MaskMargin = v,
+            PaintRow(AddMouthNumber(flow, "Mask margin", 0.02m, 3m, 0.02m, () => m.MaskMargin, v => m.MaskMargin = v,
                 "Whenever the mouth is open, everything this close (region units) to the painted lip line - its " +
                 "whole width - or to the opening is covered in the Skin colour, so the painted mouth (a baked-on " +
-                "smile past an O's corners, painted lips) never shows round the drawn one. Raise it until none does."));
+                "smile past an O's corners, painted lips) never shows round the drawn one. Raise it until none does. " +
+                "Sculpted lips painted over: round the lip line at rest too, hiding the painted mouth line."));
         }
 
         // A crease at each corner of the open mouth, like the ones painted on a smiling face.
         private void BuildCreaseRows(FlowLayoutPanel flow)
         {
             var m = _mouth;
-            DrawnOnly(AddMouthNumber(flow, "Crease length", 0m, 5m, 0.02m, () => m.CreaseLength, v => m.CreaseLength = v,
+            PaintRow(AddMouthNumber(flow, "Crease length", 0m, 5m, 0.02m, () => m.CreaseLength, v => m.CreaseLength = v,
                 "A crease at each corner of the open mouth, this long (region units), just outside the corner. 0 = none."));
-            DrawnOnly(AddMouthNumber(flow, "Crease width", 0m, 1m, 0.01m, () => m.CreaseWidth, v => m.CreaseWidth = v,
+            PaintRow(AddMouthNumber(flow, "Crease width", 0m, 1m, 0.01m, () => m.CreaseWidth, v => m.CreaseWidth = v,
                 "How thick the crease is in its middle; it tapers to points at the ends."));
-            DrawnOnly(AddMouthNumber(flow, "Crease curve", 0m, 1m, 0.05m, () => m.CreaseCurve, v => m.CreaseCurve = v,
+            PaintRow(AddMouthNumber(flow, "Crease curve", 0m, 1m, 0.05m, () => m.CreaseCurve, v => m.CreaseCurve = v,
                 "0 = a straight stroke, 1 = a half circle. It bulges away from the mouth - a ) at the right corner."));
-            DrawnOnly(AddMouthNumber(flow, "Crease angle", -90m, 90m, 5m, () => m.CreaseAngle, v => m.CreaseAngle = v,
+            PaintRow(AddMouthNumber(flow, "Crease angle", -90m, 90m, 5m, () => m.CreaseAngle, v => m.CreaseAngle = v,
                 "Degrees the crease's middle turns from straight out to the side: positive up, negative down.", 0));
-            DrawnOnly(AddMouthNumber(flow, "Crease offset", -2m, 2m, 0.02m, () => m.CreaseOffset, v => m.CreaseOffset = v,
+            PaintRow(AddMouthNumber(flow, "Crease offset", -2m, 2m, 0.02m, () => m.CreaseOffset, v => m.CreaseOffset = v,
                 "How far outside the opening's corner the crease sits, region units (negative: overlapping it)."));
-            DrawnOnly(AddMouthColor(flow, "Crease", c => m.Crease = c, () => m.Crease, fromModel: true,
+            PaintRow(AddMouthColor(flow, "Crease", c => m.Crease = c, () => m.Crease, fromModel: true,
                 "The creases' colour. \"From Model\" takes it from the next spot you click - a painted crease, say."));
         }
 
         private void BuildMouthColorRows(FlowLayoutPanel flow)
         {
             var m = _mouth;
-            DrawnOnly(AddMouthColor(flow, "Lips", c => m.Lips = c, () => m.Lips, fromModel: true,
+            PaintRow(AddMouthColor(flow, "Lips", c => m.Lips = c, () => m.Lips, fromModel: true,
                 "The lips' colour. \"From Model\" takes it from the next spot you click on the model."));
-            DrawnOnly(AddMouthColor(flow, "Outline", c => m.Outline = c, () => m.Outline, fromModel: true,
+            PaintRow(AddMouthColor(flow, "Outline", c => m.Outline = c, () => m.Outline, fromModel: true,
                 "The line round the outside of the lips. \"From Model\" takes it from the next spot you click."));
-            DrawnOnly(AddMouthColor(flow, "Skin", c => m.Skin = c, () => m.Skin, fromModel: true,
+            PaintRow(AddMouthColor(flow, "Skin", c => m.Skin = c, () => m.Skin, fromModel: true,
                 "The skin round the mouth, for the mask. Taken from the cheek beside the mouth region when the " +
                 "open mouth is first on; \"From Model\" takes it from the next spot you click instead."));
             AddMouthColor(flow, "Inside", c => m.Interior = c, () => m.Interior, fromModel: false, "The inside of the mouth.");
@@ -393,17 +415,25 @@ namespace GlbMerger
             return row;
         }
 
-        // A row only drawn lips use (lips, mask, creases, painted opening): greyed out for sculpted lips.
+        // A row only drawn lips use (the opening's depth and curve): greyed out for sculpted lips.
         private void DrawnOnly(Control rowOrNumber)
         {
             _drawnLipRows.Add(rowOrNumber is NumericUpDown n ? n.Parent! : rowOrNumber);
+        }
+
+        // A row for the lips, mask and creases: sculpted lips use it only when painted over.
+        private void PaintRow(Control rowOrNumber)
+        {
+            _paintRows.Add(rowOrNumber is NumericUpDown n ? n.Parent! : rowOrNumber);
         }
 
         private void UpdateSculptedRows()
         {
             bool sculpted = _mouth.SculptedLips;
             foreach (var row in _drawnLipRows) row.Enabled = !sculpted;
+            foreach (var row in _paintRows) row.Enabled = !sculpted || _mouth.SculptedPaint;
             _chkAlwaysDrawn.Enabled = !sculpted;
+            _chkSculptedPaint.Enabled = sculpted;
             _seamBandRow.Enabled = sculpted;
         }
 
@@ -469,6 +499,7 @@ namespace GlbMerger
             _chkMouth.Checked = _mouth.Enabled;
             _chkAlwaysDrawn.Checked = _mouth.AlwaysDrawn;
             _chkSculpted.Checked = _mouth.SculptedLips;
+            _chkSculptedPaint.Checked = _mouth.SculptedPaint;
             UpdateSculptedRows();
             foreach (var (control, get) in _mouthNumbers) SetClamped(control, get());
             foreach (var (swatch, get) in _mouthColors) ShowSwatch(swatch, get());

@@ -132,8 +132,11 @@ namespace GlbMerger
         private NumericUpDown _numRefineSegments = null!, _numRefineRoundness = null!, _numRefineCrease = null!;
         private CheckBox _chkRefineStoredNormals = null!;
         private Button _btnAnalyzeRefine = null!, _btnRefine = null!;
+        private CheckBox _chkFlipFolds = null!;
+        private NumericUpDown _numSurfacePadding = null!;
+        private Button _btnAnalyzeSurface = null!, _btnRepairSurface = null!;
 
-        private enum Operation { Simplify, Delete, Cut, Watertight, TextureWarp, Restore, Refine }
+        private enum Operation { Simplify, Delete, Cut, Watertight, Surface, TextureWarp, Restore, Refine }
 
         // Dropdown order and labels, indexed by Operation.
         private static readonly (Operation Op, string Label)[] Operations =
@@ -142,6 +145,7 @@ namespace GlbMerger
             (Operation.Delete,      "Delete Painted Triangles"),
             (Operation.Cut,         "Planar Cut"),
             (Operation.Watertight,  "Make Watertight"),
+            (Operation.Surface,     "Repair Surface Faults"),
             (Operation.TextureWarp, "Fix Texture Warp"),
             (Operation.Restore,     "Restore Painted Detail"),
             (Operation.Refine,      "Round Out Painted Region"),
@@ -149,7 +153,8 @@ namespace GlbMerger
 
         private ComboBox _cmbOperation = null!;
         private FlowLayoutPanel _secSimplifySettings = null!, _secPaint = null!, _secSimplifyActions = null!,
-            _secDelete = null!, _secCut = null!, _secWatertight = null!, _secUv = null!, _secRestore = null!, _secRefine = null!;
+            _secDelete = null!, _secCut = null!, _secWatertight = null!, _secSurface = null!, _secUv = null!, _secRestore = null!,
+            _secRefine = null!;
 
         private Operation CurrentOperation => Operations[Math.Max(0, _cmbOperation.SelectedIndex)].Op;
 
@@ -239,6 +244,7 @@ namespace GlbMerger
             var delete = _secDelete = NewSection();
             var cut = _secCut = NewSection();
             var watertight = _secWatertight = NewSection();
+            var surface = _secSurface = NewSection();
             var uv = _secUv = NewSection();
             var restore = _secRestore = NewSection();
             var refine = _secRefine = NewSection();
@@ -606,9 +612,10 @@ namespace GlbMerger
             _btnRestore.Click += async (s, e) => await RunRestoreAsync(apply: true);
             restore.Controls.Add(_btnRestore);
 
+            BuildSurfaceSection(surface);
             BuildRefineSection(refine);
 
-            foreach (var section in new[] { simplifySettings, paint, simplifyActions, delete, cut, watertight, uv, restore, refine })
+            foreach (var section in new[] { simplifySettings, paint, simplifyActions, delete, cut, watertight, surface, uv, restore, refine })
                 flow.Controls.Add(section);
 
             // Wired after every section exists, since the handler shows and hides all of them.
@@ -770,6 +777,7 @@ namespace GlbMerger
             _secDelete.Visible = op == Operation.Delete;
             _secCut.Visible = op == Operation.Cut;
             _secWatertight.Visible = op == Operation.Watertight;
+            _secSurface.Visible = op == Operation.Surface;
             _secUv.Visible = op == Operation.TextureWarp;
             _secRestore.Visible = op == Operation.Restore;
             _secRefine.Visible = op == Operation.Refine;
@@ -1531,6 +1539,120 @@ namespace GlbMerger
                 (skipped.Count > 0 ? $"\n{skipped.Count} mesh part(s) skipped: {skipped[0].SkippedReason}" : "");
         }
 
+        private void BuildSurfaceSection(FlowLayoutPanel surface)
+        {
+            _help.Add(surface,
+                "For the dark specks generated models show that flicker as the camera moves. Folds are " +
+                "small flaps of surface turned back over their neighbours to face into the body: drawn " +
+                "dark, and fighting the surface under them for the depth test. Each is turned the right " +
+                "way round, which only rewrites triangles - every vertex, UV and skin weight stays.");
+
+            _help.Add(surface,
+                "Texture padding carries each texture island's edge colour out into the empty atlas " +
+                "round it, so filtering at an island's edge blends in more island instead of black - " +
+                "what makes the specks black. Analyze paints the folds it found. Records a History step.");
+
+            _chkFlipFolds = new CheckBox { Text = "Turn folded-over triangles", Checked = true, AutoSize = true, Margin = new Padding(3, 0, 3, 4) };
+            surface.Controls.Add(_chkFlipFolds);
+
+            surface.Controls.Add(new Label { Text = "Texture padding (texels, 0 = off):", AutoSize = true, Margin = new Padding(3, 4, 3, 0) });
+            _numSurfacePadding = new NumericUpDown
+            {
+                Minimum = 0, Maximum = 64, Value = 16, Width = 110, Margin = new Padding(3, 0, 3, 6),
+            };
+            surface.Controls.Add(_numSurfacePadding);
+
+            _btnAnalyzeSurface = MakeButton("Analyze Surface Faults (dry run)");
+            _btnAnalyzeSurface.Click += async (s, e) => await RunSurfaceRepairAsync(apply: false);
+            surface.Controls.Add(_btnAnalyzeSurface);
+
+            _btnRepairSurface = MakeButton("Repair Surface Faults");
+            _btnRepairSurface.Click += async (s, e) => await RunSurfaceRepairAsync(apply: true);
+            surface.Controls.Add(_btnRepairSurface);
+        }
+
+        private async Task RunSurfaceRepairAsync(bool apply)
+        {
+            var options = new SurfaceRepair.Options
+            {
+                FlipFolds = _chkFlipFolds.Checked,
+                PaddingTexels = (int)_numSurfacePadding.Value,
+            };
+            if (!options.FlipFolds && options.PaddingTexels == 0)
+            {
+                _lblStatus.Text = "Every repair is switched off - tick Turn folded-over triangles, or set some texture padding.";
+                return;
+            }
+
+            SetBusy(true, apply ? "Repairing surface..." : "Looking for surface faults...");
+
+            SurfaceRepair.Report report;
+            try
+            {
+                report = await Task.Run(() => SurfaceRepair.Analyze(_model, options));
+            }
+            catch (Exception ex)
+            {
+                SetBusy(false, null);
+                MessageBox.Show(this, $"Surface analysis failed: {ex.Message}",
+                    "Optimize Geometry", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            if (IsDisposed) return;
+
+            FillSurfaceGrid(report);
+
+            if (!report.HasChanges)
+            {
+                SetBusy(false, "No folds or unpadded texture edges found - nothing to repair.");
+                return;
+            }
+
+            string summary =
+                $"{report.Flipped:N0} folded triangle(s) " + (apply ? "turned" : "to turn") +
+                (report.TouchesImages ? $", {report.TexelsPadded:N0} texel(s) of padding in {report.Images.Count} texture(s)." : ".");
+
+            if (!apply)
+            {
+                // What it found goes on as paint, so it can be looked over before anything changes.
+                var found = report.Primitives.Where(p => p.Found.Count > 0)
+                    .ToDictionary(p => (p.MeshIndex, p.PrimitiveIndex), p => p.Found);
+                SetBusy(false, summary + (found.Count > 0 ? " Painted in the preview." : "") + " Nothing changed yet.");
+                if (found.Count > 0) ReloadPreview(found);
+                return;
+            }
+
+            // Triangles only change in their index buffers; padding rewrites images, which the
+            // history has to capture first.
+            _history.BeginChange(touchesVertexData: false, touchesImages: report.TouchesImages);
+            SurfaceRepair.Apply(report, _model);
+
+            SetBusy(false, summary + " Included the next time you save the merge.");
+            RecordHistory($"Repair surface ({report.Flipped:N0} turned" + (report.TouchesImages ? ", padded" : "") + ")",
+                touchedVertexData: false, touchedImages: report.TouchesImages);
+            ShowBaseline();
+            ReloadPreview();
+        }
+
+        private void FillSurfaceGrid(SurfaceRepair.Report report)
+        {
+            _grid.Rows.Clear();
+            foreach (var group in report.Primitives.GroupBy(p => p.MeshName))
+            {
+                int tris = group.Sum(p => p.Triangles);
+                int flipped = group.Sum(p => p.Found.Count);
+                _grid.Rows.Add(group.Key, tris.ToString("N0"), tris.ToString("N0"), flipped == 0 ? "-" : $"{flipped:N0} turned");
+            }
+
+            var skipped = report.Primitives.Where(p => p.SkippedReason != null).ToList();
+            _lblTotals.Text =
+                (report.TouchesImages
+                    ? string.Join("\n", report.Images.Select(i => $"{i.Label}: {i.TexelsPadded:N0} texel(s) padded"))
+                    : "No texture padding.") +
+                (skipped.Count > 0 ? $"\n{skipped.Count} primitive(s) skipped: {skipped[0].SkippedReason}" : "");
+        }
+
         private void BuildRefineSection(FlowLayoutPanel refine)
         {
             _help.Add(refine,
@@ -1809,6 +1931,8 @@ namespace GlbMerger
             _btnApplyCut.Enabled = !busy;
             _btnAnalyzeWatertight.Enabled = !busy;
             _btnApplyWatertight.Enabled = !busy;
+            _btnAnalyzeSurface.Enabled = !busy;
+            _btnRepairSurface.Enabled = !busy;
             _btnAnalyzeUv.Enabled = !busy;
             _btnApplyUv.Enabled = !busy;
             _btnAnalyzeRestore.Enabled = !busy;
