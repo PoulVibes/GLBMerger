@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Windows.Forms;
 using SharpGLTF.Schema2;
 
@@ -31,7 +31,6 @@ namespace GlbMerger
             TextureEditor,
             TextureAtlas,
             RigidRegion,
-            JerseyNumbers,
             FlattenModel,
         }
 
@@ -52,7 +51,6 @@ namespace GlbMerger
             (EditorMode.TextureEditor,    "Texture Editor"),
             (EditorMode.TextureAtlas,     "Texture Atlas Optimizer"),
             (EditorMode.RigidRegion,      "Rigid Region (Prevent Skew)"),
-            (EditorMode.JerseyNumbers,    "Jersey Numbers"),
             (EditorMode.FlattenModel,     "Flatten Model (Billboards)"),
         };
 
@@ -216,7 +214,6 @@ namespace GlbMerger
                     EditorMode.TextureEditor => new TextureEditorEditor(_model, _darkMode),
                     EditorMode.TextureAtlas => new TextureAtlasOptimizerEditor(_model, _darkMode),
                     EditorMode.RigidRegion => new RigidRegionEditor(_model, _darkMode),
-                    EditorMode.JerseyNumbers => new JerseyNumberEditor(_model, _darkMode, _settings),
                     EditorMode.FlattenModel => new ModelFlattenerEditor(_model, _darkMode, _settings, _sourcePath),
                     _ => throw new ArgumentOutOfRangeException(nameof(mode)),
                 };

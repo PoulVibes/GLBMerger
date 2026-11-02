@@ -12,8 +12,7 @@ namespace GlbMerger
     // and may define onLoaded() and onFrame(dt). The page gives it: post(obj), showError(msg),
     // setHint(text), srgbToLinear(c), normalise(name), materialOf(hit), sampleTexture(hit, map),
     // sampleMR(hit), meshPointFromHit(hit), frameHead(), and once loaded the globals renderer,
-    // scene, camera, controls, meshes, headBone, modelHeight, modelRoot (the loaded scene) and
-    // animations (its clips).
+    // scene, camera, meshes, headBone, modelHeight.
     //
     // Everything runs in the mesh's raw bind-pose POSITION space - the space the anchors are
     // authored in - so an overlay keyed off `position` sticks to the face however the rig is posed.
@@ -126,7 +125,6 @@ namespace GlbMerger
             var meshes = [];
             var headBone = null;
             var modelHeight = 1;
-            var modelRoot = null, animations = [];
 
             window.frameHead = function () {
                 if (meshes.length === 0) return;
@@ -165,8 +163,6 @@ namespace GlbMerger
             var loader = new THREE.GLTFLoader();
             loader.load('https://appassets.local/" + previewFileName + @"', function (gltf) {
                 scene.add(gltf.scene);
-                modelRoot = gltf.scene;
-                animations = gltf.animations || [];
                 gltf.scene.traverse(function (obj) {
                     if (obj.isMesh) {
                         meshes.push(obj);
