@@ -133,6 +133,8 @@ namespace GlbMerger
         private CheckBox _chkRefineStoredNormals = null!;
         private Button _btnAnalyzeRefine = null!, _btnRefine = null!;
         private CheckBox _chkFlipFolds = null!;
+        private CheckBox _chkCleanRims = null!;
+        private CheckBox _chkRepairNormals = null!;
         private NumericUpDown _numSurfacePadding = null!;
         private Button _btnAnalyzeSurface = null!, _btnRepairSurface = null!;
 
@@ -1550,10 +1552,30 @@ namespace GlbMerger
             _help.Add(surface,
                 "Texture padding carries each texture island's edge colour out into the empty atlas " +
                 "round it, so filtering at an island's edge blends in more island instead of black - " +
-                "what makes the specks black. Analyze paints the folds it found. Records a History step.");
+                "what makes the specks black.");
+
+            _help.Add(surface,
+                "Rebuilding normals fixes facets that catch the light wrongly - bright or dark triangles " +
+                "that only show under lighting, often along a texture seam. A normal far off the surface " +
+                "round it is rebuilt from that surface; creases sharper than 60 degrees stay hard.");
+
+            _help.Add(surface,
+                "Cleaning dark rims fixes the short dark needles that painting over can't: generated " +
+                "textures bake a thin dark edge round each island, and a painter never reaches the texel " +
+                "just outside it. Those rims are replaced with the island's own colour before padding. " +
+                "A real dark outline along an island edge (round the eyes, say) looks the same, so " +
+                "Analyze paints everything it would change: erase the paint " +
+                "where a dark edge belongs, and Repair only cleans rims that are still painted. With " +
+                "nothing painted it cleans everywhere. Records a History step.");
 
             _chkFlipFolds = new CheckBox { Text = "Turn folded-over triangles", Checked = true, AutoSize = true, Margin = new Padding(3, 0, 3, 4) };
             surface.Controls.Add(_chkFlipFolds);
+
+            _chkRepairNormals = new CheckBox { Text = "Rebuild normals off the surface", Checked = true, AutoSize = true, Margin = new Padding(3, 0, 3, 4) };
+            surface.Controls.Add(_chkRepairNormals);
+
+            _chkCleanRims = new CheckBox { Text = "Clean dark rims round texture islands", Checked = true, AutoSize = true, Margin = new Padding(3, 0, 3, 4) };
+            surface.Controls.Add(_chkCleanRims);
 
             surface.Controls.Add(new Label { Text = "Texture padding (texels, 0 = off):", AutoSize = true, Margin = new Padding(3, 4, 3, 0) });
             _numSurfacePadding = new NumericUpDown
@@ -1576,12 +1598,26 @@ namespace GlbMerger
             var options = new SurfaceRepair.Options
             {
                 FlipFolds = _chkFlipFolds.Checked,
+                RepairNormals = _chkRepairNormals.Checked,
                 PaddingTexels = (int)_numSurfacePadding.Value,
+                CleanDarkRims = _chkCleanRims.Checked,
             };
-            if (!options.FlipFolds && options.PaddingTexels == 0)
+            if (!options.FlipFolds && !options.RepairNormals && options.PaddingTexels == 0 && !options.CleanDarkRims)
             {
-                _lblStatus.Text = "Every repair is switched off - tick Turn folded-over triangles, or set some texture padding.";
+                _lblStatus.Text = "Every repair is switched off - tick a repair, or set some texture padding.";
                 return;
+            }
+
+            // Paint left on after Analyze is what the rim cleanup may touch - see the help text.
+            int limitedTo = 0;
+            if (apply && options.CleanDarkRims)
+            {
+                var painted = await ReadSelectionAsync();
+                if (painted != null && painted.Values.Any(s => s.Count > 0))
+                {
+                    options.CleanOnlyTriangles = painted;
+                    limitedTo = painted.Values.Sum(s => s.Count);
+                }
             }
 
             SetBusy(true, apply ? "Repairing surface..." : "Looking for surface faults...");
@@ -1605,32 +1641,42 @@ namespace GlbMerger
 
             if (!report.HasChanges)
             {
-                SetBusy(false, "No folds or unpadded texture edges found - nothing to repair.");
+                SetBusy(false, "No folds, bad normals, dark rims or unpadded texture edges found - nothing to repair.");
                 return;
             }
 
             string summary =
                 $"{report.Flipped:N0} folded triangle(s) " + (apply ? "turned" : "to turn") +
+                (report.NormalsFixed > 0 ? $", {report.NormalsFixed:N0} normal(s) " + (apply ? "rebuilt" : "to rebuild") : "") +
+                (report.TexelsCleaned > 0 ? $", {report.TexelsCleaned:N0} dark rim texel(s) " + (apply ? "cleaned" : "to clean") +
+                    (limitedTo > 0 ? $" in the {limitedTo:N0} painted triangle(s)" : "") : "") +
                 (report.TouchesImages ? $", {report.TexelsPadded:N0} texel(s) of padding in {report.Images.Count} texture(s)." : ".");
 
             if (!apply)
             {
                 // What it found goes on as paint, so it can be looked over before anything changes.
-                var found = report.Primitives.Where(p => p.Found.Count > 0)
-                    .ToDictionary(p => (p.MeshIndex, p.PrimitiveIndex), p => p.Found);
+                var found = report.Primitives.Where(p => p.Found.Count > 0 || p.NormalTriangles.Count > 0)
+                    .ToDictionary(p => (p.MeshIndex, p.PrimitiveIndex), p => new HashSet<int>(p.Found.Concat(p.NormalTriangles)));
+                foreach (var (key, tris) in report.Images.SelectMany(i => i.CleanedTriangles))
+                {
+                    if (found.TryGetValue(key, out var set)) set.UnionWith(tris);
+                    else found[key] = new HashSet<int>(tris);
+                }
                 SetBusy(false, summary + (found.Count > 0 ? " Painted in the preview." : "") + " Nothing changed yet.");
                 if (found.Count > 0) ReloadPreview(found);
                 return;
             }
 
-            // Triangles only change in their index buffers; padding rewrites images, which the
-            // history has to capture first.
-            _history.BeginChange(touchesVertexData: false, touchesImages: report.TouchesImages);
+            // Turned folds only change index buffers; rebuilt normals are vertex data and padding
+            // rewrites images, both of which the history has to capture first.
+            _history.BeginChange(touchesVertexData: report.TouchesVertexData, touchesImages: report.TouchesImages);
             SurfaceRepair.Apply(report, _model);
 
             SetBusy(false, summary + " Included the next time you save the merge.");
-            RecordHistory($"Repair surface ({report.Flipped:N0} turned" + (report.TouchesImages ? ", padded" : "") + ")",
-                touchedVertexData: false, touchedImages: report.TouchesImages);
+            RecordHistory($"Repair surface ({report.Flipped:N0} turned" +
+                (report.NormalsFixed > 0 ? ", normals rebuilt" : "") +
+                (report.TexelsCleaned > 0 ? ", rims cleaned" : "") + (report.TexelsPadded > 0 ? ", padded" : "") + ")",
+                touchedVertexData: report.TouchesVertexData, touchedImages: report.TouchesImages);
             ShowBaseline();
             ReloadPreview();
         }
@@ -1642,13 +1688,18 @@ namespace GlbMerger
             {
                 int tris = group.Sum(p => p.Triangles);
                 int flipped = group.Sum(p => p.Found.Count);
-                _grid.Rows.Add(group.Key, tris.ToString("N0"), tris.ToString("N0"), flipped == 0 ? "-" : $"{flipped:N0} turned");
+                int normals = group.Sum(p => p.NormalsFixed);
+                var parts = new List<string>();
+                if (flipped > 0) parts.Add($"{flipped:N0} turned");
+                if (normals > 0) parts.Add($"{normals:N0} normals");
+                _grid.Rows.Add(group.Key, tris.ToString("N0"), tris.ToString("N0"), parts.Count == 0 ? "-" : string.Join(", ", parts));
             }
 
             var skipped = report.Primitives.Where(p => p.SkippedReason != null).ToList();
             _lblTotals.Text =
                 (report.TouchesImages
-                    ? string.Join("\n", report.Images.Select(i => $"{i.Label}: {i.TexelsPadded:N0} texel(s) padded"))
+                    ? string.Join("\n", report.Images.Select(i => $"{i.Label}: " +
+                        (i.TexelsCleaned > 0 ? $"{i.TexelsCleaned:N0} rim texel(s) cleaned, " : "") + $"{i.TexelsPadded:N0} padded"))
                     : "No texture padding.") +
                 (skipped.Count > 0 ? $"\n{skipped.Count} primitive(s) skipped: {skipped[0].SkippedReason}" : "");
         }

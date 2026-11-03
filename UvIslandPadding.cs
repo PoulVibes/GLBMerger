@@ -21,12 +21,28 @@ namespace GlbMerger
     // minification. So this is a straight multi-source flood of RGBA color, seeded from every texel
     // a triangle's UV footprint actually reaches - across every material channel that binds this
     // image, not just BaseColor, since padding helps a normal or ORM map exactly as much as albedo.
+    //
+    // That flood trusts the island's own edge, and generated textures (Meshy, Tripo and friends)
+    // often can't be trusted there: the bake leaves a thin dark rim round each island, a texel or
+    // two deep, where the black background bled in. On an atlas cut into hundreds of tiny islands
+    // those rims are all over the surface, and filtering at an island's edge reads them as short
+    // dark needles. Padding alone carries the dark rim outward into the gutter, and painting over
+    // it in a texture painter doesn't help either: a painter only writes the texels inside a
+    // triangle's footprint, so the dark gutter texel just outside still gets blended into the edge.
+    // CleanDarkRims fixes the rim first (see CleanRims), so the padding then carries out clean
+    // colour. It's a brightness test, so it only runs on images a BaseColor channel binds.
     public static class UvIslandPadding
     {
         public sealed class Options
         {
             /// <summary>How far past an island's own edge to extend its color, in texels.</summary>
             public int PaddingTexels { get; set; } = 16;
+
+            /// <summary>Replace dark rim texels at island edges with the island's own colour before padding (BaseColor images only).</summary>
+            public bool CleanDarkRims { get; set; }
+
+            /// <summary>When set, rims are only cleaned inside these triangles' footprints, by (mesh, primitive) - how a caller keeps a real dark outline.</summary>
+            public Dictionary<(int MeshIndex, int PrimitiveIndex), HashSet<int>>? CleanOnlyTriangles { get; set; }
         }
 
         public sealed class ImageTarget
@@ -42,6 +58,10 @@ namespace GlbMerger
             public int Height { get; init; }
             public int TexelsCovered { get; init; }
             public int TexelsPadded { get; init; }
+            public int TexelsCleaned { get; init; }
+
+            /// <summary>Triangles whose footprint holds a cleaned texel, by (mesh, primitive) - what a preview highlights.</summary>
+            public Dictionary<(int MeshIndex, int PrimitiveIndex), HashSet<int>> CleanedTriangles { get; } = new();
         }
 
         // Every image bound by at least one material channel, labelled with the material name(s)
@@ -82,6 +102,23 @@ namespace GlbMerger
             int coveredCount = covered.Count(c => c);
 
             var pixels = TextureAtlasUtil.ReadPixels(srcBitmap);
+
+            bool[]? cleaned = null;
+            int cleanedCount = 0;
+            if (options.CleanDarkRims && IsBaseColorImage(model, imageIndex))
+            {
+                bool[]? allowed = null;
+                if (options.CleanOnlyTriangles != null)
+                {
+                    allowed = new bool[width * height];
+                    RasterizeCoverage(tris.Where(t =>
+                        options.CleanOnlyTriangles.TryGetValue((t.MeshIndex, t.PrimitiveIndex), out var set)
+                        && set.Contains(t.TriangleIndex)).ToList(), width, height, allowed);
+                }
+                cleaned = new bool[width * height];
+                cleanedCount = CleanRims(width, height, pixels, covered, cleaned, allowed);
+            }
+
             int paddedCount = DilateColor(width, height, pixels, covered, options.PaddingTexels);
 
             using var resultBitmap = TextureAtlasUtil.WritePixels(pixels, width, height);
@@ -90,10 +127,25 @@ namespace GlbMerger
             var report = new Report
             {
                 ImageIndex = imageIndex, Width = width, Height = height,
-                TexelsCovered = coveredCount, TexelsPadded = paddedCount,
+                TexelsCovered = coveredCount, TexelsPadded = paddedCount, TexelsCleaned = cleanedCount,
             };
+            if (cleanedCount > 0)
+            {
+                foreach (var t in tris)
+                {
+                    if (!TouchesAny(t, width, height, cleaned!)) continue;
+                    var key = (t.MeshIndex, t.PrimitiveIndex);
+                    if (!report.CleanedTriangles.TryGetValue(key, out var set))
+                        report.CleanedTriangles[key] = set = new HashSet<int>();
+                    set.Add(t.TriangleIndex);
+                }
+            }
             return (report, pngBytes);
         }
+
+        private static bool IsBaseColorImage(ModelRoot model, int imageIndex) =>
+            model.LogicalMaterials.Any(mat => mat.Channels.Any(ch =>
+                ch.Key == "BaseColor" && ch.Texture?.PrimaryImage?.LogicalIndex == imageIndex));
 
         // Writes a previously computed result onto the model.
         public static void Apply(ModelRoot model, int imageIndex, byte[] pngBytes) =>
@@ -107,7 +159,12 @@ namespace GlbMerger
         private readonly struct Tri2
         {
             public readonly Vector2 Uv0, Uv1, Uv2; // already in pixel space
-            public Tri2(Vector2 uv0, Vector2 uv1, Vector2 uv2) { Uv0 = uv0; Uv1 = uv1; Uv2 = uv2; }
+            public readonly int MeshIndex, PrimitiveIndex, TriangleIndex;
+            public Tri2(Vector2 uv0, Vector2 uv1, Vector2 uv2, int meshIndex, int primitiveIndex, int triangleIndex)
+            {
+                Uv0 = uv0; Uv1 = uv1; Uv2 = uv2;
+                MeshIndex = meshIndex; PrimitiveIndex = primitiveIndex; TriangleIndex = triangleIndex;
+            }
         }
 
         // Every triangle from every primitive whose material binds this image on ANY channel - the
@@ -144,12 +201,14 @@ namespace GlbMerger
                             if (!seen.Add((meshIdx, primIdx, ch.TextureCoordinate))) continue;
 
                             var uvs = uvAcc.AsVector2Array();
+                            int triIdx = 0;
                             foreach (var (a, b, c) in prim.GetTriangleIndices())
                             {
                                 tris.Add(new Tri2(
                                     new Vector2(uvs[a].X * width, uvs[a].Y * height),
                                     new Vector2(uvs[b].X * width, uvs[b].Y * height),
-                                    new Vector2(uvs[c].X * width, uvs[c].Y * height)));
+                                    new Vector2(uvs[c].X * width, uvs[c].Y * height),
+                                    meshIdx, primIdx, triIdx++));
                             }
                         }
                     }
@@ -249,6 +308,178 @@ namespace GlbMerger
                 }
             }
             return paddedCount;
+        }
+
+        // --- dark rim cleanup --------------------------------------------------------------------
+
+        // A rim texel is one within RimDepth texels of its island's edge (8-neighbour steps); the
+        // rest of the island is its core. A rim texel darker than DarkRatio times the core texel
+        // nearest it is bake bleed, not detail.
+        private const int RimDepth = 2;
+        private const float DarkRatio = 0.65f;
+
+        // Replaces each island's dark rim texels with the colour of the nearest core texel of the
+        // same island, so padding afterwards carries clean colour out. Islands are the 8-connected
+        // groups of covered texels; the floods below only step through covered texels, so they
+        // never leave the island they started in and one island's colour can't reach another.
+        //
+        // An island too small to have a core RimDepth deep uses whatever is more than one texel in;
+        // one with no interior at all is left alone, since there's nothing to compare its rim to.
+        // A dark island (hair, a shadowed fold) has a dark core too, so its rim isn't dark by
+        // comparison and stays - only a rim darker than what it surrounds is replaced. A deliberate
+        // dark outline that runs along an island's edge looks the same as bleed and is lightened,
+        // which is why callers preview the triangles this touched and can pass `allowed` - only
+        // texels set in it are cleaned (they're still compared against the whole island).
+        internal static int CleanRims(int width, int height, byte[] pixels, bool[] covered, bool[] cleaned, bool[]? allowed = null)
+        {
+            int count = width * height;
+
+            // Depth into the island: 1 for a texel touching the gutter, growing inward.
+            var depth = new int[count];
+            var queue = new Queue<int>();
+            for (int i = 0; i < count; i++)
+            {
+                if (!covered[i]) continue;
+                int x = i % width, y = i / width;
+                for (int k = 0; k < 8; k++)
+                {
+                    int nx = x + Dx8[k], ny = y + Dy8[k];
+                    if (nx < 0 || nx >= width || ny < 0 || ny >= height || !covered[ny * width + nx])
+                    {
+                        depth[i] = 1;
+                        queue.Enqueue(i);
+                        break;
+                    }
+                }
+            }
+            while (queue.Count > 0)
+            {
+                int idx = queue.Dequeue();
+                ForEachCoveredNeighbour(idx, width, height, covered, n =>
+                {
+                    if (depth[n] != 0) return;
+                    depth[n] = depth[idx] + 1;
+                    queue.Enqueue(n);
+                });
+            }
+
+            // Label islands, and note the deepest texel each reaches to pick its core depth.
+            var island = new int[count];
+            var deepest = new List<int> { 0 };
+            for (int i = 0; i < count; i++)
+            {
+                if (!covered[i] || island[i] != 0) continue;
+                int label = deepest.Count, maxDepth = 0;
+                deepest.Add(0);
+                island[i] = label;
+                queue.Enqueue(i);
+                while (queue.Count > 0)
+                {
+                    int idx = queue.Dequeue();
+                    maxDepth = Math.Max(maxDepth, depth[idx]);
+                    ForEachCoveredNeighbour(idx, width, height, covered, n =>
+                    {
+                        if (island[n] != 0) return;
+                        island[n] = label;
+                        queue.Enqueue(n);
+                    });
+                }
+                deepest[label] = maxDepth;
+            }
+
+            int CoreDepth(int idx)
+            {
+                int d = deepest[island[idx]];
+                return d > RimDepth ? RimDepth + 1 : d > 1 ? 2 : int.MaxValue;
+            }
+
+            // Nearest core texel to every texel of its island, by flooding out from the cores.
+            var source = new int[count];
+            Array.Fill(source, -1);
+            for (int i = 0; i < count; i++)
+            {
+                if (covered[i] && depth[i] >= CoreDepth(i)) { source[i] = i; queue.Enqueue(i); }
+            }
+            while (queue.Count > 0)
+            {
+                int idx = queue.Dequeue();
+                ForEachCoveredNeighbour(idx, width, height, covered, n =>
+                {
+                    if (source[n] != -1) return;
+                    source[n] = source[idx];
+                    queue.Enqueue(n);
+                });
+            }
+
+            int cleanedCount = 0;
+            for (int i = 0; i < count; i++)
+            {
+                if (source[i] == -1 || source[i] == i) continue;
+                if (allowed != null && !allowed[i]) continue;
+                if (Luminance(pixels, i) >= DarkRatio * Luminance(pixels, source[i])) continue;
+                cleaned[i] = true;
+                cleanedCount++;
+            }
+            if (cleanedCount == 0) return 0;
+
+            // Each dark rim texel takes the colour of the core texel it was judged against. Not the
+            // nearest acceptable texel: that can be a rim texel only just above DarkRatio of its
+            // own core, which is still too dark for a brighter core next door - and every later
+            // run would then find, and "clean", the same texels again.
+            for (int i = 0; i < count; i++)
+            {
+                if (!cleaned[i]) continue;
+                int s = source[i];
+                pixels[i * 4 + 0] = pixels[s * 4 + 0];
+                pixels[i * 4 + 1] = pixels[s * 4 + 1];
+                pixels[i * 4 + 2] = pixels[s * 4 + 2];
+            }
+            return cleanedCount;
+        }
+
+        private static void ForEachCoveredNeighbour(int idx, int width, int height, bool[] covered, Action<int> visit)
+        {
+            int x = idx % width, y = idx / width;
+            for (int k = 0; k < 8; k++)
+            {
+                int nx = x + Dx8[k], ny = y + Dy8[k];
+                if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
+                int n = ny * width + nx;
+                if (covered[n]) visit(n);
+            }
+        }
+
+        // Pixels are BGRA (TextureAtlasUtil.ReadPixels).
+        private static float Luminance(byte[] pixels, int idx) =>
+            0.114f * pixels[idx * 4] + 0.587f * pixels[idx * 4 + 1] + 0.299f * pixels[idx * 4 + 2];
+
+        // Whether any texel centre inside the triangle's footprint is set in `mask` - the same
+        // inside test RasterizeCoverage uses.
+        private static bool TouchesAny(Tri2 t, int width, int height, bool[] mask)
+        {
+            int x0 = Math.Max(0, (int)MathF.Floor(MathF.Min(t.Uv0.X, MathF.Min(t.Uv1.X, t.Uv2.X))));
+            int x1 = Math.Min(width - 1, (int)MathF.Ceiling(MathF.Max(t.Uv0.X, MathF.Max(t.Uv1.X, t.Uv2.X))));
+            int y0 = Math.Max(0, (int)MathF.Floor(MathF.Min(t.Uv0.Y, MathF.Min(t.Uv1.Y, t.Uv2.Y))));
+            int y1 = Math.Min(height - 1, (int)MathF.Ceiling(MathF.Max(t.Uv0.Y, MathF.Max(t.Uv1.Y, t.Uv2.Y))));
+            float areaX2 = Cross2D(t.Uv1 - t.Uv0, t.Uv2 - t.Uv0);
+            if (MathF.Abs(areaX2) < 1e-6f) return false;
+
+            for (int py = y0; py <= y1; py++)
+            {
+                for (int px = x0; px <= x1; px++)
+                {
+                    if (!mask[py * width + px]) continue;
+                    var p = new Vector2(px + 0.5f, py + 0.5f);
+                    float w0 = Cross2D(t.Uv2 - t.Uv1, p - t.Uv1);
+                    float w1 = Cross2D(t.Uv0 - t.Uv2, p - t.Uv2);
+                    float w2 = Cross2D(t.Uv1 - t.Uv0, p - t.Uv0);
+                    bool inside = areaX2 > 0
+                        ? (w0 >= 0 && w1 >= 0 && w2 >= 0)
+                        : (w0 <= 0 && w1 <= 0 && w2 <= 0);
+                    if (inside) return true;
+                }
+            }
+            return false;
         }
     }
 }

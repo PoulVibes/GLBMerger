@@ -572,17 +572,126 @@ namespace GlbMerger
                                 var ox = pos[rep0 * 3], oy = pos[rep0 * 3 + 1], oz = pos[rep0 * 3 + 2];
                                 updates.push([w, ox + (sx - ox) * strength, oy + (sy - oy) * strength, oz + (sz - oz) * strength]);
                             });
-                            for (var u = 0; u < updates.length; u++) {
-                                var w2 = updates[u][0], dupes = info.duplicates[w2];
-                                for (var d = 0; d < dupes.length; d++) {
-                                    var v = dupes[d];
-                                    pos[v * 3] = updates[u][1]; pos[v * 3 + 1] = updates[u][2]; pos[v * 3 + 2] = updates[u][3];
-                                }
-                            }
+                            applyWithoutFolding(info, pos, updates);
                             posAttr.needsUpdate = true;
 
                             if (info.hasNormal) recomputeNormalsNear(info, eligibleWeld);
                             return true;
+                        }
+
+                        // Writes a frame's moves, then takes back whatever folds a triangle. Pulling a
+                        // point to its neighbours' plain average can carry it past the far edge of a
+                        // small triangle beside it wherever triangle sizes are uneven - as on any
+                        // generated model - and that triangle turns over, a fold that is drawn dark
+                        // and z-fights the surface it now lies on. Not always in one frame: a
+                        // triangle can also tip a little further each frame until it faces against
+                        // the surface round it. So a triangle near a moved point folds when it turns
+                        // over against its own facing before the frame (or collapses to nothing), or
+                        // when it faces against the triangles sharing its corners and does so more
+                        // than it did before the frame - a fold the model already had doesn't block
+                        // smoothing round it. Every moved corner of a folding triangle and of the
+                        // triangles round it is pulled half way back and checked again; after a few
+                        // halvings they go back to where they were this frame. Everything else moves
+                        // as before, so smoothing reads the same - it only stops short where it would
+                        // have folded.
+                        function applyWithoutFolding(info, pos, updates) {
+                            var moved = new Map();   // original vertex -> [old x, y, z, target x, y, z]
+                            var tris = new Set();
+                            for (var u = 0; u < updates.length; u++) {
+                                var dupes = info.duplicates[updates[u][0]];
+                                for (var d = 0; d < dupes.length; d++) {
+                                    var v = dupes[d];
+                                    moved.set(v, [pos[v * 3], pos[v * 3 + 1], pos[v * 3 + 2], updates[u][1], updates[u][2], updates[u][3]]);
+                                    var inc = info.incident[v];
+                                    for (var k = 0; k < inc.length; k++) tris.add(inc[k]);
+                                }
+                            }
+
+                            function normalOf(t, out) {
+                                var a = info.triangles[t * 3], b = info.triangles[t * 3 + 1], c = info.triangles[t * 3 + 2];
+                                _e1.set(pos[b * 3] - pos[a * 3], pos[b * 3 + 1] - pos[a * 3 + 1], pos[b * 3 + 2] - pos[a * 3 + 2]);
+                                _e2.set(pos[c * 3] - pos[a * 3], pos[c * 3 + 1] - pos[a * 3 + 1], pos[c * 3 + 2] - pos[a * 3 + 2]);
+                                return out.crossVectors(_e1, _e2);
+                            }
+
+                            // The triangles sharing a corner with t (welded, so across seams too).
+                            var rings = new Map();
+                            function ringOf(t) {
+                                var r = rings.get(t);
+                                if (r) return r;
+                                var set = new Set();
+                                for (var k = 0; k < 3; k++) {
+                                    var dupes = info.duplicates[info.weldOf[info.triangles[t * 3 + k]]];
+                                    for (var d = 0; d < dupes.length; d++) {
+                                        var inc = info.incident[dupes[d]];
+                                        for (var i = 0; i < inc.length; i++) if (inc[i] !== t) set.add(inc[i]);
+                                    }
+                                }
+                                r = Array.from(set);
+                                rings.set(t, r);
+                                return r;
+                            }
+                            // Cosine between t's normal and its ring's area-weighted one; 1 with nothing to compare.
+                            var _ring = new THREE.Vector3(), _other = new THREE.Vector3(), _own = new THREE.Vector3();
+                            function facingOf(t) {
+                                normalOf(t, _own);
+                                _ring.set(0, 0, 0);
+                                var r = ringOf(t);
+                                for (var i = 0; i < r.length; i++) _ring.add(normalOf(r[i], _other));
+                                var l = Math.sqrt(_own.lengthSq() * _ring.lengthSq());
+                                return l > 0 ? _own.dot(_ring) / l : 1;
+                            }
+
+                            var before = new Map(), facing = new Map();
+                            tris.forEach(function (t) { before.set(t, normalOf(t, new THREE.Vector3())); facing.set(t, facingOf(t)); });
+
+                            // Share of the way each moved vertex goes, halved for a corner of a fold.
+                            var share = new Map();
+                            moved.forEach(function (m, v) { share.set(v, 1); });
+                            function place(v) {
+                                var m = moved.get(v), s = share.get(v);
+                                pos[v * 3] = m[0] + (m[3] - m[0]) * s;
+                                pos[v * 3 + 1] = m[1] + (m[4] - m[1]) * s;
+                                pos[v * 3 + 2] = m[2] + (m[5] - m[2]) * s;
+                            }
+                            moved.forEach(function (m, v) { place(v); });
+
+                            function addMovedCorners(t, into) {
+                                for (var k = 0; k < 3; k++) {
+                                    var v = info.triangles[t * 3 + k];
+                                    if (moved.has(v) && share.get(v) > 0) into.add(info.weldOf[v]);
+                                }
+                            }
+
+                            // Past the halvings, a fold's neighbourhood goes back outright, round
+                            // after round until nothing folds. A triangle whose corners and ring are
+                            // all back is exactly as it was before the frame, so it can't fold; each
+                            // round puts at least one more point back, so this ends.
+                            for (var round = 0; ; round++) {
+                                var folding = new Set();
+                                tris.forEach(function (t) {
+                                    var n0 = before.get(t);
+                                    if (n0.lengthSq() === 0) return;   // no facing to keep
+                                    var n1 = normalOf(t, _n);
+                                    var turned = n1.dot(n0) <= n0.lengthSq() * 1e-6;   // or squashed to nothing
+                                    var f = turned ? -1 : facingOf(t);
+                                    if (!turned && !(f < 0 && f < facing.get(t) - 1e-6)) return;
+                                    addMovedCorners(t, folding);
+                                    var r = ringOf(t);
+                                    for (var i = 0; i < r.length; i++) addMovedCorners(r[i], folding);
+                                });
+                                if (folding.size === 0) return;
+                                // Split vertices of one welded point keep moving as one, so a seam never tears.
+                                folding.forEach(function (w) {
+                                    var dupes = info.duplicates[w];
+                                    for (var d = 0; d < dupes.length; d++) {
+                                        var v = dupes[d];
+                                        if (!moved.has(v)) continue;
+                                        share.set(v, round >= 4 ? 0 : share.get(v) * 0.5);
+                                        place(v);
+                                    }
+                                });
+                            }
                         }
 
                         // Recomputes smooth per-vertex normals (area-weighted, unnormalized-sum of
