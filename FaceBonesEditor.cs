@@ -132,6 +132,7 @@ namespace GlbMerger
                     LowerLipPoints = f == Mouth ? LowerLipPointsForRig() : null,
                     TiltDeg = f < Mouth ? _browTilt[f] : 0f,
                     ChinStartY = f == Chin ? MouthOpenBottomY() : null,
+                    ChinClearOf = f == Chin ? DrawnMouthArea() : null,
                     SculptedLips = f == Mouth && _mouth.Enabled && _mouth.SculptedLips,
                 })
                 .ToList();

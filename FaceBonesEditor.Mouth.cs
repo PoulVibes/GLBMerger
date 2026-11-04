@@ -488,6 +488,34 @@ namespace GlbMerger
             return _regions[Mouth].Centre.Y + (m.LipY - m.OpenDepth - shut - m.Edge - 0.8f) * ry;
         }
 
+        // Where the drawn mouth paints fully open, mesh units, as MouthShapeAt shapes it (unrounded, with the
+        // outline round it): the rigger keeps the chin's pull off every triangle in it. Null for sculpted lips,
+        // whose jaw parts the mesh instead.
+        private FaceBoneRigger.DrawnMouthArea? DrawnMouthArea()
+        {
+            if (!_mouth.Enabled || _mouth.SculptedLips || !_regions[Mouth].Set) return null;
+            var m = _mouth;
+            var region = _regions[Mouth];
+            float ry = region.RadiiPct.Y * _modelHeight / 100f;
+            float hl = Math.Max(m.LipWidthPct / 100f * MouthAspect, 1e-4f);
+            float shut = m.BaseOpen > 0f || m.AlwaysDrawn ? m.LipThickness : 0f;
+            float arcPow = Math.Max(m.LipArc, 0.05f);
+            var c = region.Centre;
+            return new FaceBoneRigger.DrawnMouthArea
+            {
+                MinX = c.X - (hl + m.Edge) * ry, MaxX = c.X + (hl + m.Edge) * ry,
+                Z = c.Z, Back = region.RadiiPct.Z * _modelHeight / 100f, Front = region.FrontPct * _modelHeight / 100f,
+                Span = x =>
+                {
+                    float t = Math.Clamp((x - c.X) / ry / hl, -1f, 1f);
+                    float arc = MathF.Sqrt(Math.Max(1f - t * t, 0f));
+                    float line = m.LipY + (m.LipCornerY - m.LipY) * t * t;
+                    float bottom = line - m.OpenDepth * MathF.Pow(arc, arcPow) - 2f * shut * MathF.Sqrt(arc);
+                    return (c.Y + (bottom - m.Edge) * ry, c.Y + (line + m.Edge) * ry);
+                },
+            };
+        }
+
         private void MouthEdited()
         {
             _dirty = true;

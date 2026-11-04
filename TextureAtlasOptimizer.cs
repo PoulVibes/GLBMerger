@@ -57,6 +57,9 @@ namespace GlbMerger
 
             /// <summary>Longest side of every rebuilt image; 0 keeps each image's own size.</summary>
             public int OutputSize { get; set; }
+
+            /// <summary>Clean the dark rims generators bake round source islands before rebaking (BaseColor images only) - see Bake.</summary>
+            public bool CleanDarkRims { get; set; } = true;
         }
 
         public sealed class GroupResult
@@ -310,6 +313,7 @@ namespace GlbMerger
             public required float[] Area;
             public required float[] SourceTexArea;   // per triangle, in source texels
             public required int[] Adj;          // per triangle edge: the triangle across it, or -1
+            public int[] SourceIsland = Array.Empty<int>();   // per triangle: its source island, numbered across the group
             public int TriCount => Tris.Length / 3;
             public int W(int t, int k) => Weld[Tris[t * 3 + k]];
         }
@@ -802,10 +806,19 @@ namespace GlbMerger
         // shouldn't veto an otherwise good merge.
         private const float StretchTolerance = 0.05f;
 
+        // How far past MaxStretch (as a further linear factor) that share may go. Without a bound the
+        // share was taken by whatever a conformal map squeezes hardest - the far end of a long
+        // merged chart - and on Jamal and Conner left hundreds of real triangles at a fifth of their
+        // texels or less, two hundred of Conner's at none: a triangle covering no texel shows one
+        // smeared sample and can't be painted. With the default MaxStretch of 1.5 this keeps every
+        // triangle within 2x of its density; a merge that can't is not made, and its seam stays.
+        private const float HardStretch = 4f / 3f;
+
         // A flattening is usable when (folds aside) no triangle is turned over, no two triangles
         // land on the same spot, and every part of it is within maxStretch of its target density
-        // relative to the rest. Mirrors the whole chart first if it came out the wrong way round
-        // (that alone isn't a fault). Fixes pts in place.
+        // relative to the rest - all but StretchTolerance of it, and even that within HardStretch
+        // further. Mirrors the whole chart first if it came out the wrong way round (that alone
+        // isn't a fault). Fixes pts in place.
         private static bool Validate(int[] localTris, Vector3[] pos, Vector2[] pts, float[] target, float maxStretch)
         {
             int triCount = localTris.Length / 3;
@@ -834,6 +847,7 @@ namespace GlbMerger
             float minArea3 = (float)(total3 / triCount * 1e-3);
             double ratio = pos2 / totalTarget;
             double limit = maxStretch * maxStretch;
+            double hardLimit = limit * HardStretch * HardStretch;
             double badStretch = 0;
             var faulty = new HashSet<int>();
             for (int t = 0; t < triCount; t++)
@@ -841,26 +855,34 @@ namespace GlbMerger
                 if (a3[t] < minArea3) continue;
                 if (a2[t] <= 0) { faulty.Add(t); continue; }
                 double r = a2[t] / target[t];
+                if (r < ratio / hardLimit || r > ratio * hardLimit) return false;
                 if (r < ratio / limit || r > ratio * limit) badStretch += target[t];
             }
             if (badStretch > totalTarget * StretchTolerance) return false;
 
             double foldBudget = total3 * FoldTolerance;
             if (faulty.Sum(t => (double)a3[t]) > foldBudget) return false;
-            FindOverlaps(localTris, pts, a2, a3, minArea3, faulty);
+            if (!FindOverlaps(localTris, pos, pts, a2, a3, minArea3, faulty)) return false;
             return faulty.Sum(t => (double)a3[t]) <= foldBudget;
         }
 
+        // How far apart (in multiples of the larger triangle's longest edge) two overlapping
+        // triangles may lie on the surface and still count as a fold.
+        private const float FoldReach = 3f;
+
         // Rasterizes the chart at a modest resolution: a sample strictly inside two triangles that
         // don't even share a corner means the chart lies on top of itself there. The smaller of
-        // each such pair goes into `faulty`.
-        private static void FindOverlaps(int[] localTris, Vector2[] pts, float[] a2, float[] a3, float minArea3, HashSet<int> faulty)
+        // each such pair goes into `faulty` - when the two lie close together on the surface, as a
+        // fold's flap does over its neighbours. Two triangles from different parts of the body
+        // sharing texels is no fold: painting one would paint the other. Returns false for that,
+        // which rejects the chart.
+        private static bool FindOverlaps(int[] localTris, Vector3[] pos, Vector2[] pts, float[] a2, float[] a3, float minArea3, HashSet<int> faulty)
         {
             int triCount = localTris.Length / 3;
-            if (triCount < 2) return;
+            if (triCount < 2) return true;
             var b = Bounds(pts);
             float extent = MathF.Max(b.Max.X - b.Min.X, b.Max.Y - b.Min.Y);
-            if (extent <= 0) return;
+            if (extent <= 0) return true;
 
             int grid = Math.Clamp((int)(MathF.Sqrt(triCount) * 4), 32, 512);
             float cell = extent / grid;
@@ -887,9 +909,23 @@ namespace GlbMerger
                         int idx = y * gw + x;
                         int o = owner[idx];
                         if (o < 0) { owner[idx] = t; continue; }
-                        if (!SharesCorner(localTris, t, o)) faulty.Add(a3[t] <= a3[o] ? t : o);
+                        if (SharesCorner(localTris, t, o)) continue;
+                        if (!CloseOnSurface(localTris, pos, t, o)) return false;
+                        faulty.Add(a3[t] <= a3[o] ? t : o);
                     }
             }
+            return true;
+        }
+
+        private static bool CloseOnSurface(int[] localTris, Vector3[] pos, int a, int b)
+        {
+            Vector3 Centroid(int t) => (pos[localTris[t * 3]] + pos[localTris[t * 3 + 1]] + pos[localTris[t * 3 + 2]]) / 3f;
+            float LongestEdge(int t)
+            {
+                var p0 = pos[localTris[t * 3]]; var p1 = pos[localTris[t * 3 + 1]]; var p2 = pos[localTris[t * 3 + 2]];
+                return MathF.Max(Vector3.Distance(p0, p1), MathF.Max(Vector3.Distance(p1, p2), Vector3.Distance(p2, p0)));
+            }
+            return Vector3.Distance(Centroid(a), Centroid(b)) <= FoldReach * MathF.Max(LongestEdge(a), LongestEdge(b));
         }
 
         private static bool SharesCorner(int[] localTris, int a, int b)
@@ -1154,6 +1190,7 @@ namespace GlbMerger
             progress?.Report(new Progress(done, total, $"{label}: merging charts"));
             var prims = group.Prims.Select(e => LoadPrim(model, e, srcW, srcH)).ToList();
             var charts = new List<Chart>();
+            int islandId = 0;
             foreach (var p in prims)
             {
                 var (seams, islands) = SourceIslands(p);
@@ -1161,7 +1198,13 @@ namespace GlbMerger
                 result.IslandsBefore += islands.Count;
                 result.Triangles += p.TriCount;
                 result.VerticesBefore += p.Pos.Length;
-                foreach (var island in islands) charts.Add(SourceChart(p, island, texScale));
+                p.SourceIsland = new int[p.TriCount];
+                foreach (var island in islands)
+                {
+                    foreach (int t in island) p.SourceIsland[t] = islandId;
+                    islandId++;
+                    charts.Add(SourceChart(p, island, texScale));
+                }
             }
             result.Primitives = prims.Count;
 
@@ -1283,7 +1326,8 @@ namespace GlbMerger
                 progress?.Report(new Progress(done, total, $"{label}: baking image {img}"));
                 var readers = prims.Where(p => p.Entry.Images.Contains(img)).ToList();
                 report.NewImages[img] = Bake(model, img, outSize[img], readers, rewrites,
-                    group.NormalImages.Contains(img), pad, cancellation);
+                    group.NormalImages.Contains(img), pad,
+                    options.CleanDarkRims && UvIslandPadding.IsBaseColorImage(model, img), cancellation);
                 done++;
             }
         }
@@ -1425,12 +1469,14 @@ namespace GlbMerger
             public readonly Vector2 N0, N1, N2;      // new UVs, in output texels
             public readonly Vector2 O0, O1, O2;      // source UVs, normalized
             public readonly float M00, M01, M10, M11; // normal-map XY: source frame -> new frame
+            public readonly int Island;               // source island, numbered across the group
 
             public BakeTri(Vector2 n0, Vector2 n1, Vector2 n2, Vector2 o0, Vector2 o1, Vector2 o2,
-                float m00, float m01, float m10, float m11)
+                float m00, float m01, float m10, float m11, int island)
             {
                 N0 = n0; N1 = n1; N2 = n2; O0 = o0; O1 = o1; O2 = o2;
                 M00 = m00; M01 = m01; M10 = m10; M11 = m11;
+                Island = island;
             }
         }
 
@@ -1440,15 +1486,25 @@ namespace GlbMerger
         // edge) rather than padding - bilinear filtering at the edge reads these.
         private const float EdgeReach = 1.5f;
 
+        // Where two source islands are merged into one chart, their old seam runs through the
+        // middle of it, and the texels along it sample the source right at the old islands' edges.
+        // Two things there would otherwise be baked into the chart's interior, where no later edge
+        // cleanup can reach them: the dark rim a generator leaves round each island (cleaned first
+        // when cleanRims, as Surface Repair does - see UvIslandPadding.CleanRims), and a
+        // neighbouring island packed closer than a bilinear footprint - generators pack islands
+        // with next to no gutter, so the texel beside an edge can belong to another part of the
+        // body entirely. Each sample therefore reads only texels of its own triangle's source
+        // island (see SampleOwnIsland), which the padding below extends past the island's edge.
         private static byte[] Bake(ModelRoot model, int imageIndex, (int W, int H) size, List<PrimData> readers,
-            Dictionary<PrimData, PrimitiveRewrite> rewrites, bool isNormal, int padding, CancellationToken cancellation)
+            Dictionary<PrimData, PrimitiveRewrite> rewrites, bool isNormal, int padding, bool cleanRims, CancellationToken cancellation)
         {
             using var srcBitmap = TextureAtlasUtil.LoadBitmap(TextureAtlasUtil.SnapshotContent(model, imageIndex));
             int sw = srcBitmap.Width, sh = srcBitmap.Height;
             var source = TextureAtlasUtil.ReadPixels(srcBitmap);
 
             var tris = new List<BakeTri>();
-            var sourceCovered = new bool[sw * sh];
+            var sourceOwner = new int[sw * sh];
+            Array.Fill(sourceOwner, -1);
             var srcScale = new Vector2(sw, sh);
             var outScale = new Vector2(size.W, size.H);
             foreach (var p in readers)
@@ -1473,14 +1529,20 @@ namespace GlbMerger
                         }
                     }
 
-                    tris.Add(new BakeTri(n0 * outScale, n1 * outScale, n2 * outScale, o0, o1, o2, m00, m01, m10, m11));
-                    RasterizeCoverage(o0 * srcScale, o1 * srcScale, o2 * srcScale, sw, sh, sourceCovered);
+                    int island = p.SourceIsland[t];
+                    tris.Add(new BakeTri(n0 * outScale, n1 * outScale, n2 * outScale, o0, o1, o2, m00, m01, m10, m11, island));
+                    RasterizeOwner(o0 * srcScale, o1 * srcScale, o2 * srcScale, sw, sh, sourceOwner, island);
                 }
             }
+            var sourceCovered = new bool[sw * sh];
+            for (int i = 0; i < sourceCovered.Length; i++) sourceCovered[i] = sourceOwner[i] >= 0;
+
+            if (cleanRims) UvIslandPadding.CleanRims(sw, sh, source, sourceCovered, new bool[sw * sh]);
 
             // Pad the source on its own islands first, so a bilinear sample at the very edge of a
-            // source island reads more of that island instead of whatever the old gutter held.
-            UvIslandPadding.DilateColor(sw, sh, source, sourceCovered, 4);
+            // source island reads more of that island instead of whatever the old gutter held -
+            // the owner padded with it, so the sample can tell its own island's texels apart.
+            UvIslandPadding.DilateColor(sw, sh, source, sourceCovered, 4, owner: sourceOwner);
 
             int width = size.W, height = size.H;
             var output = new byte[width * height * 4];
@@ -1505,7 +1567,7 @@ namespace GlbMerger
                 int rowStart = band * BandRows;
                 int rowEnd = Math.Min(height, rowStart + BandRows) - 1;
                 foreach (int i in perBand[band])
-                    BakeTriangle(tris[i], width, rowStart, rowEnd, source, sw, sh, output, dist, isNormal);
+                    BakeTriangle(tris[i], width, rowStart, rowEnd, source, sourceOwner, sw, sh, output, dist, isNormal);
             });
 
             var covered = new bool[width * height];
@@ -1539,7 +1601,7 @@ namespace GlbMerger
         }
 
         private static void BakeTriangle(in BakeTri t, int width, int rowStart, int rowEnd,
-            byte[] source, int sw, int sh, byte[] output, float[] dist, bool isNormal)
+            byte[] source, int[] sourceOwner, int sw, int sh, byte[] output, float[] dist, bool isNormal)
         {
             float minX = MathF.Min(t.N0.X, MathF.Min(t.N1.X, t.N2.X)) - EdgeReach;
             float maxX = MathF.Max(t.N0.X, MathF.Max(t.N1.X, t.N2.X)) + EdgeReach;
@@ -1576,7 +1638,7 @@ namespace GlbMerger
                     dist[idx] = d;
 
                     var uv = t.O0 * w0 + t.O1 * w1 + t.O2 * w2;
-                    TextureRebaker.SampleBilinear(source, sw, sh, uv, output, idx * 4);
+                    SampleOwnIsland(source, sourceOwner, sw, sh, uv, t.Island, output, idx * 4);
 
                     if (isNormal)
                     {
@@ -1621,7 +1683,42 @@ namespace GlbMerger
             return best;
         }
 
-        private static void RasterizeCoverage(Vector2 a, Vector2 b, Vector2 c, int width, int height, bool[] covered)
+        // Bilinear like TextureRebaker.SampleBilinear, over only the taps that belong to `island`,
+        // re-weighted to sum to one. A sample none of whose taps are its island's (it can happen
+        // past the reach of the padding) falls back to plain bilinear, as before.
+        private static void SampleOwnIsland(byte[] src, int[] owner, int width, int height, Vector2 uv, int island, byte[] dst, int dstOffset)
+        {
+            float fx = uv.X * width - 0.5f, fy = uv.Y * height - 0.5f;
+            int x0 = (int)MathF.Floor(fx), y0 = (int)MathF.Floor(fy);
+            float tx = fx - x0, ty = fy - y0;
+            int xa = Wrap(x0, width), xb = Wrap(x0 + 1, width), ya = Wrap(y0, height), yb = Wrap(y0 + 1, height);
+            Span<int> taps = stackalloc int[] { ya * width + xa, ya * width + xb, yb * width + xa, yb * width + xb };
+            Span<float> weights = stackalloc float[] { (1 - tx) * (1 - ty), tx * (1 - ty), (1 - tx) * ty, tx * ty };
+
+            float total = 0;
+            for (int k = 0; k < 4; k++)
+            {
+                if (owner[taps[k]] != island) weights[k] = 0;
+                total += weights[k];
+            }
+            if (total < 1e-6f)
+            {
+                TextureRebaker.SampleBilinear(src, width, height, uv, dst, dstOffset);
+                return;
+            }
+            for (int c = 0; c < 4; c++)
+            {
+                float v = 0;
+                for (int k = 0; k < 4; k++) v += src[taps[k] * 4 + c] * weights[k];
+                dst[dstOffset + c] = (byte)Math.Clamp(MathF.Round(v / total), 0, 255);
+            }
+        }
+
+        private static int Wrap(int i, int n) => ((i % n) + n) % n;
+
+        // Labels every texel whose centre lies inside the triangle with `label` - the coverage
+        // test UvIslandPadding uses. Where triangles of two islands claim one texel, the later wins.
+        private static void RasterizeOwner(Vector2 a, Vector2 b, Vector2 c, int width, int height, int[] owner, int label)
         {
             int x0 = Math.Max(0, (int)MathF.Floor(MathF.Min(a.X, MathF.Min(b.X, c.X))));
             int x1 = Math.Min(width - 1, (int)MathF.Ceiling(MathF.Max(a.X, MathF.Max(b.X, c.X))));
@@ -1635,7 +1732,7 @@ namespace GlbMerger
                     var p = new Vector2(px + 0.5f, py + 0.5f);
                     float w0 = Cross2D(c - b, p - b), w1 = Cross2D(a - c, p - c), w2 = Cross2D(b - a, p - a);
                     bool inside = area > 0 ? (w0 >= 0 && w1 >= 0 && w2 >= 0) : (w0 <= 0 && w1 <= 0 && w2 <= 0);
-                    if (inside) covered[py * width + px] = true;
+                    if (inside) owner[py * width + px] = label;
                 }
         }
 

@@ -48,6 +48,16 @@ namespace GlbMerger
             public bool SculptedLips;        // mouth: lips sculpted in the mesh -- the jaw parts them (SculptedJaw)
             public float? ChinStartY;        // chin: mesh y its pull starts below -- under the drawn mouth fully
                                              // open, so the opening rides the jaw rigidly; null = the region's top
+            public DrawnMouthArea? ChinClearOf;   // chin: the drawn mouth fully open; its pull starts below every
+                                                  // triangle under it too
+        }
+
+        // Where the drawn (not sculpted) mouth paints fully open, mesh units: across MinX..MaxX, at x from
+        // Span(x).Bottom up to Span(x).Top, within the depth slab Z - Back .. Z + Front.
+        public sealed class DrawnMouthArea
+        {
+            public float MinX, MaxX, Z, Back, Front;
+            public required Func<float, (float Bottom, float Top)> Span;
         }
 
         private const float CornerAt = 0.9f;   // a brow bone's distance from the centre, x the half-width
@@ -79,7 +89,7 @@ namespace GlbMerger
         // Returns a one-line status.
         public static string Apply(ModelRoot model, Node head, Matrix4x4 meshToHead, float modelHeight, IReadOnlyList<Feature> features)
         {
-            var specs = BuildSpecs(features, modelHeight);
+            var specs = BuildSpecs(features, modelHeight, ChinStart(model, features));
             var nodes = PlaceBones(model, head, meshToHead, specs);
 
             int skins = 0, verts = 0;
@@ -97,7 +107,67 @@ namespace GlbMerger
 
         // ---- What bones, where -----------------------------------------------------------------
 
-        private static List<BoneSpec> BuildSpecs(IReadOnlyList<Feature> features, float modelHeight)
+        // The mesh y the chin's pull starts below: its ChinStartY, and below the lowest corner of every
+        // triangle the drawn mouth covers fully open. The mouth is drawn on the bind-pose surface, so a
+        // triangle under it with one corner pulled down by the jaw (they're big round a mouth: one can
+        // reach from the lip line to well under the chin's start) bends the drawn lower lip into a notch.
+        private static float? ChinStart(ModelRoot model, IReadOnlyList<Feature> features)
+        {
+            var chin = features.FirstOrDefault(f => f.Name == "Chin" && f.Region.Set);
+            if (chin?.ChinClearOf is not DrawnMouthArea area) return chin?.ChinStartY;
+            float? start = chin.ChinStartY;
+            foreach (var meshNode in model.LogicalNodes.Where(n => n.Skin != null && n.Mesh != null))
+                foreach (var prim in meshNode.Mesh.Primitives)
+                {
+                    var positions = prim.GetVertexAccessor("POSITION")?.AsVector3Array();
+                    if (positions == null) continue;
+                    foreach (var (a, b, c) in prim.GetTriangleIndices())
+                    {
+                        Vector3 pa = positions[a], pb = positions[b], pc = positions[c];
+                        if (!Covers(area, pa, pb, pc)) continue;
+                        float low = Math.Min(pa.Y, Math.Min(pb.Y, pc.Y)) - 1e-5f;
+                        start = start is float s ? Math.Min(s, low) : low;
+                    }
+                }
+            return start;
+        }
+
+        // Whether the triangle is in the drawn mouth's slab and overlaps its area, tried at points across
+        // the x they share: the triangle's height range there against the mouth's.
+        private static bool Covers(DrawnMouthArea area, Vector3 a, Vector3 b, Vector3 c)
+        {
+            static bool InSlab(DrawnMouthArea m, Vector3 p) => p.Z >= m.Z - m.Back && p.Z <= m.Z + m.Front;
+            if (!InSlab(area, a) && !InSlab(area, b) && !InSlab(area, c)) return false;
+            float x0 = Math.Max(Math.Min(a.X, Math.Min(b.X, c.X)), area.MinX);
+            float x1 = Math.Min(Math.Max(a.X, Math.Max(b.X, c.X)), area.MaxX);
+            if (x0 > x1) return false;
+            const int Steps = 8;
+            for (int i = 0; i <= Steps; i++)
+            {
+                float x = x0 + (x1 - x0) * i / Steps;
+                float lo = float.MaxValue, hi = float.MinValue;
+                foreach (var (p, q) in new[] { (a, b), (b, c), (c, a) })
+                {
+                    float dx = q.X - p.X;
+                    if (MathF.Abs(dx) < 1e-9f)
+                    {
+                        if (MathF.Abs(x - p.X) > 1e-6f) continue;
+                        lo = Math.Min(lo, Math.Min(p.Y, q.Y)); hi = Math.Max(hi, Math.Max(p.Y, q.Y));
+                        continue;
+                    }
+                    float t = (x - p.X) / dx;
+                    if (t < -1e-6f || t > 1f + 1e-6f) continue;
+                    float y = p.Y + (q.Y - p.Y) * Math.Clamp(t, 0f, 1f);
+                    lo = Math.Min(lo, y); hi = Math.Max(hi, y);
+                }
+                if (lo > hi) continue;
+                var (bottom, top) = area.Span(x);
+                if (lo <= top && hi >= bottom) return true;
+            }
+            return false;
+        }
+
+        private static List<BoneSpec> BuildSpecs(IReadOnlyList<Feature> features, float modelHeight, float? chinStart)
         {
             var specs = new List<BoneSpec>();
             var browL = features.FirstOrDefault(f => f.Name == "BrowL" && f.Region.Set);
@@ -122,7 +192,7 @@ namespace GlbMerger
                         // Sculpted: the jaw, less the lower lip its own bones hold.
                         Weight = jaw != null && lowerLip != null ? v => jaw.Weight(v) * (1f - lowerLip.Hold(v))
                                : jaw != null && lip != null ? v => jaw.Weight(v) * (1f - LipShare(lip, v))
-                               : v => ChinFalloff(v - c, r, front, f.Core, ChinTop(c, r, f.ChinStartY)),
+                               : v => ChinFalloff(v - c, r, front, f.Core, ChinTop(c, r, chinStart)),
                     });
                 }
                 else if (f.Name == "Mouth")

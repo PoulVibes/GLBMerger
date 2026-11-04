@@ -137,8 +137,9 @@ namespace GlbMerger
         private CheckBox _chkRepairNormals = null!;
         private NumericUpDown _numSurfacePadding = null!;
         private Button _btnAnalyzeSurface = null!, _btnRepairSurface = null!;
+        private Button _btnAnalyzeOverlap = null!, _btnSeparateOverlap = null!;
 
-        private enum Operation { Simplify, Delete, Cut, Watertight, Surface, TextureWarp, Restore, Refine }
+        private enum Operation { Simplify, Delete, Cut, Watertight, Surface, UvOverlap, TextureWarp, Restore, Refine }
 
         // Dropdown order and labels, indexed by Operation.
         private static readonly (Operation Op, string Label)[] Operations =
@@ -148,6 +149,7 @@ namespace GlbMerger
             (Operation.Cut,         "Planar Cut"),
             (Operation.Watertight,  "Make Watertight"),
             (Operation.Surface,     "Repair Surface Faults"),
+            (Operation.UvOverlap,   "Separate Overlapping UVs"),
             (Operation.TextureWarp, "Fix Texture Warp"),
             (Operation.Restore,     "Restore Painted Detail"),
             (Operation.Refine,      "Round Out Painted Region"),
@@ -155,8 +157,8 @@ namespace GlbMerger
 
         private ComboBox _cmbOperation = null!;
         private FlowLayoutPanel _secSimplifySettings = null!, _secPaint = null!, _secSimplifyActions = null!,
-            _secDelete = null!, _secCut = null!, _secWatertight = null!, _secSurface = null!, _secUv = null!, _secRestore = null!,
-            _secRefine = null!;
+            _secDelete = null!, _secCut = null!, _secWatertight = null!, _secSurface = null!, _secUvOverlap = null!, _secUv = null!,
+            _secRestore = null!, _secRefine = null!;
 
         private Operation CurrentOperation => Operations[Math.Max(0, _cmbOperation.SelectedIndex)].Op;
 
@@ -247,6 +249,7 @@ namespace GlbMerger
             var cut = _secCut = NewSection();
             var watertight = _secWatertight = NewSection();
             var surface = _secSurface = NewSection();
+            var uvOverlap = _secUvOverlap = NewSection();
             var uv = _secUv = NewSection();
             var restore = _secRestore = NewSection();
             var refine = _secRefine = NewSection();
@@ -615,9 +618,10 @@ namespace GlbMerger
             restore.Controls.Add(_btnRestore);
 
             BuildSurfaceSection(surface);
+            BuildUvOverlapSection(uvOverlap);
             BuildRefineSection(refine);
 
-            foreach (var section in new[] { simplifySettings, paint, simplifyActions, delete, cut, watertight, surface, uv, restore, refine })
+            foreach (var section in new[] { simplifySettings, paint, simplifyActions, delete, cut, watertight, surface, uvOverlap, uv, restore, refine })
                 flow.Controls.Add(section);
 
             // Wired after every section exists, since the handler shows and hides all of them.
@@ -780,6 +784,7 @@ namespace GlbMerger
             _secCut.Visible = op == Operation.Cut;
             _secWatertight.Visible = op == Operation.Watertight;
             _secSurface.Visible = op == Operation.Surface;
+            _secUvOverlap.Visible = op == Operation.UvOverlap;
             _secUv.Visible = op == Operation.TextureWarp;
             _secRestore.Visible = op == Operation.Restore;
             _secRefine.Visible = op == Operation.Refine;
@@ -1681,6 +1686,88 @@ namespace GlbMerger
             ReloadPreview();
         }
 
+        private void BuildUvOverlapSection(FlowLayoutPanel section)
+        {
+            _help.Add(section,
+                "For texture that two parts of the body share: generated models map a few spots onto " +
+                "texels another spot already uses (the back of Eli's neck and his collar), so paint on " +
+                "one shows up on the other. In each such place the smaller part gets its own copy of " +
+                "those texels in empty atlas space - an exact copy, so nothing looks different - and " +
+                "can then be painted on its own.");
+
+            _help.Add(section,
+                "Only the moved parts' UVs change, plus a new seam round each. Every texture read " +
+                "through the same UVs is copied too. Analyze paints both sides of every overlap. " +
+                "Records a History step.");
+
+            _btnAnalyzeOverlap = MakeButton("Analyze Overlapping UVs (dry run)");
+            _btnAnalyzeOverlap.Click += async (s, e) => await RunUvOverlapAsync(apply: false);
+            section.Controls.Add(_btnAnalyzeOverlap);
+
+            _btnSeparateOverlap = MakeButton("Separate Overlapping UVs");
+            _btnSeparateOverlap.Click += async (s, e) => await RunUvOverlapAsync(apply: true);
+            section.Controls.Add(_btnSeparateOverlap);
+        }
+
+        private async Task RunUvOverlapAsync(bool apply)
+        {
+            SetBusy(true, apply ? "Separating overlapping UVs..." : "Looking for overlapping UVs...");
+
+            UvOverlapRepair.Report report;
+            try
+            {
+                report = await Task.Run(() => UvOverlapRepair.Analyze(_model, new UvOverlapRepair.Options()));
+            }
+            catch (Exception ex)
+            {
+                SetBusy(false, null);
+                MessageBox.Show(this, $"UV overlap analysis failed: {ex.Message}",
+                    "Optimize Geometry", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            if (IsDisposed) return;
+
+            _grid.Rows.Clear();
+            foreach (var group in report.Primitives.GroupBy(p => p.MeshName))
+            {
+                int tris = group.Sum(p => p.Triangles);
+                int moved = group.Sum(p => p.PatchesMoved);
+                _grid.Rows.Add(group.Key, tris.ToString("N0"), tris.ToString("N0"), moved == 0 ? "-" : $"{moved:N0} moved");
+            }
+            var skipped = report.Primitives.Where(p => p.SkippedReason != null).ToList();
+            _lblTotals.Text = $"{report.TexelsShared:N0} texel(s) shared by separate parts of the body" +
+                (report.PatchesUnplaced > 0 ? $"\n{report.PatchesUnplaced} part(s) didn't fit in the free atlas space and stay shared" : "") +
+                (skipped.Count > 0 ? $"\n{skipped.Count} primitive(s) skipped: {skipped[0].SkippedReason}" : "");
+
+            if (!report.HasChanges)
+            {
+                SetBusy(false, report.TexelsShared == 0
+                    ? "No overlapping UVs found - nothing to separate."
+                    : "Overlapping UVs found, but none could be separated.");
+                return;
+            }
+
+            string summary = $"{report.PatchesMoved:N0} part(s) " + (apply ? "given" : "to give") + " their own texels.";
+            if (!apply)
+            {
+                var found = report.Primitives.Where(p => p.Found.Count > 0)
+                    .ToDictionary(p => (p.MeshIndex, p.PrimitiveIndex), p => new HashSet<int>(p.Found));
+                SetBusy(false, summary + " Both sides of each overlap painted in the preview. Nothing changed yet.");
+                ReloadPreview(found);
+                return;
+            }
+
+            // Vertices are split along the new seams and the images get the copies.
+            _history.BeginChange(touchesVertexData: true, touchesImages: true);
+            UvOverlapRepair.Apply(report, _model);
+
+            SetBusy(false, summary + " Included the next time you save the merge.");
+            RecordHistory($"Separate overlapping UVs ({report.PatchesMoved:N0} moved)", touchedVertexData: true, touchedImages: true);
+            ShowBaseline();
+            ReloadPreview();
+        }
+
         private void FillSurfaceGrid(SurfaceRepair.Report report)
         {
             _grid.Rows.Clear();
@@ -1984,6 +2071,8 @@ namespace GlbMerger
             _btnApplyWatertight.Enabled = !busy;
             _btnAnalyzeSurface.Enabled = !busy;
             _btnRepairSurface.Enabled = !busy;
+            _btnAnalyzeOverlap.Enabled = !busy;
+            _btnSeparateOverlap.Enabled = !busy;
             _btnAnalyzeUv.Enabled = !busy;
             _btnApplyUv.Enabled = !busy;
             _btnAnalyzeRestore.Enabled = !busy;

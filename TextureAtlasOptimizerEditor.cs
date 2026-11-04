@@ -26,7 +26,7 @@ namespace GlbMerger
 
         private NumericUpDown _numStretch = null!, _numPadding = null!;
         private ComboBox _cmbOutputSize = null!, _cmbImage = null!;
-        private CheckBox _chkPreserveDensity = null!, _chkWireframe = null!;
+        private CheckBox _chkPreserveDensity = null!, _chkWireframe = null!, _chkCleanRims = null!;
         private Button _btnPreview = null!, _btnApply = null!, _btnCancel = null!;
         private ProgressBar _progress = null!;
         private Label _lblStatus = null!;
@@ -110,6 +110,15 @@ namespace GlbMerger
                 "Scales each chart by how much texture the source gave that part of the surface - " +
                 "a face that had a lot of the old texture keeps a lot of the new one. Off spreads " +
                 "texels evenly over the whole surface.");
+
+            _chkCleanRims = new CheckBox { Text = "Clean dark rims round source islands", AutoSize = true, Checked = true, Margin = new Padding(3, 0, 3, 4) };
+            flow.Controls.Add(_chkCleanRims);
+            _help.Add(flow,
+                "Merging two islands puts their old seam in the middle of a chart, and the thin dark " +
+                "edge generators bake round each island would come with it - a line no edge cleanup " +
+                "can reach afterwards. This cleans those edges in the base colour before rebaking, " +
+                "as Surface Repair does. A real dark outline on an island's edge (round an eye) is " +
+                "lightened too; untick it for a model where that matters.");
 
             _btnPreview = MakeButton("Preview Re-Atlas");
             _btnPreview.Click += async (s, e) => await RunPreviewAsync();
@@ -252,7 +261,7 @@ namespace GlbMerger
             _btnPreview.Enabled = !busy && _images.Count > 0;
             _btnApply.Enabled = !busy && _report != null && _report.HasChanges;
             _btnCancel.Enabled = busy;
-            _numStretch.Enabled = _numPadding.Enabled = _cmbOutputSize.Enabled = _chkPreserveDensity.Enabled = !busy;
+            _numStretch.Enabled = _numPadding.Enabled = _cmbOutputSize.Enabled = _chkPreserveDensity.Enabled = _chkCleanRims.Enabled = !busy;
             _progress.Visible = busy;
             Cursor = busy ? Cursors.WaitCursor : Cursors.Default;
         }
@@ -265,6 +274,7 @@ namespace GlbMerger
                 PaddingTexels = (int)_numPadding.Value,
                 PreserveDensity = _chkPreserveDensity.Checked,
                 OutputSize = OutputSizes[Math.Max(0, _cmbOutputSize.SelectedIndex)].Size,
+                CleanDarkRims = _chkCleanRims.Checked,
             };
 
             _report = null;

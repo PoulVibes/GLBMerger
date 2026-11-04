@@ -143,7 +143,7 @@ namespace GlbMerger
             return (report, pngBytes);
         }
 
-        private static bool IsBaseColorImage(ModelRoot model, int imageIndex) =>
+        internal static bool IsBaseColorImage(ModelRoot model, int imageIndex) =>
             model.LogicalMaterials.Any(mat => mat.Channels.Any(ch =>
                 ch.Key == "BaseColor" && ch.Texture?.PrimaryImage?.LogicalIndex == imageIndex));
 
@@ -264,8 +264,10 @@ namespace GlbMerger
         // stamping each newly-reached texel with the color of whichever covered texel it was
         // reached from, carrying color outward one texel-ring at a time. Returns how many texels
         // were filled. When given, `filled` is set for every texel the flood reached (covered ones
-        // included).
-        internal static int DilateColor(int width, int height, byte[] pixels, bool[] covered, int maxRadius, bool[]? filled = null)
+        // included), and `owner` - a label per covered texel, -1 elsewhere - is carried out with
+        // the colour, so each padded texel knows which island it was filled from.
+        internal static int DilateColor(int width, int height, byte[] pixels, bool[] covered, int maxRadius, bool[]? filled = null,
+            int[]? owner = null)
         {
             if (maxRadius <= 0) return 0;
 
@@ -296,6 +298,7 @@ namespace GlbMerger
 
                     dist[nIdx] = d + 1;
                     if (filled != null) filled[nIdx] = true;
+                    if (owner != null) owner[nIdx] = owner[idx];
                     pixels[nIdx * 4 + 0] = pixels[idx * 4 + 0];
                     pixels[nIdx * 4 + 1] = pixels[idx * 4 + 1];
                     pixels[nIdx * 4 + 2] = pixels[idx * 4 + 2];

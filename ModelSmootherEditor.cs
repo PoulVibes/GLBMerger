@@ -55,6 +55,7 @@ namespace GlbMerger
 
         private WebView2 _webView = null!;
         private CheckBox _chkPaintMode = null!;
+        private ComboBox _cmbBrushMode = null!;
         private TrackBar _sliderBrush = null!, _sliderStrength = null!, _sliderCrease = null!;
         private Label _lblBrush = null!, _lblStrength = null!, _lblCrease = null!, _lblStatus = null!;
         private Button _btnRevert = null!;
@@ -118,6 +119,27 @@ namespace GlbMerger
             _chkPaintMode.CheckedChanged += (s, e) => PushPaintMode();
             flow.Controls.Add(_chkPaintMode);
 
+            var modeRow = new FlowLayoutPanel
+            {
+                AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, WrapContents = false,
+                Margin = new Padding(0, 0, 0, 4),
+            };
+            modeRow.Controls.Add(new Label { Text = "Brush:", AutoSize = true, Margin = new Padding(3, 7, 6, 3) });
+            _cmbBrushMode = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 250, Margin = new Padding(0, 4, 3, 3) };
+            _cmbBrushMode.Items.AddRange(new object[] { "Smooth (relax bumps)", "Flatten (paint over raised detail)" });
+            _cmbBrushMode.SelectedIndex = 0;
+            _cmbBrushMode.SelectedIndexChanged += (s, e) => PushBrushMode();
+            modeRow.Controls.Add(_cmbBrushMode);
+            flow.Controls.Add(modeRow);
+
+            _help.Add(flow,
+                "Flatten is for raised detail smoothing can't remove, like jersey numbers stuck out " +
+                "from the shirt. Paint over the whole feature in one stroke, and a little past its " +
+                "edge: what you've painted is rebuilt from the surface just outside it, keeping that " +
+                "surface's curve, and moves only in and out - never sideways - so a texture printed " +
+                "on it stays where it was. A new stroke starts a new area, so cover the whole number " +
+                "before letting go.");
+
             _lblBrush = new Label { Text = "Brush size: 5%", AutoSize = true, Margin = new Padding(3, 0, 3, 0) };
             _sliderBrush = new TrackBar
             {
@@ -139,9 +161,10 @@ namespace GlbMerger
             flow.Controls.Add(_sliderStrength);
 
             _help.Add(flow, 
-                "How far the surface moves toward its neighbours per frame while the brush is held. " +
-                "It runs continuously, not once per stroke - low strength held a moment is gentle, " +
-                "high strength (or holding longer) flattens fast and can round off nearby detail.");
+                "How far the surface moves toward its neighbours (Flatten: toward the rebuilt surface) " +
+                "per frame while the brush is held. It runs continuously, not once per stroke - low " +
+                "strength held a moment is gentle, high strength (or holding longer) flattens fast and " +
+                "can round off nearby detail.");
 
             _lblCrease = new Label { Text = "Crease angle: 60°", AutoSize = true, Margin = new Padding(3, 8, 3, 0) };
             _sliderCrease = new TrackBar
@@ -332,6 +355,8 @@ namespace GlbMerger
                         };
                         window.setBrushRadius = function (fraction) { brushFraction = fraction; resolveBrushRadius(); };
                         window.setStrength = function (value) { strength = value; };
+                        var brushMode = 'smooth';   // or 'flatten' - see flattenPainted
+                        window.setBrushMode = function (mode) { brushMode = mode; };
 
                         // --- Loaded primitives -------------------------------------------------
                         // One entry per mesh primitive: its Three.js Mesh (the SAME object being
@@ -384,6 +409,7 @@ namespace GlbMerger
                             var nrmAttr = geo.attributes.normal;
                             var index = geo.index;
                             var vertexCount = posAttr.count;
+                            geo.setAttribute('aMask', new THREE.BufferAttribute(new Float32Array(vertexCount), 1));
                             var triCount = index.count / 3;
                             var triangles = new Int32Array(index.count);
                             for (var i = 0; i < index.count; i++) triangles[i] = index.getX(i);
@@ -429,7 +455,10 @@ namespace GlbMerger
                                 triangles: triangles, triCount: triCount,
                                 weldOf: weldOf, duplicates: duplicates, neighbors: neighbors, incident: incident,
                                 worldMatrix: mesh.matrixWorld.clone(),
+                                worldInverse: mesh.matrixWorld.clone().invert(),
+                                worldScale: Math.max(worldScale.x, worldScale.y, worldScale.z),
                                 hasNormal: !!nrmAttr,
+                                flatten: null,   // this stroke's painted area, in Flatten mode
                                 sphereCenter: sphereCenter, sphereRadius: sphereRadius,
                             };
                         }
@@ -446,12 +475,20 @@ namespace GlbMerger
                                 uCenter: { value: new THREE.Vector3() },
                                 uRadius: { value: 1 },
                                 uColor: { value: new THREE.Color(0x5ec8ff) },
+                                uMaskColor: { value: new THREE.Color(0xffb347) },
                             },
+                            // aMask (1 on every point this Flatten stroke has painted) tints the
+                            // painted area outside the brush, so it's clear whether the stroke has
+                            // reached past a raised feature's edge - an edge left out stays up, and
+                            // holds the rebuilt surface up with it.
                             vertexShader: [
+                                'attribute float aMask;',
                                 'varying vec3 vWorld;',
+                                'varying float vMask;',
                                 'void main() {',
                                 '    vec4 world = modelMatrix * vec4(position, 1.0);',
                                 '    vWorld = world.xyz;',
+                                '    vMask = aMask;',
                                 '    gl_Position = projectionMatrix * viewMatrix * world;',
                                 '}',
                             ].join('\n'),
@@ -459,10 +496,16 @@ namespace GlbMerger
                                 'uniform vec3 uCenter;',
                                 'uniform float uRadius;',
                                 'uniform vec3 uColor;',
+                                'uniform vec3 uMaskColor;',
                                 'varying vec3 vWorld;',
+                                'varying float vMask;',
                                 'void main() {',
                                 '    float d = distance(vWorld, uCenter);',
-                                '    if (d > uRadius) discard;',
+                                '    if (d > uRadius) {',
+                                '        if (vMask < 0.5) discard;',
+                                '        gl_FragColor = vec4(uMaskColor, 0.3);',
+                                '        return;',
+                                '    }',
                                 '    float rim = smoothstep(uRadius * 0.82, uRadius, d);',
                                 '    gl_FragColor = vec4(uColor, mix(0.32, 0.85, rim));',
                                 '}',
@@ -554,6 +597,7 @@ namespace GlbMerger
                                 eligibleWeld.add(info.weldOf[c]);
                             }
                             if (!eligibleWeld || eligibleWeld.size === 0) return false;
+                            if (brushMode === 'flatten') return flattenPainted(info, eligibleWeld, worldPoint);
 
                             // Jacobi-style: every point's move this frame is computed from
                             // positions as they stood BEFORE this frame's pass, so the result
@@ -579,6 +623,214 @@ namespace GlbMerger
                             return true;
                         }
 
+                        // --- Flatten ---------------------------------------------------------------
+                        // Smoothing can't take down a raised feature like a jersey number: a point on
+                        // top of it averages with the points round it, which are on top too, so only
+                        // the edge creeps in - and laying the side walls down trips the fold guard.
+                        // Flatten rebuilds the painted area from the surface just outside it instead.
+                        // Every point the stroke has covered so far joins the mask; the two rings of
+                        // points round the mask are the anchors (the inner ring alone when it has
+                        // enough points - see below). A quadric height field fitted to the
+                        // anchors carries the surrounding surface's curve (a chest) across the mask,
+                        // and the inner ring's own distance from that fit is spread harmonically over
+                        // the mask, so the rebuilt surface meets the real one exactly at its edge.
+                        // Points move only along the patch's average normal - never sideways - so
+                        // their UVs, and the texture printed on them, stay put.
+                        //
+                        // Only points actually inside the brush join the mask - not every corner of
+                        // every triangle it touches, as smoothing takes. On a coarse mesh (Conner's
+                        // shirt triangles are ~45mm across) those corners reach far past the brush,
+                        // the mask spreads over the whole chest, its rings wrap round the sides of
+                        // the body, and no one quadric fits that: the middle comes out a dent. For
+                        // the same reason the fit uses the inner ring alone when it's dense enough to
+                        // pin a quadric down (24 points); a sparser one - Conner's back has 13, up to
+                        // 12cm out - gets the second ring too, or the curve it guesses puts the middle
+                        // of the patch well under the shirt.
+                        //
+                        // Everything is computed from the positions at the start of the stroke, so a
+                        // frame's result doesn't depend on the frames before it; each frame moves the
+                        // mask a share (strength) of the way there, through the same fold guard as
+                        // smoothing - judged against the start of the stroke too.
+                        var _brushLocal = new THREE.Vector3();
+                        function flattenPainted(info, eligibleWeld, worldPoint) {
+                            var geo = info.mesh.geometry;
+                            var posAttr = geo.attributes.position;
+                            var pos = posAttr.array;
+                            var st = info.flatten;
+                            if (!st) st = info.flatten = { start: new Float32Array(pos), mask: new Set(), residual: new Map() };
+
+                            // Brush distance in the mesh's own space; the radius is a world size.
+                            _brushLocal.copy(worldPoint).applyMatrix4(info.worldInverse);
+                            var localScale = Math.max(info.worldScale, 1e-12);
+                            var r2 = (brushRadius / localScale) * (brushRadius / localScale);
+                            eligibleWeld.forEach(function (w) {
+                                var p = info.duplicates[w][0] * 3;
+                                var dx = pos[p] - _brushLocal.x, dy = pos[p + 1] - _brushLocal.y, dz = pos[p + 2] - _brushLocal.z;
+                                if (dx * dx + dy * dy + dz * dz > r2 || st.mask.has(w)) return;
+                                st.mask.add(w);
+                                var dupes = info.duplicates[w], tint = geo.attributes.aMask;
+                                for (var d = 0; d < dupes.length; d++) tint.array[dupes[d]] = 1;
+                                tint.needsUpdate = true;
+                            });
+                            if (st.mask.size === 0) return false;
+
+                            var targets = flattenTargets(info, st);
+                            if (!targets) return false;
+                            var updates = [];
+                            for (var i = 0; i < targets.length; i++) {
+                                var rep = info.duplicates[targets[i][0]][0];
+                                var ox = pos[rep * 3], oy = pos[rep * 3 + 1], oz = pos[rep * 3 + 2];
+                                updates.push([targets[i][0], ox + (targets[i][1] - ox) * strength,
+                                    oy + (targets[i][2] - oy) * strength, oz + (targets[i][3] - oz) * strength]);
+                            }
+                            applyWithoutFolding(info, pos, updates, st.start, st.up);
+                            posAttr.needsUpdate = true;
+                            if (info.hasNormal) recomputeNormalsNear(info, st.mask);
+                            return true;
+                        }
+
+                        // Where each masked point goes, as [welded point, x, y, z] in the mesh's own
+                        // space; null when there's nothing round the mask to rebuild it from (it
+                        // covers a whole closed part) or the anchors don't span a surface.
+                        function flattenTargets(info, st) {
+                            var start = st.start, mask = st.mask, nbr = info.neighbors;
+                            function at(w) { return info.duplicates[w][0] * 3; }
+
+                            var ring1 = new Set(), anchors = new Set();
+                            mask.forEach(function (w) {
+                                var n = nbr[w];
+                                for (var k = 0; k < n.length; k++) if (!mask.has(n[k])) ring1.add(n[k]);
+                            });
+                            if (ring1.size < 3) return null;
+                            ring1.forEach(function (w) {
+                                anchors.add(w);
+                                if (ring1.size >= 24) return;
+                                var n = nbr[w];
+                                for (var k = 0; k < n.length; k++) if (!mask.has(n[k])) anchors.add(n[k]);
+                            });
+
+                            // Height direction: the patch's area-weighted normal, which points out of
+                            // the surface. The fit itself would be the same either way up.
+                            var nx = 0, ny = 0, nz = 0, cx = 0, cy = 0, cz = 0, count = 0;
+                            function addFacesOf(w) {
+                                var dupes = info.duplicates[w];
+                                for (var d = 0; d < dupes.length; d++) {
+                                    var inc = info.incident[dupes[d]];
+                                    for (var k = 0; k < inc.length; k++) {
+                                        var t = inc[k];
+                                        var a = info.triangles[t * 3] * 3, b = info.triangles[t * 3 + 1] * 3, c = info.triangles[t * 3 + 2] * 3;
+                                        var e1x = start[b] - start[a], e1y = start[b + 1] - start[a + 1], e1z = start[b + 2] - start[a + 2];
+                                        var e2x = start[c] - start[a], e2y = start[c + 1] - start[a + 1], e2z = start[c + 2] - start[a + 2];
+                                        nx += e1y * e2z - e1z * e2y; ny += e1z * e2x - e1x * e2z; nz += e1x * e2y - e1y * e2x;
+                                    }
+                                }
+                                var p = at(w); cx += start[p]; cy += start[p + 1]; cz += start[p + 2]; count++;
+                            }
+                            mask.forEach(addFacesOf);
+                            anchors.forEach(addFacesOf);
+                            var nl = Math.sqrt(nx * nx + ny * ny + nz * nz);
+                            if (nl < 1e-20) return null;
+                            nx /= nl; ny /= nl; nz /= nl;
+                            cx /= count; cy /= count; cz /= count;
+                            (st.up = st.up || new THREE.Vector3()).set(nx, ny, nz);   // outward, as the faces are wound
+
+                            // Two directions across the patch: n x X, or n x Y when n is close to X.
+                            var ux, uy, uz;
+                            if (Math.abs(nx) < 0.9) { ux = 0; uy = nz; uz = -ny; } else { ux = -nz; uy = 0; uz = nx; }
+                            var ul = Math.sqrt(ux * ux + uy * uy + uz * uz); ux /= ul; uy /= ul; uz /= ul;
+                            var vx = ny * uz - nz * uy, vy = nz * ux - nx * uz, vz = nx * uy - ny * ux;
+
+                            // Across-coordinates scaled to about +-1 over the anchors, so the fit is well conditioned.
+                            var span = 1e-12;
+                            anchors.forEach(function (w) {
+                                var p = at(w), dx = start[p] - cx, dy = start[p + 1] - cy, dz = start[p + 2] - cz;
+                                span = Math.max(span, Math.abs(dx * ux + dy * uy + dz * uz), Math.abs(dx * vx + dy * vy + dz * vz));
+                            });
+                            var L = [0, 0, 0];
+                            function local(w) {
+                                var p = at(w), dx = start[p] - cx, dy = start[p + 1] - cy, dz = start[p + 2] - cz;
+                                L[0] = (dx * ux + dy * uy + dz * uz) / span;
+                                L[1] = (dx * vx + dy * vy + dz * vz) / span;
+                                L[2] = dx * nx + dy * ny + dz * nz;
+                                return L;
+                            }
+
+                            // Least-squares quadric (a plane when there are too few anchors for one).
+                            var terms = anchors.size >= 12 ? 6 : 3;
+                            function basis(u, v) { return terms === 6 ? [u * u, u * v, v * v, u, v, 1] : [u, v, 1]; }
+                            var M = [], rhs = [];
+                            for (var i = 0; i < terms; i++) { M.push(new Array(terms).fill(0)); rhs.push(0); }
+                            anchors.forEach(function (w) {
+                                local(w);
+                                var b = basis(L[0], L[1]);
+                                for (var i = 0; i < terms; i++) {
+                                    rhs[i] += b[i] * L[2];
+                                    for (var j = 0; j < terms; j++) M[i][j] += b[i] * b[j];
+                                }
+                            });
+                            var coef = solveSmall(M, rhs);
+                            if (!coef) return null;
+                            function surface(u, v) {
+                                var b = basis(u, v), h = 0;
+                                for (var i = 0; i < terms; i++) h += b[i] * coef[i];
+                                return h;
+                            }
+
+                            // The inner ring's distance from the fit, spread over the mask (Gauss-Seidel,
+                            // warm-started from the last frame's values, so it keeps converging as the
+                            // stroke goes on). A mask point's neighbours are all mask or inner ring.
+                            var ringResidual = new Map();
+                            ring1.forEach(function (w) { local(w); ringResidual.set(w, L[2] - surface(L[0], L[1])); });
+                            var res = st.residual;
+                            var maskList = Array.from(mask);
+                            for (var it = 0; it < 40; it++) {
+                                for (var m = 0; m < maskList.length; m++) {
+                                    var w = maskList[m], n = nbr[w], sum = 0;
+                                    if (n.length === 0) continue;
+                                    for (var q = 0; q < n.length; q++)
+                                        sum += mask.has(n[q]) ? (res.get(n[q]) || 0) : ringResidual.get(n[q]);
+                                    res.set(w, sum / n.length);
+                                }
+                            }
+
+                            var out = [];
+                            for (var m2 = 0; m2 < maskList.length; m2++) {
+                                var w2 = maskList[m2];
+                                local(w2);
+                                var dh = surface(L[0], L[1]) + (res.get(w2) || 0) - L[2];
+                                var p2 = at(w2);
+                                out.push([w2, start[p2] + nx * dh, start[p2 + 1] + ny * dh, start[p2 + 2] + nz * dh]);
+                            }
+                            return out;
+                        }
+
+                        // Gaussian elimination with partial pivoting on a small dense system, with a
+                        // touch of ridge so anchors that only just span the patch still solve.
+                        function solveSmall(M, rhs) {
+                            var n = rhs.length, A = M.map(function (row, i) { return row.concat([rhs[i]]); });
+                            var scale = 0;
+                            for (var d = 0; d < n; d++) scale = Math.max(scale, Math.abs(A[d][d]));
+                            if (scale === 0) return null;
+                            for (var d2 = 0; d2 < n; d2++) A[d2][d2] += scale * 1e-9;
+                            for (var col = 0; col < n; col++) {
+                                var piv = col;
+                                for (var r = col + 1; r < n; r++) if (Math.abs(A[r][col]) > Math.abs(A[piv][col])) piv = r;
+                                if (Math.abs(A[piv][col]) < scale * 1e-14) return null;
+                                var tmp = A[col]; A[col] = A[piv]; A[piv] = tmp;
+                                for (var r2 = col + 1; r2 < n; r2++) {
+                                    var f = A[r2][col] / A[col][col];
+                                    for (var c2 = col; c2 <= n; c2++) A[r2][c2] -= f * A[col][c2];
+                                }
+                            }
+                            var x = new Array(n).fill(0);
+                            for (var row = n - 1; row >= 0; row--) {
+                                var s = A[row][n];
+                                for (var c3 = row + 1; c3 < n; c3++) s -= A[row][c3] * x[c3];
+                                x[row] = s / A[row][row];
+                            }
+                            return x;
+                        }
+
                         // Writes a frame's moves, then takes back whatever folds a triangle. Pulling a
                         // point to its neighbours' plain average can carry it past the far edge of a
                         // small triangle beside it wherever triangle sizes are uneven - as on any
@@ -594,7 +846,21 @@ namespace GlbMerger
                         // halvings they go back to where they were this frame. Everything else moves
                         // as before, so smoothing reads the same - it only stops short where it would
                         // have folded.
-                        function applyWithoutFolding(info, pos, updates) {
+                        //
+                        // reference and up (Flatten): the positions at the start of the stroke and
+                        // the patch's outward direction. Every triangle of a flattened patch should
+                        // end up facing out of it, so that is the whole test: a triangle folds when it
+                        // comes to face in, having not faced in at the start. Pressing a raised number
+                        // back into the shirt lays its side walls flat - a wall turns through ninety
+                        // degrees, which is no fold, and a vertical one ends with no area at all,
+                        // invisible and the intended result - so a squashed triangle is let through.
+                        // The neighbour test smoothing uses is left out: the walls lie in a strip
+                        // that can turn over together, each still agreeing with its neighbours, and
+                        // a triangle the model already had folded (Conner's back number has several)
+                        // gets worse against them at the slightest move - which, since a fold holds
+                        // back every corner round it, froze most of that number in place. Triangles
+                        // already facing in at the start are left to Surface Repair, which turns them.
+                        function applyWithoutFolding(info, pos, updates, reference, up) {
                             var moved = new Map();   // original vertex -> [old x, y, z, target x, y, z]
                             var tris = new Set();
                             for (var u = 0; u < updates.length; u++) {
@@ -607,10 +873,11 @@ namespace GlbMerger
                                 }
                             }
 
-                            function normalOf(t, out) {
+                            function normalOf(t, out, arr) {
+                                var p = arr || pos;
                                 var a = info.triangles[t * 3], b = info.triangles[t * 3 + 1], c = info.triangles[t * 3 + 2];
-                                _e1.set(pos[b * 3] - pos[a * 3], pos[b * 3 + 1] - pos[a * 3 + 1], pos[b * 3 + 2] - pos[a * 3 + 2]);
-                                _e2.set(pos[c * 3] - pos[a * 3], pos[c * 3 + 1] - pos[a * 3 + 1], pos[c * 3 + 2] - pos[a * 3 + 2]);
+                                _e1.set(p[b * 3] - p[a * 3], p[b * 3 + 1] - p[a * 3 + 1], p[b * 3 + 2] - p[a * 3 + 2]);
+                                _e2.set(p[c * 3] - p[a * 3], p[c * 3 + 1] - p[a * 3 + 1], p[c * 3 + 2] - p[a * 3 + 2]);
                                 return out.crossVectors(_e1, _e2);
                             }
 
@@ -633,17 +900,17 @@ namespace GlbMerger
                             }
                             // Cosine between t's normal and its ring's area-weighted one; 1 with nothing to compare.
                             var _ring = new THREE.Vector3(), _other = new THREE.Vector3(), _own = new THREE.Vector3();
-                            function facingOf(t) {
-                                normalOf(t, _own);
+                            function facingOf(t, arr) {
+                                normalOf(t, _own, arr);
                                 _ring.set(0, 0, 0);
                                 var r = ringOf(t);
-                                for (var i = 0; i < r.length; i++) _ring.add(normalOf(r[i], _other));
+                                for (var i = 0; i < r.length; i++) _ring.add(normalOf(r[i], _other, arr));
                                 var l = Math.sqrt(_own.lengthSq() * _ring.lengthSq());
                                 return l > 0 ? _own.dot(_ring) / l : 1;
                             }
 
                             var before = new Map(), facing = new Map();
-                            tris.forEach(function (t) { before.set(t, normalOf(t, new THREE.Vector3())); facing.set(t, facingOf(t)); });
+                            tris.forEach(function (t) { before.set(t, normalOf(t, new THREE.Vector3(), reference)); facing.set(t, facingOf(t, reference)); });
 
                             // Share of the way each moved vertex goes, halved for a corner of a fold.
                             var share = new Map();
@@ -673,9 +940,13 @@ namespace GlbMerger
                                     var n0 = before.get(t);
                                     if (n0.lengthSq() === 0) return;   // no facing to keep
                                     var n1 = normalOf(t, _n);
-                                    var turned = n1.dot(n0) <= n0.lengthSq() * 1e-6;   // or squashed to nothing
+                                    if (reference && n0.dot(up) < -0.1 * Math.sqrt(n0.lengthSq())) return;   // folded already
+                                    if (reference && n1.lengthSq() <= n0.lengthSq() * 1e-4) return;
+                                    var turned = !reference && n1.dot(n0) <= n0.lengthSq() * 1e-6;   // or squashed to nothing
                                     var f = turned ? -1 : facingOf(t);
-                                    if (!turned && !(f < 0 && f < facing.get(t) - 1e-6)) return;
+                                    var inward = up && n1.dot(up) < -0.1 * Math.sqrt(n1.lengthSq())
+                                        && n0.dot(up) >= -0.1 * Math.sqrt(n0.lengthSq());
+                                    if (!turned && !inward && (reference || !(f < 0 && f < facing.get(t) - 1e-6))) return;
                                     addMovedCorners(t, folding);
                                     var r = ringOf(t);
                                     for (var i = 0; i < r.length; i++) addMovedCorners(r[i], folding);
@@ -774,6 +1045,7 @@ namespace GlbMerger
                             if (!hit) return;
                             painting = true;
                             touchedThisStroke.clear();
+                            paintableMeshes.forEach(clearFlatten);   // a new stroke flattens a new area
                             showBrushCursor(hit.point);
                             event.preventDefault();
                         });
@@ -787,9 +1059,15 @@ namespace GlbMerger
                             if (!painting) hideBrushCursor();
                         });
                         paintOverlay.addEventListener('contextmenu', function (event) { event.preventDefault(); });
+                        function clearFlatten(info) {
+                            info.flatten = null;
+                            var tint = info.mesh.geometry.attributes.aMask;
+                            if (tint) { tint.array.fill(0); tint.needsUpdate = true; }
+                        }
                         window.addEventListener('pointerup', function () {
                             if (!painting) return;
                             painting = false;
+                            paintableMeshes.forEach(clearFlatten);
                             if (touchedThisStroke.size === 0) return;
 
                             var payload = [];
@@ -818,6 +1096,7 @@ namespace GlbMerger
                                     if (seen.indexOf(mat) !== -1) return;
                                     seen.push(mat);
                                     mat.side = THREE.DoubleSide;
+                                    mat.skinning = false;   // drawn unskinned - see unskinMeshes
                                     // Forces opaque rendering even where the source material is
                                     // alphaMode BLEND with no real translucency - see
                                     // GeometryOptimizerEditor's identical fix for why that
@@ -836,6 +1115,35 @@ namespace GlbMerger
                             });
                         }
 
+                        // Swaps every skinned mesh for a plain one over the same geometry, so the
+                        // preview draws the mesh exactly as its positions are stored - the bind pose
+                        // - instead of skinned into the skeleton's rest pose. Those differ on a
+                        // merged model whenever the rest pose was adjusted after binding (Conner's
+                        // body is drawn 5-10cm from its stored positions), and everything here -
+                        // the brush's selection, the cursor decal, every edit and what gets saved -
+                        // works on the stored positions. Drawn skinned, the cursor sank partly
+                        // behind the visible surface and the brush worked on a patch that far from
+                        // where it was pointed. Unskinned, the mesh picked, edited and shown is one
+                        // surface again. Each replacement takes the old one's place among its
+                        // siblings, since a primitive's index is read from that order below.
+                        function unskinMeshes(root) {
+                            var skinned = [];
+                            root.traverse(function (obj) { if (obj.isSkinnedMesh) skinned.push(obj); });
+                            skinned.forEach(function (obj) {
+                                var plain = new THREE.Mesh(obj.geometry, obj.material);
+                                plain.name = obj.name;
+                                plain.userData = obj.userData;
+                                plain.position.copy(obj.position);
+                                plain.quaternion.copy(obj.quaternion);
+                                plain.scale.copy(obj.scale);
+                                var parent = obj.parent;
+                                parent.children[parent.children.indexOf(obj)] = plain;
+                                plain.parent = parent;
+                                obj.parent = null;
+                            });
+                            root.updateMatrixWorld(true);
+                        }
+
                         function loadModel(url, frameCamera) {
                             var loader = new THREE.GLTFLoader();
                             loader.load(url, function (gltf) {
@@ -845,6 +1153,8 @@ namespace GlbMerger
                                     scene.add(currentRoot);
                                     currentRoot.updateMatrixWorld(true);
                                     tweakMaterials(currentRoot);
+
+                                    unskinMeshes(currentRoot);
 
                                     var meshes = [];
                                     var byKey = {};
@@ -1010,6 +1320,7 @@ namespace GlbMerger
             {
                 _viewerReady = true;
                 PushPaintMode();
+                PushBrushMode();
                 PushBrushRadius();
                 PushStrength();
                 return;
@@ -1025,9 +1336,10 @@ namespace GlbMerger
                     ModelSmoother.ApplyStroke(_model, p.MeshIndex, p.PrimIndex, positions, normals);
                 }
                 _btnRevert.Enabled = true;
+                string verb = _cmbBrushMode.SelectedIndex == 1 ? "Flattened" : "Smoothed";
                 _lblStatus.Text = message.Primitives.Length == 1
-                    ? "Smoothed live - included the next time you save the merge."
-                    : $"Smoothed {message.Primitives.Length} primitives live - included the next time you save the merge.";
+                    ? $"{verb} live - included the next time you save the merge."
+                    : $"{verb} {message.Primitives.Length} primitives live - included the next time you save the merge.";
             }
         }
 
@@ -1043,6 +1355,13 @@ namespace GlbMerger
         {
             if (!_viewerReady || _webView.CoreWebView2 == null) return;
             _ = _webView.CoreWebView2.ExecuteScriptAsync($"setPaintMode({(_chkPaintMode.Checked ? "true" : "false")});");
+        }
+
+        private void PushBrushMode()
+        {
+            if (!_viewerReady || _webView.CoreWebView2 == null) return;
+            _ = _webView.CoreWebView2.ExecuteScriptAsync(
+                $"setBrushMode('{(_cmbBrushMode.SelectedIndex == 1 ? "flatten" : "smooth")}');");
         }
 
         private void PushBrushRadius()
