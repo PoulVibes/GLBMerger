@@ -37,6 +37,16 @@ namespace GlbMerger
     // so they are duplicated first. Where no textured material or no free patch exists, it falls
     // back to plain UV averaging over the original vertices, unchanged from before.
     //
+    // Not every boundary loop is a hole. A loose triangle joined to nothing has all three of its
+    // edges open, and the cap the winding rule derives for it is its own back face in the same
+    // place: two faces then fight for the depth test (a dark speck that flickers), and the new one
+    // is wound against the very normals it copied, which is what SurfaceRepair reads as a fold - so
+    // repairing the surface afterwards turns it and leaves a doubled face instead, and every run of
+    // this tool adds another copy. A loop of three whose face is already standing is therefore
+    // counted (LoopsAlreadyFaced) and left alone rather than capped. It leaves the model not closed
+    // there, which is the truth: a face with no thickness can't be closed by facing it twice, and
+    // deleting geometry isn't this tool's job.
+    //
     // Unlike GeometryOptimizer's simplification (which only ever rewrites the index buffer),
     // filling a hole adds vertices, so GeometryHistory has to capture full vertex accessor
     // contents before a fill runs, not just the indices - see its BeginChange.
@@ -80,6 +90,9 @@ namespace GlbMerger
             /// <summary>Ring vertices that lay on a straight run between two corners and so weren't needed by the cap.</summary>
             public int PlanarCornersDropped { get; set; }
 
+            /// <summary>Loops left alone because a face already stands where the cap would (see LoopAlreadyFaced).</summary>
+            public int LoopsAlreadyFaced { get; set; }
+
             // Filled in by Analyze, consumed by Apply - null when this primitive is unchanged.
             public VertexPatch? Patch { get; set; }
         }
@@ -105,6 +118,7 @@ namespace GlbMerger
             public int PlanarHolesSealed => Primitives.Sum(p => p.PlanarHolesSealed);
             public int PlanarChainsClosed => Primitives.Sum(p => p.PlanarChainsClosed);
             public int PlanarCornersDropped => Primitives.Sum(p => p.PlanarCornersDropped);
+            public int LoopsAlreadyFaced => Primitives.Sum(p => p.LoopsAlreadyFaced);
             public bool HasChanges => Primitives.Any(p => p.Patch != null);
         }
 
@@ -132,6 +146,14 @@ namespace GlbMerger
             public bool Equals(PosKey other) => X == other.X && Y == other.Y && Z == other.Z;
             public override bool Equals(object? obj) => obj is PosKey k && Equals(k);
             public override int GetHashCode() => HashCode.Combine(X, Y, Z);
+
+            /// <summary>An order for sorting keys into a shape that doesn't depend on winding.</summary>
+            public static int Compare(PosKey x, PosKey y)
+            {
+                int c = x.X.CompareTo(y.X); if (c != 0) return c;
+                c = x.Y.CompareTo(y.Y); if (c != 0) return c;
+                return x.Z.CompareTo(y.Z);
+            }
         }
 
         private readonly struct EdgeKey : IEquatable<EdgeKey>
@@ -141,14 +163,8 @@ namespace GlbMerger
             {
                 // Order-independent so the same physical edge hashes the same regardless of which
                 // primitive's winding it was read from.
-                if (Compare(a, b) <= 0) { A = a; B = b; }
+                if (PosKey.Compare(a, b) <= 0) { A = a; B = b; }
                 else { A = b; B = a; }
-            }
-            private static int Compare(PosKey x, PosKey y)
-            {
-                int c = x.X.CompareTo(y.X); if (c != 0) return c;
-                c = x.Y.CompareTo(y.Y); if (c != 0) return c;
-                return x.Z.CompareTo(y.Z);
             }
             public bool Equals(EdgeKey other) => A.Equals(other.A) && B.Equals(other.B);
             public override bool Equals(object? obj) => obj is EdgeKey k && Equals(k);
@@ -525,6 +541,16 @@ namespace GlbMerger
         // not there's a texture patch - the duplicates are what carry the cap's own normal, and the
         // originals keep theirs for the surface beside the cut - and that normal is the loop's
         // plane normal rather than an average of the boundary's.
+        // Where a face stands, independent of which vertex copies it was built from and which way
+        // round it is wound - so a cap can be matched against the faces already there.
+        private static (PosKey, PosKey, PosKey) FaceKey(IList<Vector3> positions, int a, int b, int c)
+        {
+            float scale = 1f / WeldTolerance;
+            var keys = new[] { new PosKey(positions[a], scale), new PosKey(positions[b], scale), new PosKey(positions[c], scale) };
+            Array.Sort(keys, PosKey.Compare);
+            return (keys[0], keys[1], keys[2]);
+        }
+
         private static void BuildFillPatch(PrimitiveData data, List<List<int>> loops, PrimitiveResult result,
             string? patchUvAttribute, Vector2? patchUv, bool flatCaps = false, PlanarAdditions? planar = null)
         {
@@ -586,8 +612,27 @@ namespace GlbMerger
                 return avg;
             }
 
+            // The faces the primitive already has, by the positions of their corners, so a cap can
+            // be told from a face that is already standing there - see LoopAlreadyFaced.
+            var standing = new HashSet<(PosKey, PosKey, PosKey)>();
+            foreach (var (a, b, c) in data.Triangles) standing.Add(FaceKey(data.Positions, a, b, c));
+
             foreach (var loop in loops)
             {
+                // A loop of three whose face is already there is a loose triangle, not a hole: all
+                // three of its edges are open because nothing is joined to it, and the "cap" the
+                // winding rule derives is its own back face, in the same place, facing the other
+                // way. Adding it leaves two faces fighting for the depth test, a dark speck that
+                // flickers, and a triangle whose winding is against its own normals - which is what
+                // a fold is, so the surface repair then turns it and makes a doubled face instead.
+                // Each run would add another copy. Left alone and counted; the model isn't closed
+                // there, but a zero-thickness face can't be closed by facing it twice.
+                if (loop.Count == 3 && standing.Contains(FaceKey(data.Positions, loop[0], loop[1], loop[2])))
+                {
+                    result.LoopsAlreadyFaced++;
+                    continue;
+                }
+
                 // The loop's own plane normal, oriented the way the fan below faces - the fan runs
                 // the loop backwards (see the winding note there), so the normal is negated.
                 Vector3? flatNormal = flatCaps ? -LoopNormal(data.Positions, loop) : null;

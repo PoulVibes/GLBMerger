@@ -132,7 +132,7 @@ namespace GlbMerger
         private NumericUpDown _numRefineSegments = null!, _numRefineRoundness = null!, _numRefineCrease = null!;
         private CheckBox _chkRefineStoredNormals = null!;
         private Button _btnAnalyzeRefine = null!, _btnRefine = null!;
-        private CheckBox _chkFlipFolds = null!;
+        private CheckBox _chkFlipFolds = null!, _chkDropDuplicates = null!;
         private CheckBox _chkCleanRims = null!;
         private CheckBox _chkRepairNormals = null!;
         private NumericUpDown _numSurfacePadding = null!;
@@ -156,6 +156,12 @@ namespace GlbMerger
         };
 
         private ComboBox _cmbOperation = null!;
+
+        // Animation preview (see BuildAnimationRow). Index 0 of the dropdown is bind pose; index
+        // n is LogicalAnimations[n - 1].
+        private ComboBox _cmbAnimation = null!;
+        private Button _btnPlayPause = null!;
+        private bool _animPlaying;
         private FlowLayoutPanel _secSimplifySettings = null!, _secPaint = null!, _secSimplifyActions = null!,
             _secDelete = null!, _secCut = null!, _secWatertight = null!, _secSurface = null!, _secUvOverlap = null!, _secUv = null!,
             _secRestore = null!, _secRefine = null!;
@@ -241,6 +247,8 @@ namespace GlbMerger
             };
             foreach (var (_, label) in Operations) _cmbOperation.Items.Add(label);
             flow.Controls.Add(_cmbOperation);
+
+            BuildAnimationRow(flow);
 
             var simplifySettings = _secSimplifySettings = NewSection();
             var paint = _secPaint = NewSection();
@@ -532,7 +540,13 @@ namespace GlbMerger
                 "that's meant to stay open, like a mouth interior, will get capped too since there's " +
                 "no way to tell intent from geometry alone - step back in History if that happens.");
 
-            _help.Add(watertight, 
+            _help.Add(watertight,
+                "A loose triangle joined to nothing has all three edges open, but it isn't a hole: " +
+                "the only cap that fits is its own back face, in the same place, and the two then " +
+                "fight for the depth test and read as a flickering dark speck that Repair Surface " +
+                "Faults sees as a fold. Those are counted and left alone.");
+
+            _help.Add(watertight,
                 "When the material has a texture, caps look for an unused, blank-looking patch of " +
                 "it and sample the fill from there, so the cap reads as a plain, unremarkable " +
                 "surface instead of a smear across unrelated texture. Where no such patch exists, " +
@@ -1343,9 +1357,13 @@ namespace GlbMerger
 
             if (!report.HasChanges)
             {
-                SetBusy(false, report.HolesFound == 0 && report.UnresolvedEdges == 0
-                    ? "No open holes found - this model is already watertight."
-                    : $"Found {report.UnresolvedEdges} boundary edge(s) that couldn't be resolved into simple loops - nothing else to fill.");
+                SetBusy(false, report.LoopsAlreadyFaced > 0
+                    ? $"Nothing to fill: {report.LoopsAlreadyFaced:N0} of the open loop(s) are loose triangles with a face " +
+                      "already standing there, which capping would only double." +
+                      (report.UnresolvedEdges > 0 ? $" {report.UnresolvedEdges} boundary edge(s) left unresolved." : "")
+                    : report.HolesFound == 0 && report.UnresolvedEdges == 0
+                        ? "No open holes found - this model is already watertight."
+                        : $"Found {report.UnresolvedEdges} boundary edge(s) that couldn't be resolved into simple loops - nothing else to fill.");
                 return;
             }
 
@@ -1358,6 +1376,10 @@ namespace GlbMerger
                     : "") +
                 (report.PrimitivesUsingTexturePatch > 0
                     ? $" {report.PrimitivesUsingTexturePatch} mesh part(s) will texture their cap from a found blank spot in the atlas."
+                    : "") +
+                (report.LoopsAlreadyFaced > 0
+                    ? $" {report.LoopsAlreadyFaced:N0} of them are loose triangles with a face already standing there, " +
+                      "left alone - capping one only adds its own back face."
                     : "") +
                 (report.UnresolvedEdges > 0 ? $" {report.UnresolvedEdges} boundary edge(s) left unresolved." : "");
 
@@ -1565,6 +1587,14 @@ namespace GlbMerger
                 "round it is rebuilt from that surface; creases sharper than 60 degrees stay hard.");
 
             _help.Add(surface,
+                "It also clears pleats: a seam left standing as a wall a fraction of a millimetre high " +
+                "but centimetres long, which reads as a dark smudge that painting can't reach and that " +
+                "spreads as the model is posed. Every face of such a wall is a needle, so they are left " +
+                "out of the normals round them and shade as the surface they sit on. Analyze paints them " +
+                "along with the rest - a thin ridge that was meant to be there will be painted too, so " +
+                "look over what it found before repairing.");
+
+            _help.Add(surface,
                 "Cleaning dark rims fixes the short dark needles that painting over can't: generated " +
                 "textures bake a thin dark edge round each island, and a painter never reaches the texel " +
                 "just outside it. Those rims are replaced with the island's own colour before padding. " +
@@ -1572,6 +1602,16 @@ namespace GlbMerger
                 "Analyze paints everything it would change: erase the paint " +
                 "where a dark edge belongs, and Repair only cleans rims that are still painted. With " +
                 "nothing painted it cleans everywhere. Records a History step.");
+
+            _help.Add(surface,
+                "Dropping faces drawn twice clears the same face stacked in the same place and the same " +
+                "way round - older merges and older Make Watertight runs both left these - which fight " +
+                "for the depth test and flicker. A place holding the face BOTH ways round is the two " +
+                "sides of a card with no thickness (hair, cloth), is needed by a single-sided material, " +
+                "and is only counted and painted, never dropped.");
+
+            _chkDropDuplicates = new CheckBox { Text = "Drop faces drawn twice", Checked = true, AutoSize = true, Margin = new Padding(3, 0, 3, 4) };
+            surface.Controls.Add(_chkDropDuplicates);
 
             _chkFlipFolds = new CheckBox { Text = "Turn folded-over triangles", Checked = true, AutoSize = true, Margin = new Padding(3, 0, 3, 4) };
             surface.Controls.Add(_chkFlipFolds);
@@ -1603,11 +1643,13 @@ namespace GlbMerger
             var options = new SurfaceRepair.Options
             {
                 FlipFolds = _chkFlipFolds.Checked,
+                DropDuplicateFaces = _chkDropDuplicates.Checked,
                 RepairNormals = _chkRepairNormals.Checked,
                 PaddingTexels = (int)_numSurfacePadding.Value,
                 CleanDarkRims = _chkCleanRims.Checked,
             };
-            if (!options.FlipFolds && !options.RepairNormals && options.PaddingTexels == 0 && !options.CleanDarkRims)
+            if (!options.FlipFolds && !options.DropDuplicateFaces && !options.RepairNormals
+                && options.PaddingTexels == 0 && !options.CleanDarkRims)
             {
                 _lblStatus.Text = "Every repair is switched off - tick a repair, or set some texture padding.";
                 return;
@@ -1646,13 +1688,20 @@ namespace GlbMerger
 
             if (!report.HasChanges)
             {
-                SetBusy(false, "No folds, bad normals, dark rims or unpadded texture edges found - nothing to repair.");
+                SetBusy(false, "No folds, faces drawn twice, bad normals, dark rims or unpadded texture edges found - " +
+                    "nothing to repair." +
+                    (report.OpposedFaces > 0
+                        ? $" ({report.OpposedFaces:N0} two-sided face(s) found and left alone.)"
+                        : ""));
                 return;
             }
 
             string summary =
                 $"{report.Flipped:N0} folded triangle(s) " + (apply ? "turned" : "to turn") +
+                (report.DuplicatesDropped > 0 ? $", {report.DuplicatesDropped:N0} face(s) drawn twice " + (apply ? "dropped" : "to drop") : "") +
+                (report.OpposedFaces > 0 ? $", {report.OpposedFaces:N0} two-sided face(s) left alone" : "") +
                 (report.NormalsFixed > 0 ? $", {report.NormalsFixed:N0} normal(s) " + (apply ? "rebuilt" : "to rebuild") : "") +
+                (report.Pleats > 0 ? $", {report.Pleats:N0} pleat face(s) " + (apply ? "shaded into the surface" : "to shade into the surface") : "") +
                 (report.TexelsCleaned > 0 ? $", {report.TexelsCleaned:N0} dark rim texel(s) " + (apply ? "cleaned" : "to clean") +
                     (limitedTo > 0 ? $" in the {limitedTo:N0} painted triangle(s)" : "") : "") +
                 (report.TouchesImages ? $", {report.TexelsPadded:N0} texel(s) of padding in {report.Images.Count} texture(s)." : ".");
@@ -1660,8 +1709,12 @@ namespace GlbMerger
             if (!apply)
             {
                 // What it found goes on as paint, so it can be looked over before anything changes.
-                var found = report.Primitives.Where(p => p.Found.Count > 0 || p.NormalTriangles.Count > 0)
-                    .ToDictionary(p => (p.MeshIndex, p.PrimitiveIndex), p => new HashSet<int>(p.Found.Concat(p.NormalTriangles)));
+                var found = report.Primitives
+                    .Where(p => p.Found.Count > 0 || p.NormalTriangles.Count > 0 || p.PleatTriangles.Count > 0
+                                || p.DuplicateTriangles.Count > 0 || p.OpposedTriangles.Count > 0)
+                    .ToDictionary(p => (p.MeshIndex, p.PrimitiveIndex),
+                        p => new HashSet<int>(p.Found.Concat(p.NormalTriangles).Concat(p.PleatTriangles)
+                            .Concat(p.DuplicateTriangles).Concat(p.OpposedTriangles)));
                 foreach (var (key, tris) in report.Images.SelectMany(i => i.CleanedTriangles))
                 {
                     if (found.TryGetValue(key, out var set)) set.UnionWith(tris);
@@ -1679,7 +1732,9 @@ namespace GlbMerger
 
             SetBusy(false, summary + " Included the next time you save the merge.");
             RecordHistory($"Repair surface ({report.Flipped:N0} turned" +
+                (report.DuplicatesDropped > 0 ? $", {report.DuplicatesDropped:N0} drawn twice dropped" : "") +
                 (report.NormalsFixed > 0 ? ", normals rebuilt" : "") +
+                (report.Pleats > 0 ? ", pleats shaded in" : "") +
                 (report.TexelsCleaned > 0 ? ", rims cleaned" : "") + (report.TexelsPadded > 0 ? ", padded" : "") + ")",
                 touchedVertexData: report.TouchesVertexData, touchedImages: report.TouchesImages);
             ShowBaseline();
@@ -1776,9 +1831,15 @@ namespace GlbMerger
                 int tris = group.Sum(p => p.Triangles);
                 int flipped = group.Sum(p => p.Found.Count);
                 int normals = group.Sum(p => p.NormalsFixed);
+                int pleats = group.Sum(p => p.PleatTriangles.Count);
+                int dupes = group.Sum(p => p.DuplicateTriangles.Count);
+                int opposed = group.Sum(p => p.OpposedTriangles.Count);
                 var parts = new List<string>();
                 if (flipped > 0) parts.Add($"{flipped:N0} turned");
+                if (dupes > 0) parts.Add($"{dupes:N0} drawn twice");
+                if (opposed > 0) parts.Add($"{opposed:N0} two-sided");
                 if (normals > 0) parts.Add($"{normals:N0} normals");
+                if (pleats > 0) parts.Add($"{pleats:N0} pleat faces");
                 _grid.Rows.Add(group.Key, tris.ToString("N0"), tris.ToString("N0"), parts.Count == 0 ? "-" : string.Join(", ", parts));
             }
 
@@ -2134,7 +2195,8 @@ namespace GlbMerger
             <body>
                 <div id='viewerStack'>
                     <model-viewer id='viewer' src='https://appassets.local/" + previewFileName + @"' camera-controls
-                        shadow-intensity='1' environment-image='neutral' exposure='1'>
+                        shadow-intensity='1' environment-image='neutral' exposure='1'
+                        animation-crossfade-duration='0'>
                     </model-viewer>
                     <canvas id='overlayCanvas'></canvas>
                 </div>
@@ -2205,6 +2267,11 @@ namespace GlbMerger
                         // the file once). Painting simply becomes available a moment after the
                         // model appears instead of at the same instant.
                         loadHitTestGeometry(currentUrl);
+
+                        // A reload restarts <model-viewer>'s animation state (and shows frame 0
+                        // of whatever animationName it last had), so the chosen clip, frame and
+                        // play state are put back - or the clip stopped again for bind pose.
+                        applyAnimationState();
                     });
 
                     // --- Paint-a-region tool ---------------------------------------------------
@@ -2844,7 +2911,7 @@ namespace GlbMerger
                     // Only stopped when the pick actually lands on the model, so dragging the
                     // background still orbits normally while in paint mode.
                     viewer.addEventListener('pointerdown', function (event) {
-                        if (!paintMode || event.button === 1) return;
+                        if (!paintMode || overlaySuspended || event.button === 1) return;
                         if (pickAndPaint(event)) {
                             painting = true;
                             event.stopPropagation();
@@ -2852,7 +2919,7 @@ namespace GlbMerger
                         }
                     }, true);
                     viewer.addEventListener('pointermove', function (event) {
-                        if (!paintMode) return;
+                        if (!paintMode || overlaySuspended) return;
                         if (painting) { pickAndPaint(event); return; }
 
                         // Not dragging: track the disc across the surface so the brush footprint is
@@ -2899,7 +2966,7 @@ namespace GlbMerger
                     // of the actual pose. That's most visible on whatever moves furthest from bind
                     // pose, typically the arms.
                     function bakeSkinnedGeometry(mesh) {
-                        var srcGeom = mesh.geometry;
+                        var srcGeom = mesh.userData.sourceGeometry || mesh.geometry;
                         if (!mesh.isSkinnedMesh || !mesh.skeleton
                             || !srcGeom.attributes.skinIndex || !srcGeom.attributes.skinWeight) {
                             return srcGeom;
@@ -2969,6 +3036,10 @@ namespace GlbMerger
                                 })) {
                                     primIndex = parent.children.indexOf(obj);
                                 }
+                                // The skinned original is kept so the mesh can be re-baked at
+                                // another pose (see reposeMeshes); the baked copy is what
+                                // everything else reads.
+                                obj.userData.sourceGeometry = obj.geometry;
                                 obj.geometry = bakeSkinnedGeometry(obj);
                                 var triData = computeTriangleData(obj);
                                 meshes.push({
@@ -2980,13 +3051,22 @@ namespace GlbMerger
                                 });
                             });
                             paintableMeshes = meshes;
-                            rebuildDepthMask();
-                            rebuildBrushDecal();
 
+                            // Measured in bind pose, before any repose below: the cut plane and
+                            // the brush size are both bind-pose quantities.
                             var box = new THREE.Box3().setFromObject(gltf.scene);
                             var size = box.getSize(new THREE.Vector3());
                             modelMaxDim = Math.max(size.x, size.y, size.z) || 1;
                             modelBox = box;
+
+                            hitTestRoot = gltf.scene;
+                            hitTestClips = gltf.animations || [];
+                            hitTestMixer = hitTestClips.length > 0 ? new THREE.AnimationMixer(gltf.scene) : null;
+                            // Reloaded while paused on a frame: put the overlay on that frame.
+                            if (animIndex >= 0 && !animPlaying) reposeMeshes();
+
+                            rebuildDepthMask();
+                            rebuildBrushDecal();
                             rebuildCutPlane();
 
                             // Only now is the brush fraction resolvable into a world-space radius,
@@ -3002,6 +3082,121 @@ namespace GlbMerger
                     }
                     // --- end paint-a-region tool -------------------------------------------------
 
+                    // --- Animation preview -------------------------------------------------------
+                    // <model-viewer> plays the clip. The overlay can't follow it frame by frame:
+                    // its geometry is CPU-baked (bakeSkinnedGeometry), far too slow to redo every
+                    // frame on the dense models this tool is for. So while a clip plays the
+                    // overlay is hidden and painting is off, and on pause the hit-test parse is
+                    // posed at the same clip and time with its own AnimationMixer and re-baked -
+                    // after which the wireframe, paint and brush sit on the posed surface again,
+                    // and <model-viewer>'s pick (which is skinned) lands on the same surface.
+                    // The pose never changes triangle indices, so the selection carries over.
+                    //
+                    // State lives here rather than being re-sent by .NET, because a reload (after
+                    // every Apply) resets <model-viewer>'s own animation state and the 'load'
+                    // handler has to put it back.
+                    var animIndex = -1;          // index into the model's animations; -1 = bind pose
+                    var animPlaying = false;
+                    var animTime = 0;            // frame to show / resume from while paused
+                    var animToken = 0;           // drops a stale applyAnimationState after an await
+                    var overlaySuspended = false;
+                    var hitTestRoot = null, hitTestMixer = null, hitTestClips = [];
+
+                    function setOverlaySuspended(suspended) {
+                        overlaySuspended = suspended;
+                        overlayCanvas.style.visibility = suspended ? 'hidden' : 'visible';
+                        if (suspended) { painting = false; hideBrushCursor(); }
+                    }
+
+                    // Back to bind pose. <model-viewer> has no public call for it - with no
+                    // animationName it plays the FIRST clip - so this reaches its ModelScene
+                    // (stored under a Symbol('scene')) for stopAnimation, whose stopAllAction
+                    // restores every animated property to its original value. If that ever moves,
+                    // frame 0 of the clip is the nearest fallback.
+                    function stopViewerAnimation() {
+                        var sym = Object.getOwnPropertySymbols(viewer).find(function (s) { return s.description === 'scene'; });
+                        var scene = sym ? viewer[sym] : null;
+                        if (scene && typeof scene.stopAnimation === 'function') {
+                            scene.stopAnimation();
+                            if (typeof scene.queueShadowRender === 'function') scene.queueShadowRender();
+                            if (typeof scene.queueRender === 'function') scene.queueRender();
+                        } else {
+                            viewer.currentTime = 0;
+                        }
+                    }
+
+                    // Re-bakes every paintable mesh at the current clip and time (or bind pose),
+                    // in place. Triangle data is recomputed; the overlay groups are not rebuilt.
+                    function reposeMeshes() {
+                        if (!hitTestRoot) return;
+                        if (hitTestMixer) {
+                            hitTestMixer.stopAllAction();   // restores bind pose
+                            var clip = animIndex >= 0 ? hitTestClips[animIndex] : null;
+                            if (clip) {
+                                hitTestMixer.clipAction(clip).play();
+                                hitTestMixer.setTime(animTime);
+                            }
+                        }
+                        hitTestRoot.updateMatrixWorld(true);
+                        paintableMeshes.forEach(function (meshInfo) {
+                            var obj = meshInfo.object;
+                            var old = obj.geometry;
+                            obj.geometry = bakeSkinnedGeometry(obj);
+                            if (old !== obj.geometry && old !== obj.userData.sourceGeometry) old.dispose();
+                            var triData = computeTriangleData(obj);
+                            meshInfo.centroids = triData.centroids;
+                            meshInfo.radii = triData.radii;
+                            meshInfo.normals = triData.normals;
+                            meshInfo.corners = triData.corners;
+                        });
+                    }
+
+                    function reposeOverlay() {
+                        if (paintableMeshes.length === 0) return;
+                        reposeMeshes();
+                        rebuildDepthMask();
+                        rebuildBrushDecal();
+                        rebuildWireframe();
+                        rebuildOverlay();
+                    }
+
+                    async function applyAnimationState() {
+                        var token = ++animToken;
+                        var playing = animPlaying && animIndex >= 0;
+                        setOverlaySuspended(playing);
+                        if (loaded) {
+                            var names = viewer.availableAnimations || [];
+                            if (animIndex < 0 || animIndex >= names.length) {
+                                viewer.pause();
+                                stopViewerAnimation();
+                            } else {
+                                if (viewer.animationName !== names[animIndex]) {
+                                    viewer.animationName = names[animIndex];
+                                    await viewer.updateComplete;
+                                    if (token !== animToken) return;
+                                }
+                                // play() is what (re)starts the clip's action - including after
+                                // stopViewerAnimation or a reload - and it rewinds a paused clip,
+                                // so the frame is set afterwards in both cases.
+                                viewer.play();
+                                if (!playing) viewer.pause();
+                                viewer.currentTime = animTime;
+                            }
+                        }
+                        if (!playing) reposeOverlay();
+                    }
+
+                    // Called by .NET. Idempotent, since it is also re-sent on every 'ready'.
+                    window.setAnimation = function (index, playing) {
+                        if (index === animIndex && playing === animPlaying) return;
+                        if (index !== animIndex) animTime = 0;
+                        else if (!playing && loaded) animTime = viewer.currentTime;  // pausing: hold this frame
+                        animIndex = index;
+                        animPlaying = playing;
+                        applyAnimationState();
+                    };
+                    // --- end animation preview ---------------------------------------------------
+
                     // Points <model-viewer> at a freshly written GLB after an Apply/Revert. 'load'
                     // fires again afterward, which is what re-announces readiness so .NET can
                     // re-push state (see AnimationTrimEditor's identical reloadModel/'load' split).
@@ -3016,6 +3211,9 @@ namespace GlbMerger
                         selection = {};
                         pendingSelectionData = null;
                         modelBox = null;
+                        hitTestRoot = null;
+                        hitTestMixer = null;
+                        hitTestClips = [];
                         rebuildOverlay();
                         rebuildDepthMask();
                         rebuildWireframe();
@@ -3130,6 +3328,7 @@ namespace GlbMerger
                 PushWireframe();
                 PushCutPlane();
                 PushPendingSelection();
+                PushAnimation();
                 return;
             }
 
@@ -3204,6 +3403,74 @@ namespace GlbMerger
             _syncingSelectionMode = true;
             try { other.Checked = false; }
             finally { _syncingSelectionMode = false; }
+        }
+
+        // Animation preview: a clip picker and a Play/Pause button, shared by every operation.
+        // Purely a view onto the model - nothing here changes the geometry, and every operation
+        // still runs on the bind-pose mesh. While a clip is playing the overlay (wireframe, paint,
+        // cut plane, brush) is hidden and painting is off, since it would have to be re-skinned
+        // on the CPU every frame; paused, it is rebuilt at the paused pose, so painting on a
+        // posed limb works and paints the same triangles it would in bind pose.
+        private void BuildAnimationRow(FlowLayoutPanel flow)
+        {
+            flow.Controls.Add(new Label { Text = "Preview animation:", AutoSize = true, Margin = new Padding(3, 0, 3, 2) });
+
+            // 236 + 82 (+ margins) = 330, the same width as the Operation dropdown above it.
+            var row = new FlowLayoutPanel
+            {
+                FlowDirection = FlowDirection.LeftToRight, WrapContents = false,
+                AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Margin = new Padding(0, 0, 0, 10),
+            };
+            _cmbAnimation = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 236, Margin = new Padding(3, 1, 3, 3) };
+            _btnPlayPause = new Button
+            {
+                Text = "Play", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowOnly,
+                MinimumSize = new System.Drawing.Size(82, 0), Margin = new Padding(3, 0, 3, 3),
+            };
+            row.Controls.Add(_cmbAnimation);
+            row.Controls.Add(_btnPlayPause);
+            flow.Controls.Add(row);
+
+            _cmbAnimation.Items.Add("(Bind pose)");
+            foreach (var anim in _model.LogicalAnimations)
+                _cmbAnimation.Items.Add(string.IsNullOrEmpty(anim.Name) ? $"Animation {anim.LogicalIndex}" : anim.Name);
+            _cmbAnimation.SelectedIndex = 0;
+            _cmbAnimation.Enabled = _model.LogicalAnimations.Count > 0;
+
+            // Picking a clip starts it playing; picking bind pose stops it.
+            _cmbAnimation.SelectedIndexChanged += (s, e) =>
+            {
+                _animPlaying = _cmbAnimation.SelectedIndex > 0;
+                UpdatePlayPauseButton();
+                PushAnimation();
+            };
+            _btnPlayPause.Click += (s, e) =>
+            {
+                _animPlaying = !_animPlaying;
+                UpdatePlayPauseButton();
+                PushAnimation();
+            };
+            UpdatePlayPauseButton();
+
+            _help.Add(row,
+                "Plays one of the model's animations in the preview. While it plays, the wireframe, " +
+                "paint and cut plane are hidden and painting is off; pause to see them on the posed " +
+                "model and paint there. Operations always work on the bind-pose mesh, so a planar " +
+                "cut is placed in bind pose whatever frame is showing.");
+        }
+
+        private void UpdatePlayPauseButton()
+        {
+            _btnPlayPause.Enabled = _cmbAnimation.SelectedIndex > 0;
+            _btnPlayPause.Text = _animPlaying ? "Pause" : "Play";
+        }
+
+        private void PushAnimation()
+        {
+            if (!_viewerReady || _webView.CoreWebView2 == null) return;
+            int clip = _cmbAnimation.SelectedIndex - 1;   // -1 = bind pose
+            _ = _webView.CoreWebView2.ExecuteScriptAsync(
+                $"setAnimation({clip}, {(_animPlaying && clip >= 0 ? "true" : "false")});");
         }
 
         private void PushWireframe()
