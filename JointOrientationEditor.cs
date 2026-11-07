@@ -24,7 +24,7 @@ namespace GlbMerger
     // One of the four modes hosted by ModelEditorForm (see EditorMode there), which owns the
     // window chrome - the title, the sizing, and the single "Done" button shared by all four -
     // so this control only contributes its own left-hand controls and 3D preview.
-    public class JointOrientationEditor : UserControl, IUnappliedChanges
+    public partial class JointOrientationEditor : UserControl, IUnappliedChanges
     {
         private readonly ModelRoot _model;
 
@@ -141,9 +141,10 @@ namespace GlbMerger
 
         private bool _suppressSliderEvents;
 
-        public JointOrientationEditor(ModelRoot model, bool darkMode = false)
+        public JointOrientationEditor(ModelRoot model, bool darkMode = false, bool bandMode = false, string? sourcePath = null)
         {
             _model = model;
+            _bandMode = bandMode; _bandSourcePath = sourcePath;
 
             Dock = DockStyle.Fill;
 
@@ -156,6 +157,7 @@ namespace GlbMerger
             ThemeManager.Apply(this, darkMode);
 
             _ = InitializeViewerAsync();
+            TryAutoLoadBandInstrument();
         }
 
         private void BuildUi()
@@ -170,6 +172,7 @@ namespace GlbMerger
             // Once buttons became AutoSize (to stop their own text clipping), they could grow
             // taller than those fixed gaps allowed for and start overlapping the control below.
             int y = 12;
+            if (_bandMode) BuildBandControls(controlPanel, ref y);
             const int gap = 6;
 
             var lblBone = new Label { Text = "Joint / Bone:", Left = 12, Top = y, AutoSize = true };
@@ -284,6 +287,7 @@ namespace GlbMerger
             if (IsDisposed || _webView.IsDisposed) return;
 
             string tempFolder = Path.GetTempPath();
+            if (_bandMode) { _bandPreviewFolder = Path.Combine(tempFolder, "glbmerger-band-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(_bandPreviewFolder); tempFolder = _bandPreviewFolder; }
             string previewPath = Path.Combine(tempFolder, "glbmerger_joint_preview.glb");
             _webView.CoreWebView2.SetVirtualHostNameToFolderMapping("appassets.local", tempFolder, CoreWebView2HostResourceAccessKind.Allow);
             _webView.CoreWebView2.NavigationCompleted += (s, e) => { _viewerReady = e.IsSuccess; PushShowJoints(); };
@@ -300,6 +304,7 @@ namespace GlbMerger
             // the flicker the user was seeing. Raw Three.js exposes the actual bone objects, so a
             // slider move can just set a rotation directly with no file round-trip at all.
             _model.SaveGLB(previewPath);
+            if (_bandMode) _bandTempFiles.Add(previewPath);
             var previewFileName = Path.GetFileName(previewPath);
 
             string htmlContent = @"
@@ -360,6 +365,7 @@ namespace GlbMerger
                         var mixer = null;
                         var clock = new THREE.Clock();
                         var paused = false;
+                        var playbackRate = 1;
                         var bonesByName = {};
                         var jointNames = " + jointNamesJson + @";
                         var jointMarkerMeshes = [];
@@ -493,6 +499,7 @@ namespace GlbMerger
                             applySelectedJointHighlight();
                         };
 
+                        " + (_bandMode ? BandViewerScript : "") + @"
                         var loader = new THREE.GLTFLoader();
                         loader.load('https://appassets.local/" + previewFileName + @"', function (gltf) {
                             try {
@@ -545,7 +552,7 @@ namespace GlbMerger
                                 }
 
                                 orderedMaterials.forEach(function (mat, i) {
-                                    var visible = i === 0;
+                                    var visible = " + (_bandMode ? "true" : "i === 0") + @";
                                     showMaterial(mat, visible);
 
                                     // Same metallic/roughness dampening as the main model viewer,
@@ -624,6 +631,7 @@ namespace GlbMerger
                                     currentAction = mixer.clipAction(currentClip);
                                     currentAction.play();
                                 }
+                                if (typeof bandCharacterLoaded === ""function"") bandCharacterLoaded(gltf.scene, groundQuad, groundGrid, groundSize);
                             } catch (innerErr) {
                                 showError('Error setting up loaded model: ' + innerErr.message);
                             }
@@ -657,7 +665,7 @@ namespace GlbMerger
                         function animate() {
                             requestAnimationFrame(animate);
                             var delta = clock.getDelta();
-                            if (mixer && !paused) mixer.update(delta);
+                            if (mixer && !paused) mixer.update(delta * playbackRate);
                             var clipTime = currentAction ? currentAction.time : 0;
 
                             var rotationNames = Object.keys(liveCorrections).concat(
@@ -741,6 +749,7 @@ namespace GlbMerger
                             }
 
                             controls.update();
+                            if (typeof updateBandInstrument === ""function"") updateBandInstrument();
                             renderer.render(scene, camera);
                         }
                         animate();
@@ -760,7 +769,7 @@ namespace GlbMerger
             foreach (var anim in _model.LogicalAnimations)
                 _animDropdown.Items.Add(anim.Name ?? $"Anim_{anim.LogicalIndex}");
 
-            _animDropdown.SelectedIndex = _animDropdown.Items.Count > 1 ? 1 : 0;
+            _animDropdown.SelectedIndex = _bandMode && _animDropdown.Items.Contains("Play") ? _animDropdown.Items.IndexOf("Play") : _animDropdown.Items.Count > 1 ? 1 : 0;
         }
 
         private void OnAnimationSelected()
@@ -808,6 +817,7 @@ namespace GlbMerger
         // sliders/checkboxes exactly as if it had been picked from the dropdown directly.
         private void OnWebMessageReceived(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
         {
+            if (HandleBandMessage(e)) return;
             ViewerMessage? message;
             try
             {

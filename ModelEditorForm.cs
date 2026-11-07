@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Windows.Forms;
 using SharpGLTF.Schema2;
 
@@ -18,6 +18,7 @@ namespace GlbMerger
         public enum EditorMode
         {
             JointOrientation,
+            BandPerformance,
             Rigging,
             BallAnchor,
             EyeAnchor,
@@ -38,6 +39,7 @@ namespace GlbMerger
         private static readonly (EditorMode Mode, string Label)[] Modes =
         {
             (EditorMode.JointOrientation, "Fix Joint Orientation"),
+            (EditorMode.BandPerformance, "Band Performance"),
             (EditorMode.Rigging,          "Rigging (Move Joints)"),
             (EditorMode.BallAnchor,       "Ball Anchor"),
             (EditorMode.EyeAnchor,        "Eye Anchors"),
@@ -200,6 +202,7 @@ namespace GlbMerger
                 Control editor = mode switch
                 {
                     EditorMode.JointOrientation => new JointOrientationEditor(_model, _darkMode),
+                    EditorMode.BandPerformance => new BandPerformanceEditor(_model, _darkMode, _sourcePath),
                     EditorMode.Rigging => new RiggingEditor(_model, _darkMode, _settings),
                     EditorMode.BallAnchor => new BallAnchorEditor(_model, _darkMode, _settings),
                     EditorMode.EyeAnchor => new EyeAnchorEditor(_model, _darkMode),
